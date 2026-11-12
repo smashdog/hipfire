@@ -139,6 +139,81 @@ const Q8X_MODULES: [(&str, &str, &str); 14] = [
     ),
 ];
 
+/// MQ3G256V2 (qt49, 3-bit) twins of [`Q8X_MODULES`]; same index layout
+/// ([`q8x_module_index`]), same activation quantizer ([`Q8X_QUANT_MODULE`]).
+const Q8X_MQ3_MODULES: [(&str, &str, &str); 14] = [
+    (
+        "mq3v2_q8x_v4_b2",
+        "mq3v2_q8x_v4_b2_multi",
+        kernels::GEMV_MQ3G256V2_Q8X_V4_B2_SRC,
+    ),
+    (
+        "mq3v2_q8x_v4_b2_res",
+        "mq3v2_q8x_v4_b2_res_multi",
+        kernels::GEMV_MQ3G256V2_Q8X_V4_B2_RES_SRC,
+    ),
+    (
+        "mq3v2_q8x_v4_b3",
+        "mq3v2_q8x_v4_b3_multi",
+        kernels::GEMV_MQ3G256V2_Q8X_V4_B3_SRC,
+    ),
+    (
+        "mq3v2_q8x_v4_b3_res",
+        "mq3v2_q8x_v4_b3_res_multi",
+        kernels::GEMV_MQ3G256V2_Q8X_V4_B3_RES_SRC,
+    ),
+    (
+        "mq3v2_q8x_v4_b4",
+        "mq3v2_q8x_v4_b4_multi",
+        kernels::GEMV_MQ3G256V2_Q8X_V4_B4_SRC,
+    ),
+    (
+        "mq3v2_q8x_v4_b4_res",
+        "mq3v2_q8x_v4_b4_res_multi",
+        kernels::GEMV_MQ3G256V2_Q8X_V4_B4_RES_SRC,
+    ),
+    (
+        "mq3v2_q8x_v3_b2",
+        "mq3v2_q8x_v3_b2_multi",
+        kernels::GEMV_MQ3G256V2_Q8X_V3_B2_SRC,
+    ),
+    (
+        "mq3v2_q8x_v3_b2_res",
+        "mq3v2_q8x_v3_b2_res_multi",
+        kernels::GEMV_MQ3G256V2_Q8X_V3_B2_RES_SRC,
+    ),
+    (
+        "mq3v2_q8x_v3_b3",
+        "mq3v2_q8x_v3_b3_multi",
+        kernels::GEMV_MQ3G256V2_Q8X_V3_B3_SRC,
+    ),
+    (
+        "mq3v2_q8x_v3_b3_res",
+        "mq3v2_q8x_v3_b3_res_multi",
+        kernels::GEMV_MQ3G256V2_Q8X_V3_B3_RES_SRC,
+    ),
+    (
+        "mq3v2_q8x_v3_b4",
+        "mq3v2_q8x_v3_b4_multi",
+        kernels::GEMV_MQ3G256V2_Q8X_V3_B4_SRC,
+    ),
+    (
+        "mq3v2_q8x_v3_b4_res",
+        "mq3v2_q8x_v3_b4_res_multi",
+        kernels::GEMV_MQ3G256V2_Q8X_V3_B4_RES_SRC,
+    ),
+    (
+        "mq3v2_q8x_v3_b5",
+        "mq3v2_q8x_v3_b5_multi",
+        kernels::GEMV_MQ3G256V2_Q8X_V3_B5_SRC,
+    ),
+    (
+        "mq3v2_q8x_v3_b5_res",
+        "mq3v2_q8x_v3_b5_res_multi",
+        kernels::GEMV_MQ3G256V2_Q8X_V3_B5_RES_SRC,
+    ),
+];
+
 const Q8X_QUANT_MODULE: &str = "mq4v2_q8x_quant";
 
 fn q8x_module_index(v: Q8xVariant, batch: usize, residual: bool) -> usize {
@@ -242,8 +317,11 @@ impl Gpu {
     /// weights `(A_i, y_i, m_i)` sharing the FWHT-rotated f32 input `x`
     /// (`[batch x k]`). `residual` adds into `y_i`, otherwise overwrites.
     /// Callers check [`Self::q8x_verify_active`] first.
-    pub fn gemm_mq4g256v2_q8x(
+    fn gemm_q8x_inner(
         &mut self,
+        modules: &[(&str, &str, &str); 14],
+        label: &str,
+        bit_base: usize,
         outs: &[(&GpuTensor, &GpuTensor, usize)],
         x: &GpuTensor,
         k: usize,
@@ -253,13 +331,13 @@ impl Gpu {
         if !(2..=Q8X_MAX_BATCH).contains(&batch) || k % 256 != 0 || k > Q8X_MAX_K {
             return Err(hip_bridge::HipError::new(
                 1,
-                &format!("gemm_mq4g256v2_q8x: unsupported shape k={k} batch={batch}"),
+                &format!("{label}: unsupported shape k={k} batch={batch}"),
             ));
         }
         if outs.is_empty() || outs.len() > 4 {
             return Err(hip_bridge::HipError::new(
                 1,
-                &format!("gemm_mq4g256v2_q8x: {} weights (1..=4)", outs.len()),
+                &format!("{label}: {} weights (1..=4)", outs.len()),
             ));
         }
         self.bind_thread()?;
@@ -296,11 +374,11 @@ impl Gpu {
         // 2. One GEMV launch for the group (or one per weight for a single weight).
         let v = q8x_pick(k, batch);
         let idx = q8x_module_index(v, batch, residual);
-        let (module, multi_symbol, source) = Q8X_MODULES[idx];
+        let (module, multi_symbol, source) = modules[idx];
         let use_multi = outs.len() > 1;
         let func_name = if use_multi { multi_symbol } else { module };
         self.ensure_kernel(module, source, func_name)?;
-        let bit = 1u64 << (idx * 2 + usize::from(use_multi));
+        let bit = 1u64 << (bit_base + idx * 2 + usize::from(use_multi));
         if Q8X_ENGAGED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
             eprintln!(
                 "[q8x-verify] route active: {func_name} k={k} batch={batch} weights={}",
@@ -386,6 +464,32 @@ impl Gpu {
                 &mut params,
             )
         }
+    }
+
+    /// MQ4G256V2 (qt44) int8 small-batch verify GEMV. See [`Self::q8x_verify_active`].
+    pub fn gemm_mq4g256v2_q8x(
+        &mut self,
+        outs: &[(&GpuTensor, &GpuTensor, usize)],
+        x: &GpuTensor,
+        k: usize,
+        batch: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        self.gemm_q8x_inner(&Q8X_MODULES, "gemm_mq4g256v2_q8x", 0, outs, x, k, batch, residual)
+    }
+
+    /// MQ3G256V2 (qt49, 3-bit) int8 small-batch verify GEMV. Same activation
+    /// quantizer and LDS staging as MQ4; only the weight payload differs
+    /// (104 B/group, 12 B/lane, codes 0..7). See [`Self::q8x_verify_active`].
+    pub fn gemm_mq3g256v2_q8x(
+        &mut self,
+        outs: &[(&GpuTensor, &GpuTensor, usize)],
+        x: &GpuTensor,
+        k: usize,
+        batch: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        self.gemm_q8x_inner(&Q8X_MQ3_MODULES, "gemm_mq3g256v2_q8x", 28, outs, x, k, batch, residual)
     }
 }
 

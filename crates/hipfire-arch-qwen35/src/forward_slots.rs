@@ -596,6 +596,18 @@ fn slots_plain_gemm_key(dt: DType) -> Option<KernelKey> {
         DType::MQ5G256V2 => KernelKey::GemmMq5G256V2,
         DType::MQ3G256V2 => KernelKey::GemmMq3G256V2,
         DType::MQ2G256V2 => KernelKey::GemmMq2G256V2,
+        // Uncoded high-precision DeltaNet siblings: escha-pro / escha-35b keep
+        // in_proj_a/b as F16 (the escha ignore list leaves them plain), and the
+        // F32 arm covers the HIPFIRE_F16_LM_HEAD=f32 upcast plus PARO F32
+        // alpha/beta. Both are UNROTATED — slots_plain_proj feeds them x_norm.
+        // MB8 is the fused-transpose WMMA GEMM (Y[N,M], F16 weight × F32→F16
+        // activation, F32 accumulate): the same kernel the decode lm_head
+        // reference (gemm_f16_batched_lmhead) uses on gfx12, precision-equivalent
+        // to its gfx11 mw16 path, ragged-N safe, and HasWmma-portable across
+        // RDNA3/RDNA4. F32 rides gemm_f32_batched, the canonical DeltaNet
+        // alpha/beta batched GEMM (Y[N,M], any N).
+        DType::F16 => KernelKey::GemmF16WmmaMb8,
+        DType::F32 => KernelKey::GemmF32Batched,
         // Flat lowbit Bonsai: the tiled prefill GEMMs (same keys
         // `plain_gemm_key_for` resolves). Explicit run_key bypasses the
         // BatchGe(32) auto-resolve shape gate, so decode row counts work too.
@@ -737,6 +749,14 @@ pub(crate) fn require_batchable_deltanet_layer(
     layer: &DeltaNetLayerWeights,
     arch: &str,
 ) -> HipResult<()> {
+    // Escha trellis layers run their own grouped-GEMM arm in the slot body
+    // (qkv/z/o/gate/up/down are codes; in_proj_a/b are plain — MQ6G256V2 on
+    // escha base, F16/F32 on escha-pro — served by `slots_plain_proj`). The
+    // fused/group-plan ladder below cannot read a trellis code, so it must not
+    // gate them — the arm is the batchable path.
+    if layer.escha.is_some() {
+        return Ok(());
+    }
     plan_proj_group(
         &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
         "DeltaNet qkvza",
@@ -753,6 +773,11 @@ pub(crate) fn require_batchable_fullattn_layer(
     layer: &FullAttnLayerWeights,
     arch: &str,
 ) -> HipResult<()> {
+    // See `require_batchable_deltanet_layer`: escha layers take the grouped
+    // trellis arm, not the fused/group-plan ladder.
+    if layer.escha.is_some() {
+        return Ok(());
+    }
     plan_proj_group(&[&layer.wq, &layer.wk, &layer.wv], "FullAttn qkv", arch).map(|_| ())?;
     slots_check_residual_weight(&layer.wo, "FullAttn wo", arch)?;
     plan_proj_group(&[&layer.w_gate, &layer.w_up], "dense FFN gate_up", arch).map(|_| ())?;
@@ -1139,6 +1164,91 @@ fn q8_gate_up_proj(
     }
 }
 
+/// `[0, n]` expert-offset table for the grouped escha GEMM. A dense linear is
+/// ONE group holding every slot, so the offsets are `[0, n]` and the slot
+/// permutation is the identity (`DeltaNetEscha::iota` / `FullAttnEscha::iota`).
+/// Built once per layer; every coded projection in the layer shares it. Raw
+/// little-endian i32 bytes — the grouped GEMM reads `expert_offsets` as i32,
+/// the same deliberate reinterpretation `ids`/`iota` use (DType has no integer
+/// variant). This is what turns the per-slot indexed GEMV (weight re-read once
+/// per slot) into a single grouped WMMA GEMM (weight read once per layer,batch).
+fn escha_group_offsets(gpu: &Gpu, n: usize) -> HipResult<GpuTensor> {
+    let bytes: Vec<u8> = [0i32, n as i32]
+        .iter()
+        .flat_map(|x| x.to_ne_bytes())
+        .collect();
+    gpu.upload_raw(&bytes, &[2])
+}
+
+/// Escha trellis FFN for the dense slot bodies (DeltaNet and FullAttn share
+/// it): plain rmsnorm, gate and up as grouped trellis GEMMs, SwiGLU, then down
+/// accumulated into the residual. The fused gate_up kernel cannot serve this —
+/// the two projections have different `rin` and it could not read a trellis
+/// code regardless. `biases` is `(gate, up, down)` from the layer's escha dense
+/// export, or `None` for a bias-free model.
+///
+/// Mirrors the decode reference (`escha_run_proj` PROJ_GATE_UP +
+/// `escha_run_resid` RESID_DOWN_SWIGLU + `apply_proj_biases`) row-for-row, so
+/// batched prefill and per-token decode compute the same function.
+#[allow(clippy::too_many_arguments)]
+fn escha_ffn_body_slots(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    ffn_norm: &GpuTensor,
+    w_gate: &WeightTensor,
+    w_up: &WeightTensor,
+    w_down: &WeightTensor,
+    e_gate: &crate::qwen35::escha::EschaProj,
+    e_up: &crate::qwen35::escha::EschaProj,
+    e_down: &crate::qwen35::escha::EschaProj,
+    ids: &GpuTensor,
+    offsets: &GpuTensor,
+    iota: &GpuTensor,
+    biases: Option<(&GpuTensor, &GpuTensor, &GpuTensor)>,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+) -> HipResult<()> {
+    let grouped = Some((offsets, iota));
+    // Plain rmsnorm: escha applies its own H128 `rin` per projection, so a
+    // pre-rotated input would be rotated twice.
+    gpu.rmsnorm_batched(
+        &pbs.x_batch,
+        ffn_norm,
+        &pbs.x_norm_batch,
+        n,
+        w_gate.k,
+        config.norm_eps,
+    )?;
+    e_gate.forward(
+        gpu, w_gate, ids, &pbs.x_norm_batch, &pbs.escha_xh_batch,
+        &pbs.gate_ffn_batch, &pbs.gate_ffn_batch, n, grouped,
+    )?;
+    e_up.forward(
+        gpu, w_up, ids, &pbs.x_norm_batch, &pbs.escha_xh_batch,
+        &pbs.up_batch, &pbs.up_batch, n, grouped,
+    )?;
+    if let Some((bg, bu, _)) = biases {
+        gpu.bias_add_f32(&pbs.gate_ffn_batch, bg, n, bg.numel())?;
+        gpu.bias_add_f32(&pbs.up_batch, bu, n, bu.numel())?;
+    }
+    gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+    e_down.forward(
+        gpu, w_down, ids, &pbs.ffn_hidden_batch, &pbs.escha_xh_batch,
+        &pbs.escha_y_batch, &pbs.escha_y_batch, n, grouped,
+    )?;
+    // down_proj writes the residual stream. The fused epilogue is SKIPPED, not
+    // supplemented — it would write the residual itself, so running both would
+    // count this projection twice. The split add is exact (both terms f32).
+    let dim = w_down.m;
+    let y = pbs.escha_y_batch.sub_offset(0, n * dim);
+    let x = pbs.x_batch.sub_offset(0, n * dim);
+    gpu.add_inplace_f32(&x, &y)?;
+    if let Some((_, _, bd)) = biases {
+        gpu.bias_add_f32(&pbs.x_batch, bd, n, bd.numel())?;
+    }
+    Ok(())
+}
+
 /// Dense FFN body, dispatched per site from the gate/up group's dtypes and
 /// `w_down`'s own dtype:
 ///
@@ -1411,18 +1521,25 @@ where
     D: std::ops::Index<usize, Output = DeltaNetState> + ?Sized,
 {
     let arch = gpu.arch.as_str();
-    // Per-site plans: the qkvza group keeps one fused launch when uniform,
-    // otherwise per-weight GEMMs; wo and the FFN weights validate their own
-    // roles inside their dispatchers.
-    let qkvza_plan = plan_q8_fused_or_plain(
-        plan_proj_group(
-            &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
-            "DeltaNet qkvza",
-            arch,
-        )?,
-        q8_wmma_arch,
-    );
-    slots_check_residual_weight(&layer.wo, "DeltaNet wo", arch)?;
+    let escha = layer.escha.as_ref();
+    // One `[0, n]` grouped-GEMM offset table per layer, shared by every coded
+    // projection (a dense linear is a single group holding all n slots). The
+    // trellis `ids`/`iota` tables hold ESCHA_MAX_SLOTS rows; the scheduler's
+    // trunk budget (serve.max_batch_tokens, default 4096) normally keeps n
+    // within them. Fail closed if an operator raised the budget past the table
+    // — the grouped GEMM would otherwise read iota out of bounds.
+    let escha_off = if let Some(e) = escha {
+        if n > e.iota.numel() {
+            return Err(HipError::new(
+                0,
+                "escha batched prefill: step rows exceed the trellis slot table \
+                 (ESCHA_MAX_SLOTS); lower serve.max_batch_tokens",
+            ));
+        }
+        Some(escha_group_offsets(gpu, n)?)
+    } else {
+        None
+    };
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -1430,97 +1547,170 @@ where
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
 
-    // 1-2. rmsnorm (+FWHT-rotate for rotated containers) then the 4-way
-    // QKVZA projection. Uniform rotated groups keep the fused rmsnorm+rotate
-    // producer; mixed groups normalize once, rotate the normed rows, then
-    // run one plain GEMM per weight (each member's dtype picks its input
-    // variant — the load-bearing bit: an unrotated member MUST NOT read
-    // rotated activations).
-    let (need_rot, need_norm) = match qkvza_plan {
-        GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
-        GroupPlan::Mixed {
-            needs_rot,
-            needs_norm,
-        } => (needs_rot, needs_norm),
-    };
-    let qkvza_anchor = if let GroupPlan::Uniform(dt) = qkvza_plan {
-        slots_weight_rotated(dt).then_some(&layer.wqkv)
+    // 1-2. rmsnorm then the 4-way QKVZA projection.
+    //
+    // ESCHA FIRST: a trellis layer bypasses the fused/group-plan machinery
+    // entirely. qkv/z are trellis codes — each applies its OWN `rin` to the
+    // normed input — while in_proj_a/in_proj_b are uncoded (the escha ignore
+    // list leaves them plain). Their container varies by checkpoint: escha base
+    // keeps them MQ6G256V2 (FWHT-rotated basis → needs x_rot), escha-pro /
+    // escha-35b keep them F16 (or F32 under HIPFIRE_F16_LM_HEAD=f32), which are
+    // plain and read x_norm. So the norm site always produces x_norm (for the
+    // trellis pair) and additionally x_rot only when a rotated sibling exists.
+    // A fused Qkvza launch can neither read a trellis code nor share one rotated
+    // activation across projections with different rin. The grouped GEMM reads
+    // each weight once per (layer,batch) instead of once per slot — the
+    // dense-prefill fix.
+    if let Some(e) = escha {
+        let grouped = Some((escha_off.as_ref().expect("escha offsets built"), &e.iota));
+        // Derive need_rot + the anchor from the ACTUAL in_proj dtypes rather than
+        // assuming MQ6. This mirrors the decode reference (escha_run_proj feeds
+        // the unrotated normed s.tmp to weight_gemv, which rotates only for MQ
+        // containers): an F16/F32 sibling must read x_norm, never x_rot.
+        let beta_rot = slots_weight_rotated(layer.w_beta.gpu_dtype);
+        let alpha_rot = slots_weight_rotated(layer.w_alpha.gpu_dtype);
+        let rot_anchor = if beta_rot {
+            Some(&layer.w_beta)
+        } else if alpha_rot {
+            Some(&layer.w_alpha)
+        } else {
+            None
+        };
+        slots_norm_site(
+            gpu,
+            &pbs.x_batch,
+            &layer.attn_norm,
+            rot_anchor,
+            &pbs.x_rot_batch,
+            &pbs.x_norm_batch,
+            beta_rot || alpha_rot,
+            true,
+            config.dim,
+            config.norm_eps,
+            n,
+        )?;
+        e.qkv.forward(
+            gpu, &layer.wqkv, &e.ids, &pbs.x_norm_batch, &pbs.escha_xh_batch,
+            &pbs.dn_qkv_batch, &pbs.dn_qkv_batch, n, grouped,
+        )?;
+        e.z.forward(
+            gpu, &layer.wz, &e.ids, &pbs.x_norm_batch, &pbs.escha_xh_batch,
+            &pbs.dn_z_batch, &pbs.dn_z_batch, n, grouped,
+        )?;
+        // Uncoded in_proj_a/b siblings: slots_plain_proj picks x_rot for a
+        // rotated MQ6 container, or x_norm for the plain F16/F32 siblings
+        // (escha-pro), routing each to its dtype's batched GEMM key.
+        let beta = pbs.dn_beta_batch.sub_offset(0, n * layer.w_beta.m);
+        slots_plain_proj(gpu, &layer.w_beta, &pbs.x_rot_batch, &pbs.x_norm_batch, &beta, n)?;
+        let alpha = pbs.dn_alpha_batch.sub_offset(0, n * layer.w_alpha.m);
+        slots_plain_proj(gpu, &layer.w_alpha, &pbs.x_rot_batch, &pbs.x_norm_batch, &alpha, n)?;
+        if let Some(b) = layer.biases.as_ref() {
+            gpu.bias_add_f32(&pbs.dn_qkv_batch, &b.qkv, n, b.qkv.numel())?;
+            gpu.bias_add_f32(&pbs.dn_z_batch, &b.z, n, b.z.numel())?;
+        }
     } else {
-        [&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha]
-            .iter()
-            .find(|w| slots_weight_rotated(w.gpu_dtype))
-            .copied()
-    };
-    slots_norm_site(
-        gpu,
-        &pbs.x_batch,
-        &layer.attn_norm,
-        qkvza_anchor,
-        &pbs.x_rot_batch,
-        &pbs.x_norm_batch,
-        need_rot,
-        need_norm,
-        config.dim,
-        config.norm_eps,
-        n,
-    )?;
-    match qkvza_plan {
-        GroupPlan::Uniform(DType::Q8_0) if q8_wmma_arch => {
-            run_fused_qkvza_key(
-                gpu,
-                KernelKey::FusedQkvzaQ8_0,
-                &layer.wqkv.buf,
-                &layer.wz.buf,
-                &layer.w_beta.buf,
-                &layer.w_alpha.buf,
-                &pbs.x_norm_batch,
-                &pbs.dn_qkv_batch,
-                &pbs.dn_z_batch,
-                &pbs.dn_beta_batch,
-                &pbs.dn_alpha_batch,
-                layer.wqkv.m,
-                layer.wz.m,
-                layer.w_beta.m,
-                layer.w_alpha.m,
-                layer.wqkv.k,
-                n,
-            )?;
-        }
-        GroupPlan::Uniform(dt) => {
-            let x = if slots_weight_rotated(dt) {
-                &pbs.x_rot_batch
-            } else {
-                &pbs.x_norm_batch
-            };
-            run_fused_qkvza_key(
-                gpu,
-                fused_qkvza_key_for(dt),
-                &layer.wqkv.buf,
-                &layer.wz.buf,
-                &layer.w_beta.buf,
-                &layer.w_alpha.buf,
-                x,
-                &pbs.dn_qkv_batch,
-                &pbs.dn_z_batch,
-                &pbs.dn_beta_batch,
-                &pbs.dn_alpha_batch,
-                layer.wqkv.m,
-                layer.wz.m,
-                layer.w_beta.m,
-                layer.w_alpha.m,
-                layer.wqkv.k,
-                n,
-            )?;
-        }
-        GroupPlan::Mixed { .. } => {
-            for (w, out) in [
-                (&layer.wqkv, &pbs.dn_qkv_batch),
-                (&layer.wz, &pbs.dn_z_batch),
-                (&layer.w_beta, &pbs.dn_beta_batch),
-                (&layer.w_alpha, &pbs.dn_alpha_batch),
-            ] {
-                let y = out.sub_offset(0, n * w.m);
-                slots_plain_proj(gpu, w, &pbs.x_rot_batch, &pbs.x_norm_batch, &y, n)?;
+        // Per-site plans: the qkvza group keeps one fused launch when uniform,
+        // otherwise per-weight GEMMs; wo and the FFN weights validate their own
+        // roles inside their dispatchers.
+        let qkvza_plan = plan_q8_fused_or_plain(
+            plan_proj_group(
+                &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
+                "DeltaNet qkvza",
+                arch,
+            )?,
+            q8_wmma_arch,
+        );
+        slots_check_residual_weight(&layer.wo, "DeltaNet wo", arch)?;
+        // Uniform rotated groups keep the fused rmsnorm+rotate producer; mixed
+        // groups normalize once, rotate the normed rows, then run one plain GEMM
+        // per weight (each member's dtype picks its input variant — the
+        // load-bearing bit: an unrotated member MUST NOT read rotated activations).
+        let (need_rot, need_norm) = match qkvza_plan {
+            GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
+            GroupPlan::Mixed {
+                needs_rot,
+                needs_norm,
+            } => (needs_rot, needs_norm),
+        };
+        let qkvza_anchor = if let GroupPlan::Uniform(dt) = qkvza_plan {
+            slots_weight_rotated(dt).then_some(&layer.wqkv)
+        } else {
+            [&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha]
+                .iter()
+                .find(|w| slots_weight_rotated(w.gpu_dtype))
+                .copied()
+        };
+        slots_norm_site(
+            gpu,
+            &pbs.x_batch,
+            &layer.attn_norm,
+            qkvza_anchor,
+            &pbs.x_rot_batch,
+            &pbs.x_norm_batch,
+            need_rot,
+            need_norm,
+            config.dim,
+            config.norm_eps,
+            n,
+        )?;
+        match qkvza_plan {
+            GroupPlan::Uniform(DType::Q8_0) if q8_wmma_arch => {
+                run_fused_qkvza_key(
+                    gpu,
+                    KernelKey::FusedQkvzaQ8_0,
+                    &layer.wqkv.buf,
+                    &layer.wz.buf,
+                    &layer.w_beta.buf,
+                    &layer.w_alpha.buf,
+                    &pbs.x_norm_batch,
+                    &pbs.dn_qkv_batch,
+                    &pbs.dn_z_batch,
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    layer.wqkv.m,
+                    layer.wz.m,
+                    layer.w_beta.m,
+                    layer.w_alpha.m,
+                    layer.wqkv.k,
+                    n,
+                )?;
+            }
+            GroupPlan::Uniform(dt) => {
+                let x = if slots_weight_rotated(dt) {
+                    &pbs.x_rot_batch
+                } else {
+                    &pbs.x_norm_batch
+                };
+                run_fused_qkvza_key(
+                    gpu,
+                    fused_qkvza_key_for(dt),
+                    &layer.wqkv.buf,
+                    &layer.wz.buf,
+                    &layer.w_beta.buf,
+                    &layer.w_alpha.buf,
+                    x,
+                    &pbs.dn_qkv_batch,
+                    &pbs.dn_z_batch,
+                    &pbs.dn_beta_batch,
+                    &pbs.dn_alpha_batch,
+                    layer.wqkv.m,
+                    layer.wz.m,
+                    layer.w_beta.m,
+                    layer.w_alpha.m,
+                    layer.wqkv.k,
+                    n,
+                )?;
+            }
+            GroupPlan::Mixed { .. } => {
+                for (w, out) in [
+                    (&layer.wqkv, &pbs.dn_qkv_batch),
+                    (&layer.wz, &pbs.dn_z_batch),
+                    (&layer.w_beta, &pbs.dn_beta_batch),
+                    (&layer.w_alpha, &pbs.dn_alpha_batch),
+                ] {
+                    let y = out.sub_offset(0, n * w.m);
+                    slots_plain_proj(gpu, w, &pbs.x_rot_batch, &pbs.x_norm_batch, &y, n)?;
+                }
             }
         }
     }
@@ -1661,32 +1851,74 @@ where
         n,
     )?;
 
-    // 8. wo + residual — dispatched by wo's own dtype (Q8 residual, rotated
-    // containers rotate into dn_normed_rot first, HFQ* containers direct).
-    slots_residual_proj(
-        gpu,
-        &layer.wo,
-        &pbs.dn_normed_batch,
-        &pbs.x_batch,
-        &pbs.dn_normed_rot_batch,
-        &pbs.x_rot_batch,
-        n,
-        q8_wmma_arch,
-    )?;
+    // 8. wo + residual, 9. FFN.
+    //
+    // ESCHA: out_proj and the whole FFN are trellis codes. The fused residual
+    // epilogue and the fused gate_up launch cannot read a trellis code, so each
+    // projection runs as a grouped GEMM and the residual accumulate is a
+    // separate exact f32 add — mirroring the decode reference's
+    // `escha_run_resid` (RESID_WO + RESID_DOWN_SWIGLU) row-for-row, biases
+    // applied to the residual stream AFTER the add, exactly as `run_residual_gemv`.
+    if let Some(e) = escha {
+        let grouped = Some((escha_off.as_ref().expect("escha offsets built"), &e.iota));
+        // 8. wo + residual.
+        e.o.forward(
+            gpu, &layer.wo, &e.ids, &pbs.dn_normed_batch, &pbs.escha_xh_batch,
+            &pbs.escha_y_batch, &pbs.escha_y_batch, n, grouped,
+        )?;
+        let dim = layer.wo.m;
+        let y = pbs.escha_y_batch.sub_offset(0, n * dim);
+        let x = pbs.x_batch.sub_offset(0, n * dim);
+        gpu.add_inplace_f32(&x, &y)?;
+        if let Some(b) = layer.biases.as_ref() {
+            gpu.bias_add_f32(&pbs.x_batch, &b.o, n, b.o.numel())?;
+        }
+        // 9. FFN: rmsnorm, gate+up, silu_mul, down + residual.
+        escha_ffn_body_slots(
+            gpu,
+            config,
+            &layer.ffn_norm,
+            &layer.w_gate,
+            &layer.w_up,
+            &layer.w_down,
+            &e.gate,
+            &e.up,
+            &e.down,
+            &e.ids,
+            escha_off.as_ref().expect("escha offsets built"),
+            &e.iota,
+            layer.biases.as_ref().map(|b| (&b.gate, &b.up, &b.down)),
+            pbs,
+            n,
+        )
+    } else {
+        // 8. wo + residual — dispatched by wo's own dtype (Q8 residual, rotated
+        // containers rotate into dn_normed_rot first, HFQ* containers direct).
+        slots_residual_proj(
+            gpu,
+            &layer.wo,
+            &pbs.dn_normed_batch,
+            &pbs.x_batch,
+            &pbs.dn_normed_rot_batch,
+            &pbs.x_rot_batch,
+            n,
+            q8_wmma_arch,
+        )?;
 
-    // 9. FFN: rmsnorm, gate+up, silu_mul, w_down + residual — dispatched per
-    // site inside the body.
-    dense_ffn_body_slots(
-        gpu,
-        config,
-        &layer.ffn_norm,
-        &layer.w_gate,
-        &layer.w_up,
-        &layer.w_down,
-        pbs,
-        n,
-        q8_wmma_arch,
-    )
+        // 9. FFN: rmsnorm, gate+up, silu_mul, w_down + residual — dispatched per
+        // site inside the body.
+        dense_ffn_body_slots(
+            gpu,
+            config,
+            &layer.ffn_norm,
+            &layer.w_gate,
+            &layer.w_up,
+            &layer.w_down,
+            pbs,
+            n,
+            q8_wmma_arch,
+        )
+    }
 }
 
 /// Run one `LinearAttention` (DeltaNet) + MoE layer across the whole step.
@@ -2858,96 +3090,149 @@ fn run_fullattn_layer_slots(
     use_mrope: bool,
 ) -> HipResult<()> {
     let arch = gpu.arch.as_str();
-    // Per-site plans: {wq,wk,wv} keep one fused launch when uniform, wo and
-    // the FFN weights validate their own roles inside their dispatchers.
-    let qkv_plan = plan_q8_fused_or_plain(
-        plan_proj_group(&[&layer.wq, &layer.wk, &layer.wv], "FullAttn qkv", arch)?,
-        q8_wmma_arch,
-    );
-    slots_check_residual_weight(&layer.wo, "FullAttn wo", arch)?;
-
+    let escha = layer.escha.as_ref();
+    // One `[0, n]` grouped-GEMM offset table per layer, shared by every coded
+    // projection (a dense linear is a single group holding all n slots). See
+    // `run_deltanet_layer_slots`: fail closed if n exceeds the trellis table.
+    let escha_off = if let Some(e) = escha {
+        if n > e.iota.numel() {
+            return Err(HipError::new(
+                0,
+                "escha batched prefill: step rows exceed the trellis slot table \
+                 (ESCHA_MAX_SLOTS); lower serve.max_batch_tokens",
+            ));
+        }
+        Some(escha_group_offsets(gpu, n)?)
+    } else {
+        None
+    };
     let dim = config.dim;
 
     // 1-2. rmsnorm (+FWHT-rotate for rotated containers) then the 3-way QKV
     // projection — same group-plan rules as the DeltaNet site above.
-    let (need_rot, need_norm) = match qkv_plan {
-        GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
-        GroupPlan::Mixed {
-            needs_rot,
-            needs_norm,
-        } => (needs_rot, needs_norm),
-    };
-    let qkv_anchor = if let GroupPlan::Uniform(dt) = qkv_plan {
-        slots_weight_rotated(dt).then_some(&layer.wq)
+    //
+    // ESCHA FIRST: q/k/v are trellis codes, each applying its OWN `rin` to the
+    // normed input. Unlike DeltaNet there is no uncoded MQ6 sibling here, so
+    // only x_norm is produced — no FWHT rotation (a pre-rotated input would be
+    // rotated twice). The fused Qkv launch cannot read a trellis code; the
+    // grouped GEMM reads each weight once per (layer,batch) instead of once per
+    // slot — the dense-prefill fix. Biases land on the FULL q buffer before the
+    // shared deinterleave below, exactly as the decode `apply_proj_biases`.
+    if let Some(e) = escha {
+        let grouped = Some((escha_off.as_ref().expect("escha offsets built"), &e.iota));
+        gpu.rmsnorm_batched(
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &pbs.x_norm_batch,
+            n,
+            dim,
+            config.norm_eps,
+        )?;
+        e.q.forward(
+            gpu, &layer.wq, &e.ids, &pbs.x_norm_batch, &pbs.escha_xh_batch,
+            &pbs.fa_q_full_batch, &pbs.fa_q_full_batch, n, grouped,
+        )?;
+        e.k.forward(
+            gpu, &layer.wk, &e.ids, &pbs.x_norm_batch, &pbs.escha_xh_batch,
+            &pbs.fa_k_batch, &pbs.fa_k_batch, n, grouped,
+        )?;
+        e.v.forward(
+            gpu, &layer.wv, &e.ids, &pbs.x_norm_batch, &pbs.escha_xh_batch,
+            &pbs.fa_v_batch, &pbs.fa_v_batch, n, grouped,
+        )?;
+        if let Some(b) = layer.biases.as_ref() {
+            gpu.bias_add_f32(&pbs.fa_q_full_batch, &b.q, n, b.q.numel())?;
+            gpu.bias_add_f32(&pbs.fa_k_batch, &b.k, n, b.k.numel())?;
+            gpu.bias_add_f32(&pbs.fa_v_batch, &b.v, n, b.v.numel())?;
+        }
     } else {
-        [&layer.wq, &layer.wk, &layer.wv]
-            .iter()
-            .find(|w| slots_weight_rotated(w.gpu_dtype))
-            .copied()
-    };
-    slots_norm_site(
-        gpu,
-        &pbs.x_batch,
-        &layer.attn_norm,
-        qkv_anchor,
-        &pbs.x_rot_batch,
-        &pbs.x_norm_batch,
-        need_rot,
-        need_norm,
-        dim,
-        config.norm_eps,
-        n,
-    )?;
-    match qkv_plan {
-        GroupPlan::Uniform(DType::Q8_0) if q8_wmma_arch => {
-            run_fused_qkv_key(
-                gpu,
-                KernelKey::FusedQkvQ8_0,
-                &layer.wq.buf,
-                &layer.wk.buf,
-                &layer.wv.buf,
-                &pbs.x_norm_batch,
-                &pbs.fa_q_full_batch,
-                &pbs.fa_k_batch,
-                &pbs.fa_v_batch,
-                layer.wq.m,
-                layer.wk.m,
-                layer.wv.m,
-                layer.wq.k,
-                n,
-            )?;
-        }
-        GroupPlan::Uniform(dt) => {
-            let x = if slots_weight_rotated(dt) {
-                &pbs.x_rot_batch
-            } else {
-                &pbs.x_norm_batch
-            };
-            run_fused_qkv_key(
-                gpu,
-                fused_qkv_key_for(dt),
-                &layer.wq.buf,
-                &layer.wk.buf,
-                &layer.wv.buf,
-                x,
-                &pbs.fa_q_full_batch,
-                &pbs.fa_k_batch,
-                &pbs.fa_v_batch,
-                layer.wq.m,
-                layer.wk.m,
-                layer.wv.m,
-                layer.wq.k,
-                n,
-            )?;
-        }
-        GroupPlan::Mixed { .. } => {
-            for (w, out) in [
-                (&layer.wq, &pbs.fa_q_full_batch),
-                (&layer.wk, &pbs.fa_k_batch),
-                (&layer.wv, &pbs.fa_v_batch),
-            ] {
-                let y = out.sub_offset(0, n * w.m);
-                slots_plain_proj(gpu, w, &pbs.x_rot_batch, &pbs.x_norm_batch, &y, n)?;
+        // Per-site plans: {wq,wk,wv} keep one fused launch when uniform, wo and
+        // the FFN weights validate their own roles inside their dispatchers.
+        let qkv_plan = plan_q8_fused_or_plain(
+            plan_proj_group(&[&layer.wq, &layer.wk, &layer.wv], "FullAttn qkv", arch)?,
+            q8_wmma_arch,
+        );
+        slots_check_residual_weight(&layer.wo, "FullAttn wo", arch)?;
+
+        let (need_rot, need_norm) = match qkv_plan {
+            GroupPlan::Uniform(dt) => (slots_weight_rotated(dt), !slots_weight_rotated(dt)),
+            GroupPlan::Mixed {
+                needs_rot,
+                needs_norm,
+            } => (needs_rot, needs_norm),
+        };
+        let qkv_anchor = if let GroupPlan::Uniform(dt) = qkv_plan {
+            slots_weight_rotated(dt).then_some(&layer.wq)
+        } else {
+            [&layer.wq, &layer.wk, &layer.wv]
+                .iter()
+                .find(|w| slots_weight_rotated(w.gpu_dtype))
+                .copied()
+        };
+        slots_norm_site(
+            gpu,
+            &pbs.x_batch,
+            &layer.attn_norm,
+            qkv_anchor,
+            &pbs.x_rot_batch,
+            &pbs.x_norm_batch,
+            need_rot,
+            need_norm,
+            dim,
+            config.norm_eps,
+            n,
+        )?;
+        match qkv_plan {
+            GroupPlan::Uniform(DType::Q8_0) if q8_wmma_arch => {
+                run_fused_qkv_key(
+                    gpu,
+                    KernelKey::FusedQkvQ8_0,
+                    &layer.wq.buf,
+                    &layer.wk.buf,
+                    &layer.wv.buf,
+                    &pbs.x_norm_batch,
+                    &pbs.fa_q_full_batch,
+                    &pbs.fa_k_batch,
+                    &pbs.fa_v_batch,
+                    layer.wq.m,
+                    layer.wk.m,
+                    layer.wv.m,
+                    layer.wq.k,
+                    n,
+                )?;
+            }
+            GroupPlan::Uniform(dt) => {
+                let x = if slots_weight_rotated(dt) {
+                    &pbs.x_rot_batch
+                } else {
+                    &pbs.x_norm_batch
+                };
+                run_fused_qkv_key(
+                    gpu,
+                    fused_qkv_key_for(dt),
+                    &layer.wq.buf,
+                    &layer.wk.buf,
+                    &layer.wv.buf,
+                    x,
+                    &pbs.fa_q_full_batch,
+                    &pbs.fa_k_batch,
+                    &pbs.fa_v_batch,
+                    layer.wq.m,
+                    layer.wk.m,
+                    layer.wv.m,
+                    layer.wq.k,
+                    n,
+                )?;
+            }
+            GroupPlan::Mixed { .. } => {
+                for (w, out) in [
+                    (&layer.wq, &pbs.fa_q_full_batch),
+                    (&layer.wk, &pbs.fa_k_batch),
+                    (&layer.wv, &pbs.fa_v_batch),
+                ] {
+                    let y = out.sub_offset(0, n * w.m);
+                    slots_plain_proj(gpu, w, &pbs.x_rot_batch, &pbs.x_norm_batch, &y, n)?;
+                }
             }
         }
     }
@@ -3059,31 +3344,70 @@ fn run_fullattn_layer_slots(
         &pbs.fa_gate_batch.sub_offset(0, gate_elems),
     )?;
 
-    // 9. wo + residual — dispatched by wo's own dtype (rotated containers
-    // rotate into fa_attn_out_rot first, HFQ*/Q8 project directly).
-    slots_residual_proj(
-        gpu,
-        &layer.wo,
-        &pbs.fa_attn_out_batch,
-        &pbs.x_batch,
-        &pbs.fa_attn_out_rot_batch,
-        &pbs.x_rot_batch,
-        n,
-        q8_wmma_arch,
-    )?;
+    // 9. wo + residual, 10. FFN.
+    //
+    // ESCHA: out_proj and the whole FFN are trellis codes — grouped GEMM +
+    // separate exact f32 residual add, mirroring the decode reference's
+    // `escha_run_resid` (input is `fa_attn_out`, not `dn_normed`), biases on the
+    // residual stream AFTER the add.
+    if let Some(e) = escha {
+        let grouped = Some((escha_off.as_ref().expect("escha offsets built"), &e.iota));
+        // 9. wo + residual.
+        e.o.forward(
+            gpu, &layer.wo, &e.ids, &pbs.fa_attn_out_batch, &pbs.escha_xh_batch,
+            &pbs.escha_y_batch, &pbs.escha_y_batch, n, grouped,
+        )?;
+        let y = pbs.escha_y_batch.sub_offset(0, n * dim);
+        let x = pbs.x_batch.sub_offset(0, n * dim);
+        gpu.add_inplace_f32(&x, &y)?;
+        if let Some(b) = layer.biases.as_ref() {
+            gpu.bias_add_f32(&pbs.x_batch, &b.o, n, b.o.numel())?;
+        }
+        // 10. FFN: rmsnorm, gate+up, silu_mul, down + residual.
+        escha_ffn_body_slots(
+            gpu,
+            config,
+            &layer.ffn_norm,
+            &layer.w_gate,
+            &layer.w_up,
+            &layer.w_down,
+            &e.gate,
+            &e.up,
+            &e.down,
+            &e.ids,
+            escha_off.as_ref().expect("escha offsets built"),
+            &e.iota,
+            layer.biases.as_ref().map(|b| (&b.gate, &b.up, &b.down)),
+            pbs,
+            n,
+        )
+    } else {
+        // 9. wo + residual — dispatched by wo's own dtype (rotated containers
+        // rotate into fa_attn_out_rot first, HFQ*/Q8 project directly).
+        slots_residual_proj(
+            gpu,
+            &layer.wo,
+            &pbs.fa_attn_out_batch,
+            &pbs.x_batch,
+            &pbs.fa_attn_out_rot_batch,
+            &pbs.x_rot_batch,
+            n,
+            q8_wmma_arch,
+        )?;
 
-    // 10. FFN: rmsnorm, gate+up, silu_mul, w_down + residual — per-site.
-    dense_ffn_body_slots(
-        gpu,
-        config,
-        &layer.ffn_norm,
-        &layer.w_gate,
-        &layer.w_up,
-        &layer.w_down,
-        pbs,
-        n,
-        q8_wmma_arch,
-    )
+        // 10. FFN: rmsnorm, gate+up, silu_mul, w_down + residual — per-site.
+        dense_ffn_body_slots(
+            gpu,
+            config,
+            &layer.ffn_norm,
+            &layer.w_gate,
+            &layer.w_up,
+            &layer.w_down,
+            pbs,
+            n,
+            q8_wmma_arch,
+        )
+    }
 }
 
 /// Run one `FullAttention` + MoE layer across the whole step. Same shape as
