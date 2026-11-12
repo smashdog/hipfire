@@ -25,6 +25,16 @@ struct KvSlotDesc {
     int cap;                    // physical slab capacity in tokens; seq_len <= cap
 };
 
+// Presence test, legacy-header edition: a contiguous slab is always fully
+// resident, so every kernel body's KVMem mask below is a compile-time-true
+// branch under this header. The paged header defines the real test.
+__device__ __forceinline__ bool kv_page_present(const KvSlotDesc& s, int pos)
+{
+    (void)s;
+    (void)pos;
+    return true;
+}
+
 // Byte offset of position `pos` within slot `s`'s K slab.
 // `per_pos_bytes` is the per-position stride in bytes, uniform across slots
 // (n_kv_heads * (head_dim/32) * 34 for Q8_0).

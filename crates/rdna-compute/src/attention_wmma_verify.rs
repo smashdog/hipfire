@@ -38,6 +38,16 @@
 //! (the running max moves only when a tile exceeds it by 8 log2 units, exact
 //! algebra, P <= 256). Not byte-identical to the incumbent routes,
 //! KLD-gated. Deterministic: no atomics, fixed grid, fixed reduce order.
+//!
+//! Paged twin ([`Gpu::attention_verify_wmma_q8_gfx1100_paged`], module
+//! `attention_verify_wmma_gfx1100_paged`): the slot engine (KVMem) compiles
+//! the same body against the paged `KvSlotDesc` header and appends
+//! `slot_descs`/`row_slot` to the ABI. Every 32-key tile resolves its page
+//! through the block table; a KVMem-spilled (absent) page is addressed at
+//! arena page 0 and masked to -inf, so resident-only data is bitwise equal
+//! to this module and a spilled page costs one mask instead of a full-tile
+//! read. Admitted only for a single active slot's rows (one descriptor per
+//! step).
 
 use crate::{kernels, Gpu, GpuTensor};
 use hip_bridge::HipResult;
@@ -53,6 +63,16 @@ pub const WMMA_VERIFY_ATTN_SYMBOLS: [&str; 3] = [
     "attention_verify_wmma_q8_qt3_gfx1100",
 ];
 pub const WMMA_VERIFY_ATTN_REDUCE: &str = "attention_verify_wmma_reduce_gfx1100";
+/// Paged (KVMem) variant: same body compiled against the paged `KvSlotDesc`
+/// header with the QT kernels renamed (see
+/// `kernels::attention_verify_wmma_paged_source`). The reduce kernel is
+/// shared verbatim under its original name.
+pub const WMMA_VERIFY_ATTN_PAGED_MODULE: &str = "attention_verify_wmma_gfx1100_paged";
+pub const WMMA_VERIFY_ATTN_PAGED_SYMBOLS: [&str; 3] = [
+    "attention_verify_wmma_q8_qt1_paged_gfx1100",
+    "attention_verify_wmma_q8_qt2_paged_gfx1100",
+    "attention_verify_wmma_q8_qt3_paged_gfx1100",
+];
 
 /// Largest verify block (rows) the route takes.
 pub const WMMA_VERIFY_ATTN_MAX_ROWS: usize = 8;
@@ -226,6 +246,134 @@ impl Gpu {
         }
         Ok(true)
     }
+
+    /// Paged twin of [`Self::attention_verify_wmma_q8_gfx1100`]: identical
+    /// arithmetic and partial layout, but every 32-key tile is addressed
+    /// through this step's `KvSlotDesc` block table, and a tile whose logical
+    /// page is absent (`-1`, KVMem-spilled to host) publishes -inf instead of
+    /// resident bytes. With every page resident the result is bitwise equal
+    /// to the descriptor-less route on the same cache bytes.
+    ///
+    /// `slot_descs`/`row_slot` are the slot engine's usual staging buffers
+    /// (`descs_dev`, `row_slot_dev`). Admission is the descriptor-less gate
+    /// plus `page_tokens` being a positive multiple of the kernel's 32-key
+    /// tile (the paged pool's 128 satisfies it); the caller must pass a
+    /// SINGLE active slot's rows (all `row_slot[..rows]` equal), because the
+    /// kernel resolves one descriptor for the whole verify step. `Ok(false)`
+    /// = not admitted; the caller falls back to its tiles/scalar ladder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_verify_wmma_q8_gfx1100_paged(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        ctx_len: usize,
+        rows: usize,
+        partials: &GpuTensor,
+        slot_descs: &GpuTensor,
+        row_slot: &GpuTensor,
+        page_tokens: usize,
+    ) -> HipResult<bool> {
+        if !self.wmma_verify_attn_active(rows, n_heads, n_kv_heads, head_dim) {
+            return Ok(false);
+        }
+        if page_tokens == 0 || page_tokens % 32 != 0 {
+            return Ok(false);
+        }
+        let q_dim = n_heads * head_dim;
+        let nblk = wmma_verify_attn_spans(rows, ctx_len);
+        if partials.numel() < wmma_verify_attn_partials_len(rows, n_heads, ctx_len)
+            || q.numel() < rows * q_dim
+            || out.numel() < rows * q_dim
+            || positions.numel() < rows
+            || row_slot.numel() < rows
+            || slot_descs.numel() < 1
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let qt = wmma_verify_attn_qt(rows);
+        let symbol = WMMA_VERIFY_ATTN_PAGED_SYMBOLS[qt - 1];
+        let source = kernels::attention_verify_wmma_paged_source();
+        self.ensure_kernel(WMMA_VERIFY_ATTN_PAGED_MODULE, &source, symbol)?;
+        self.ensure_kernel(WMMA_VERIFY_ATTN_PAGED_MODULE, &source, WMMA_VERIFY_ATTN_REDUCE)?;
+        let bit = 1u32 << (2 + qt);
+        if WMMA_VERIFY_ATTN_ENGAGED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            eprintln!(
+                "[wmma-verify-attn] paged route active: {symbol} rows={rows} spans={nblk} ctx={ctx_len}"
+            );
+        }
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let p_ptr = partials.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let descs_ptr = slot_descs.buf.as_ptr();
+        let rs_ptr = row_slot.buf.as_ptr();
+        let nh = n_heads as i32;
+        // Scores in log2 units: one v_exp_f32 per score.
+        let scale_log2 = std::f32::consts::LOG2_E / (head_dim as f32).sqrt();
+        let n_blk = nblk as i32;
+        let max_spans = nblk as i32;
+        let batch_offset = 0i32;
+        let rows_i = rows as i32;
+        // Paged ABI: the same tail plus the slot descriptor and row -> slot map.
+        {
+            let func = &self.functions[symbol];
+            let mut params: Vec<*mut c_void> = vec![
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &v_ptr as *const _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &scale_log2 as *const _ as *mut c_void,
+                &n_blk as *const _ as *mut c_void,
+                &max_spans as *const _ as *mut c_void,
+                &batch_offset as *const _ as *mut c_void,
+                &rows_i as *const _ as *mut c_void,
+                &descs_ptr as *const _ as *mut c_void,
+                &rs_ptr as *const _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [n_kv_heads as u32, nblk as u32, 1],
+                    [(128 * qt) as u32, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+        let func = &self.functions[WMMA_VERIFY_ATTN_REDUCE];
+        let mut params: Vec<*mut c_void> = vec![
+            &p_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &n_blk as *const _ as *mut c_void,
+            &max_spans as *const _ as *mut c_void,
+            &batch_offset as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, rows as u32, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )?;
+        }
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -268,12 +416,30 @@ mod tests {
         {
             assert!(entry.symbols.contains(s), "{s}");
         }
+        // The paged (KVMem) twin is its own module: renamed QT kernels over
+        // the paged descriptor header, sharing the reduce kernel.
+        let paged = entries
+            .iter()
+            .find(|e| e.module == WMMA_VERIFY_ATTN_PAGED_MODULE)
+            .expect("paged module registered for gfx1100");
+        assert_eq!(
+            paged.source(),
+            kernels::attention_verify_wmma_paged_source()
+        );
+        for s in WMMA_VERIFY_ATTN_PAGED_SYMBOLS
+            .iter()
+            .chain([&WMMA_VERIFY_ATTN_REDUCE])
+        {
+            assert!(paged.symbols.contains(s), "{s}");
+        }
         for arch in ["gfx1151", "gfx1201", "gfx906", "gfx942"] {
             let other = crate::kernel_registry::entries(arch, "").unwrap();
-            assert!(
-                other.iter().all(|e| e.module != WMMA_VERIFY_ATTN_MODULE),
-                "{arch}"
-            );
+            for module in [WMMA_VERIFY_ATTN_MODULE, WMMA_VERIFY_ATTN_PAGED_MODULE] {
+                assert!(
+                    other.iter().all(|e| e.module != module),
+                    "{arch} must not carry {module}"
+                );
+            }
         }
     }
 }

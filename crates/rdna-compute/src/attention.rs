@@ -6221,6 +6221,43 @@ impl Gpu {
         }
     }
 
+    /// Whether the paged (`_wmma_slots`) prefill route must run the FA2 body
+    /// instead of the query-tiled WMMA kernel.
+    ///
+    /// This mirrors the default-route ingress in
+    /// [`Self::attention_q8_0_flash_prefill_wmma`] step for step — wide arm
+    /// (`gfx11_q8_fa2_wide` + 64..=8192 + `<=512 || %512 == 0`), then the
+    /// narrow `gfx11_fa2_prefill` arm — so a paged launch and a contiguous
+    /// launch of the same rows always run the SAME arithmetic. Any drift here
+    /// would silently break the bit-identical contract between the single-slot
+    /// and paged paths (the two kernels differ by ~6e-5 otherwise).
+    ///
+    /// Exact gfx1100 only: it is the card whose FA2 twin this build ships.
+    /// gfx1151's default body is its own twin file and stays on the
+    /// query-tiled paged kernel.
+    fn fa2_gfx11_paged_admitted(
+        &self,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        max_ctx_len: usize,
+    ) -> bool {
+        self.arch == "gfx1100"
+            && n_heads == 24
+            && n_kv_heads == 4
+            && head_dim == 256
+            && self.fa2_gfx11_ctx_admitted(max_ctx_len)
+            && ((self.flags.gfx11_q8_fa2_wide
+                && self.flags.gfx11_fa2_prefill
+                && (64..=8192).contains(&batch_size)
+                && (batch_size <= 512 || batch_size % 512 == 0))
+                || (self.flags.gfx11_fa2_prefill
+                    && !self.replay.is_recording()
+                    && !self.graphs.capture_mode
+                    && self.fa2_gfx11_batch_admitted(batch_size)))
+    }
+
     /// Whether the default gfx1201 Q8 FA2 prefill arm of
     /// [`Self::attention_q8_0_flash_prefill_wmma`] takes this call (exact
     /// arch/shape gates). Dispatch asks the same question before it routes
@@ -6595,6 +6632,38 @@ impl Gpu {
             head_dim <= 256,
             "head_dim {head_dim} exceeds MAX_D_CHUNKS*16"
         );
+        // Paged FA2: whenever the contiguous ingress would take the FA2 body
+        // for this row count, the paged route must too. Otherwise the two
+        // paths differ numerically (query-tiled WMMA vs FA2 ~6e-5) and the
+        // bit-identical contract between the single-slot and paged launches
+        // breaks. Spilled pages are masked inside the body; with every page
+        // resident the descriptor degenerates to contiguous addressing.
+        if multi_slot
+            && self.fa2_gfx11_paged_admitted(
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                batch_size,
+                max_ctx_len,
+            )
+        {
+            return self.attention_q8_0_fa2_gqa_gfx11_paged(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len,
+                batch_size,
+                slot_descs.unwrap(),
+                tile_slot.unwrap(),
+                tile_row0.unwrap(),
+                tile_qbase.unwrap(),
+            );
+        }
         // HIPFIRE_FLASH_PREFILL_SPLITQ=1 carries Q as a double-single (hi+lo)
         // pair through two WMMA passes per d-chunk. Q's f16 rounding is the
         // dominant error term — f16 Q alone through an otherwise-f32 kernel
@@ -9350,6 +9419,247 @@ impl Gpu {
         result
     }
 
+    /// Paged multi-slot variant of [`Self::attention_q8_0_fa2_gqa_gfx11`].
+    ///
+    /// Same kernel body and arithmetic as the descriptor-less FA2 launch —
+    /// the K/V fill helpers resolve each key through the tile's slot
+    /// descriptor (`kv_offset_for_k`) and a key whose block-table entry is -1
+    /// (spilled by the KV working-set manager) is staged as zeros and masked
+    /// out of the softmax, never dereferenced. With every page resident the
+    /// descriptor degenerates to `base + pos * row_stride`, so the output is
+    /// bit-identical to the contiguous FA2 launch on the same rows.
+    ///
+    /// Tile arrays follow [`Self::attention_q8_0_flash_prefill_wmma_slots`]:
+    /// `tile_slot[t]` selects the slot descriptor, `tile_qbase[t]` is the
+    /// flat row where tile `t`'s q/out/positions start, `tile_row0[t]` is
+    /// ABI-reserved and unread. Build them with
+    /// `kv_slots::build_tiles(slot_query_counts, 16)` — FA2's query tile is
+    /// the same fixed 16 rows.
+    ///
+    /// Exact gfx1100 only (the card whose FA2 twin this route ships); every
+    /// other arch keeps the query-tiled `_wmma_slots` paged kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_fa2_gqa_gfx11_paged(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        slot_descs: &GpuTensor,
+        tile_slot: &GpuTensor,
+        tile_row0: &GpuTensor,
+        tile_qbase: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1100" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_gfx11_paged requires gfx1100, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_gfx11_paged requires H24/KV4/D256, got \
+                     H{n_heads}/KV{n_kv_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        let wide = self.flags.gfx11_q8_fa2_wide;
+        let max_fa2_batch: usize = if wide { 8192 } else { 512 };
+        if batch_size == 0 || batch_size > max_fa2_batch {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_gfx11_paged requires 1 <= batch <= {max_fa2_batch}, got {batch_size}"
+                ),
+            ));
+        }
+        let max_fa2_ctx = self.fa2_gfx11_max_ctx();
+        if max_ctx_len == 0 || max_ctx_len > max_fa2_ctx {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_gfx11_paged requires 1 <= max_ctx_len <= {max_fa2_ctx}, got {max_ctx_len}"
+                ),
+            ));
+        }
+        let Some(need_qo) = batch_size
+            .checked_mul(n_heads)
+            .and_then(|v| v.checked_mul(head_dim))
+        else {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_q8_0_fa2_gqa_gfx11_paged query size overflow",
+            ));
+        };
+        if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_gfx11_paged capacity mismatch: \
+                     q={} out={} positions={} (need qo>={need_qo}, pos>={batch_size})",
+                    q.numel(),
+                    out.numel(),
+                    positions.numel()
+                ),
+            ));
+        }
+        let n_tiles = tile_slot.numel();
+        if n_tiles == 0 {
+            return Ok(());
+        }
+        if tile_qbase.numel() < n_tiles || slot_descs.numel() == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_q8_0_fa2_gqa_gfx11_paged tile array too small",
+            ));
+        }
+        // `tile_row0` is ABI-reserved (positions[] is authoritative); bound it
+        // anyway so a malformed caller fails closed rather than silently
+        // passing a short buffer to the kernel.
+        if tile_row0.numel() < n_tiles {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_q8_0_fa2_gqa_gfx11_paged tile_row0 too small",
+            ));
+        }
+        // Same warp-specialized fill / R3 selection as the contiguous
+        // launcher, so a paged launch and the base launch of the same rows
+        // compile the same arithmetic (the variants are documented
+        // bit-identical; matching the flags keeps that independent of env).
+        let fill = hipfire_config::developer_bool("HIPFIRE_FA2_FILL", true);
+        let r3 = fill && hipfire_config::developer_bool("HIPFIRE_GFX1100_FA2_R3", true);
+        const MODULE: &str = "attention_q8_0_fa2_gqa_gfx1100_paged";
+        const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx1100_paged";
+        if !self.functions.contains_key(MODULE) || !self.functions.contains_key(PRECONVERT) {
+            let src = format!(
+                "{}#define HIPFIRE_FA2_KT 32\n#define HIPFIRE_FA2_Q16 1\n#define HIPFIRE_FA2_FILL {}\n#define HIPFIRE_FA2_GFX1100 {}\n{}",
+                if r3 { "// HIPFIRE_COMPILER_FLAGS: -mcumode\n" } else { "" },
+                u8::from(fill),
+                u8::from(r3),
+                kernels::kv_slot_desc_source(kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_SRC, true)
+            );
+            self.ensure_kernel(MODULE, &src, MODULE)?;
+            self.ensure_kernel(MODULE, &src, PRECONVERT)?;
+        }
+        // F4b scratch: [batch, 24, 256] f16, Gpu-owned, grows-never-shrinks.
+        let need_q16_bytes = need_qo.checked_mul(2).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "attention_q8_0_fa2_gqa_gfx11_paged Q16 size overflow")
+        })?;
+        if batch_size > 512
+            && (self.graphs.capture_mode || self.replay.is_recording())
+            && crate::scratch::scratch_will_grow(
+                self.scratch.fa2_q16_scratch_bytes,
+                self.scratch.fa2_q16_scratch.is_some(),
+                need_q16_bytes,
+            )
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "wide gfx11 FA2 paged Q16 scratch must be grown before graph capture/recording",
+            ));
+        }
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_q16_scratch_bytes,
+            self.scratch.fa2_q16_scratch.is_some(),
+            need_q16_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let grid_x = n_tiles as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q16_arg = q16_ptr;
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut desc_ptr = slot_descs.buf.as_ptr();
+        let mut tile_slot_ptr = tile_slot.buf.as_ptr();
+        let mut tile_row0_ptr = tile_row0.buf.as_ptr();
+        let mut tile_qbase_ptr = tile_qbase.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q16_arg as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut tile_slot_ptr as *mut _ as *mut c_void,
+            &mut tile_row0_ptr as *mut _ as *mut c_void,
+            &mut tile_qbase_ptr as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", MODULE, bytes);
+        self.launch_fa2_q_preconvert_gfx11(
+            PRECONVERT,
+            q.buf.as_ptr(),
+            q16_ptr,
+            std::ptr::null(),
+            std::ptr::null(),
+            batch_size,
+            0,
+        )?;
+        let result = self.launch_maybe_blob(
+            MODULE,
+            [grid_x, 4, 1],
+            [256, 1, 1],
+            32768,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q16_arg);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b.push_ptr(desc_ptr);
+                b.push_ptr(tile_slot_ptr);
+                b.push_ptr(tile_row0_ptr);
+                b.push_ptr(tile_qbase_ptr);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Experimental exact-gfx1100 split-KV twin of the tuned Q16/R3 FA2
     /// kernel. The partial grid partitions the live KT32 range across Z and
     /// the merge performs a stable LSE-weighted reduction. Product dispatch
@@ -11953,6 +12263,351 @@ impl Gpu {
     /// method). Used by cohere2moe's `sliding_attention` layers so context beyond
     /// `sliding_window` clips correctly instead of running full-causal (degraded).
     #[allow(clippy::too_many_arguments)]
+    /// Paged (KVMem) GQA-shared Q8_0 decode attention for a single row.
+    ///
+    /// The paged ladder's generic tile kernel launches one workgroup per
+    /// (q head, tile), so the six q heads of a kv head each re-read that kv
+    /// head's K/V tile — 6x the KV traffic of the reference gfx1100 decode
+    /// route (`attention_flash_q8_0_tile_gqa_gfx1100`, one 256-thread
+    /// workgroup per (kv head, tile)). At 56k context on the 7900 XT that
+    /// duplication made a KVMem AR step 46 ms against the reference's 27 ms.
+    ///
+    /// This launches the paged twin of that GQA tile (same body, block-table
+    /// tile base, spilled pages publish the empty partial) and then the same
+    /// `attention_flash_asym_reduce_batched` the paged ladder uses, so the
+    /// partials contract and reduce numerics are unchanged — only the K/V
+    /// traffic differs.
+    ///
+    /// `Ok(false)` declines (non-gfx1100, shape outside the GQA-6/head_dim
+    /// 256/tile 128 envelope, or tile misalignment with the page size); the
+    /// caller stays on the generic paged tile ladder.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_gqa_decode_paged(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        partials: &GpuTensor,
+        slot_descs: &GpuTensor,
+        row_slot: &GpuTensor,
+    ) -> HipResult<bool> {
+        let pos_ptr = positions.buf.as_ptr();
+        if !self.attention_flash_q8_0_gqa_paged_tile(
+            q,
+            k_cache,
+            v_cache,
+            partials,
+            pos_ptr,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            slot_descs,
+            row_slot,
+        )? {
+            return Ok(false);
+        }
+        let tile_size = 128usize; // fixed by the admitted kernel body
+        let max_tiles = max_ctx_len.div_ceil(tile_size);
+        self.ensure_kernel(
+            "attention_flash_asym_reduce_batched",
+            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC,
+            "attention_flash_asym_reduce_batched",
+        )?;
+        // Same reduce as the generic paged tile ladder: one row, so chunk=1
+        // and the batch offset is 0.
+        let (p_ptr, o_ptr) = (partials.buf.as_ptr(), out.buf.as_ptr());
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let ts = tile_size as i32;
+        let mt = max_tiles as i32;
+        let bo = 0i32;
+        let bs = 0i32;
+        let bc = 0i32;
+        let mut rparams: Vec<*mut c_void> = vec![
+            &p_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ts as *const _ as *mut c_void,
+            &mt as *const _ as *mut c_void,
+            &bo as *const _ as *mut c_void,
+            &bs as *const _ as *mut c_void,
+            &bc as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "attention_flash_asym_reduce_batched",
+            [n_heads as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut rparams,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p_ptr);
+                b.push_ptr(o_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(ts);
+                b.push_i32(mt);
+                b.push_i32(bo);
+                b.push_i32(bs);
+                b.push_i32(bc);
+                b
+            },
+        )?;
+        Ok(true)
+    }
+
+    /// Paged (KVMem) gated decode attention: the same block-table tile launch
+    /// as [`Self::attention_flash_q8_0_gqa_decode_paged`], followed by the
+    /// stock gated reduce
+    /// (`attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100`): it
+    /// applies `sigmoid(gate)` and the AWQ MQ rotation in the epilogue and
+    /// yields the prerotated input the `wo` GEMV reads.
+    ///
+    /// This is the paged twin of the reference sequential decode's own
+    /// epilogue route (`attention_flash_q8_0_gqa_gated_awq_gfx1100`), so a
+    /// paged single-row decode step issues byte-identical arithmetic to stock
+    /// hipfire: identical Q8_0 writers, identical tile partials for resident
+    /// pages, the identical reduce kernel. `Ok(false)` declines exactly where
+    /// the non-gated paged twin declines.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_gqa_decode_paged_gated(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        gate: &GpuTensor,
+        awq_scale: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        partials: &GpuTensor,
+        slot_descs: &GpuTensor,
+        row_slot: &GpuTensor,
+    ) -> HipResult<bool> {
+        if awq_scale.numel() < n_heads * head_dim {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "paged gated mq rotate reducer: undersized awq_scale (got {}, required {})",
+                    awq_scale.numel(),
+                    n_heads * head_dim,
+                ),
+            ));
+        }
+        let pos_ptr = pos_buf.as_ptr();
+        if !self.attention_flash_q8_0_gqa_paged_tile(
+            q,
+            k_cache,
+            v_cache,
+            partials,
+            pos_ptr,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            slot_descs,
+            row_slot,
+        )? {
+            return Ok(false);
+        }
+        const REDUCE: &str = "attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100";
+        self.ensure_kernel(
+            REDUCE,
+            kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC,
+            REDUCE,
+        )?;
+        self.ensure_mq_signs()?;
+        let tile_size = 128usize;
+        let max_tiles = max_ctx_len.div_ceil(tile_size);
+        let p_ptr = partials.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let g_ptr = gate.buf.as_ptr();
+        let aw_ptr = awq_scale.buf.as_ptr();
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let ts = tile_size as i32;
+        let mt = max_tiles as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &p_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &g_ptr as *const _ as *mut c_void,
+            &aw_ptr as *const _ as *mut c_void,
+            &s1_ptr as *const _ as *mut c_void,
+            &s2_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &ts as *const _ as *mut c_void,
+            &mt as *const _ as *mut c_void,
+        ];
+        let k = n_heads * head_dim;
+        let bytes = n_heads * max_tiles * (2 + head_dim) * 4 + k * 4 * 3;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", REDUCE, bytes);
+        let result = self.launch_maybe_blob(
+            REDUCE,
+            [n_heads as u32, 1, 1],
+            [1024, 1, 1],
+            (2 * max_tiles * 4) as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p_ptr);
+                b.push_ptr(o_ptr);
+                b.push_ptr(g_ptr);
+                b.push_ptr(aw_ptr);
+                b.push_ptr(s1_ptr);
+                b.push_ptr(s2_ptr);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_ptr(pos_ptr);
+                b.push_i32(ts);
+                b.push_i32(mt);
+                b
+            },
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.hip);
+        }
+        result?;
+        Ok(true)
+    }
+
+    /// Admission + tile launch shared by the paged GQA decode twins: one
+    /// 256-thread workgroup per (kv head, tile), block-table-addressed K/V,
+    /// `pos_buf[0]` read as the row's last logical position. `Ok(false)`
+    /// declines (non-gfx1100, shape outside the GQA-6/head_dim-256/tile-128
+    /// envelope, tile misaligned with the page size, or empty context).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_flash_q8_0_gqa_paged_tile(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        partials: &GpuTensor,
+        pos_ptr: *mut std::ffi::c_void,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        slot_descs: &GpuTensor,
+        row_slot: &GpuTensor,
+    ) -> HipResult<bool> {
+        self.bind_thread()?;
+        let tile_size = self.attn_tile_size();
+        // The GQA tile resolves one block-table entry per tile, so the tile
+        // must not straddle a page; page_tokens is 128 in production and the
+        // tile is fixed at 128 by the kernel body.
+        if self.arch.as_str() != "gfx1100"
+            || head_dim != 256
+            || n_kv_heads == 0
+            || n_heads != n_kv_heads * 6
+            || tile_size != 128
+            // One block-table entry must resolve a whole 128-key tile; a
+            // page smaller than the tile would straddle pages.
+            || crate::page_pool::PAGE_TOKENS != 128
+            || max_ctx_len == 0
+        {
+            return Ok(false);
+        }
+        const FUNC: &str = "attention_flash_q8_0_tile_gqa_paged_gfx1100";
+        if !self.functions.contains_key(FUNC) {
+            let src = kernels::attention_flash_q8_0_tile_gqa_paged_source();
+            self.ensure_kernel(FUNC, &src, FUNC)?;
+        }
+        // One stderr line the first time the route runs, so a harness log
+        // proves the paged GQA tile (and not the 6x-duplicated ladder tile)
+        // served this decode step.
+        static GQA_PAGED_ENGAGED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !GQA_PAGED_ENGAGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[attn] paged GQA decode tile engaged: {} heads, {} kv heads, \
+                 head_dim {}, max_tiles {}",
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len.div_ceil(tile_size),
+            );
+        }
+        let max_tiles = max_ctx_len.div_ceil(tile_size);
+        // The GQA entry walks tiles blockIdx.y, +gridDim.y, ...; cap Y so a
+        // 262k-token slot does not dispatch thousands of idle workgroups.
+        let launch_y = max_tiles.min(Q8_DECODE_GQA_GFX1100_TILE_GRID_Y_CAP).max(1) as u32;
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let p_ptr = partials.buf.as_ptr();
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let ms = max_ctx_len as i32;
+        let sc = 1.0f32 / (head_dim as f32).sqrt();
+        let ts = tile_size as i32;
+        let wn = 0i32;
+        let es = 0i32;
+        let desc_ptr = slot_descs.buf.as_ptr();
+        let row_slot_ptr = row_slot.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &q_ptr as *const _ as *mut c_void,
+            &k_ptr as *const _ as *mut c_void,
+            &v_ptr as *const _ as *mut c_void,
+            &p_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ms as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &ts as *const _ as *mut c_void,
+            &wn as *const _ as *mut c_void,
+            &es as *const _ as *mut c_void,
+            &desc_ptr as *const _ as *mut c_void,
+            &row_slot_ptr as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [n_kv_heads as u32, launch_y, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(p_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b.push_i32(ts);
+                b.push_i32(wn);
+                b.push_i32(es);
+                b.push_ptr(desc_ptr);
+                b.push_ptr(row_slot_ptr);
+                b
+            },
+        )?;
+        Ok(true)
+    }
+
     /// Whether [`Self::attention_q8_0_prefill_gqa_wmma`] admits this shape.
     pub fn attention_q8_0_prefill_gqa_wmma_admitted(
         &self,
@@ -12997,7 +13652,13 @@ impl Gpu {
                 ),
             ));
         }
-        self.ensure_kernel(
+        // The tile body `#include`s kv_slot_desc.h (shared with its paged
+        // twin), and the runtime hipcc compile has no -I to kernels/src, so
+        // this MUST go through the strip-and-prepend helper. Plain
+        // `ensure_kernel` fails the legacy decode with "kv_slot_desc.h file
+        // not found" — it only ever worked on the paged module because that
+        // one is compiled by `ensure_givens4_kv_slot_kernel`.
+        self.ensure_givens4_kernel(
             TILE,
             kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC,
             TILE,

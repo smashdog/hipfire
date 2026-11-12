@@ -44,6 +44,14 @@ use crate::kv_slots::{preflight_alloc, KvSlotDesc, R9700_VRAM_BYTES};
 /// tile size the flash path walks KV in.
 pub const PAGE_TOKENS: usize = 128;
 
+/// Block-table entry marking a logical page whose bytes are NOT resident in
+/// the arena: the host spilled them to the KV working-set manager (KVMem) and
+/// released the physical page. Uploaded as the i32 sentinel -1; the slot
+/// kernels mask it out through `kv_page_present` instead of dereferencing it.
+/// Every pre-KVMem table has no sentinel entries, so release/COW/share paths
+/// are unchanged on them.
+pub const SPILLED_PAGE: u32 = u32::MAX;
+
 /// A physical page index in the shared arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageId(pub u32);
@@ -256,9 +264,65 @@ impl BlockTable {
         self.live_tokens
     }
 
-    /// Physical page index for logical page `lp`, or None if out of range.
+    /// Physical page index for logical page `lp`, or None if out of range or
+    /// spilled. A spilled logical page occupies a table slot but owns no
+    /// physical page (its bytes live in the KV working-set manager).
     pub fn physical(&self, lp: usize) -> Option<u32> {
+        self.pages
+            .get(lp)
+            .copied()
+            .filter(|&p| p != SPILLED_PAGE)
+    }
+
+    /// Raw logical→physical entry including the [`SPILLED_PAGE`] sentinel.
+    pub fn raw_entry(&self, lp: usize) -> Option<u32> {
         self.pages.get(lp).copied()
+    }
+
+    /// True when logical page `lp` is spilled (entry present, no physical
+    /// page). Out-of-range logical pages are NOT spilled.
+    pub fn is_spilled(&self, lp: usize) -> bool {
+        self.pages.get(lp) == Some(&SPILLED_PAGE)
+    }
+
+    /// Bind logical page `lp` to a resident physical page (KVMem restore).
+    /// `lp` must already exist in the table — restore never extends the
+    /// logical page count; growth is `PagePool::ensure_capacity`'s job.
+    /// Returns Err when `lp` is out of range or already maps a page.
+    pub fn bind_physical(&mut self, lp: usize, phys: u32) -> Result<(), String> {
+        match self.pages.get(lp).copied() {
+            None => Err(format!(
+                "BlockTable::bind_physical: logical page {lp} does not exist \
+                 ({} pages)",
+                self.pages.len()
+            )),
+            Some(SPILLED_PAGE) => {
+                self.pages[lp] = phys;
+                Ok(())
+            }
+            Some(current) => Err(format!(
+                "BlockTable::bind_physical: logical page {lp} already maps \
+                 phys {current}, refusing to bind {phys} (release first)"
+            )),
+        }
+    }
+
+    /// Mark logical page `lp` spilled (KVMem stage-out). Returns the physical
+    /// page that was mapped, if any: `Ok(None)` is idempotent on an
+    /// already-spilled entry; Err when `lp` is out of range.
+    pub fn unbind_physical(&mut self, lp: usize) -> Result<Option<u32>, String> {
+        match self.pages.get(lp).copied() {
+            None => Err(format!(
+                "BlockTable::unbind_physical: logical page {lp} does not exist \
+                 ({} pages)",
+                self.pages.len()
+            )),
+            Some(SPILLED_PAGE) => Ok(None),
+            Some(phys) => {
+                self.pages[lp] = SPILLED_PAGE;
+                Ok(Some(phys))
+            }
+        }
     }
 
     /// Raw page indices for GPU upload.
@@ -781,6 +845,54 @@ impl PagePool {
         Ok(handles)
     }
 
+    // ── KVMem stage-out / stage-in (spill / restore) ──────────────────
+
+    /// Allocate a fresh physical page WITHOUT attaching it to a block
+    /// table. Returns the page in [`PageState::Private`] carrying one
+    /// `table_refs` unit, which the caller transfers to a table entry via
+    /// [`BlockTable::bind_physical`]. This is the restore half of
+    /// spill/restore: allocate, bind, then copy the KVMem bytes in.
+    ///
+    /// The ref is pre-granted because `bind_physical` only rewrites the
+    /// table slot — no separate `refcount_inc` step exists on the bind
+    /// path, so granting at alloc keeps the accounting identical to
+    /// `alloc_pages`.
+    pub fn alloc_page_unbound(&mut self) -> Result<u32, String> {
+        let page = self
+            .free_pages
+            .pop()
+            .ok_or_else(|| "alloc_page_unbound: no free pages".to_string())?;
+        let meta = &mut self.page_meta[page as usize];
+        meta.state = PageState::Private;
+        meta.generation = meta.generation.wrapping_add(1);
+        meta.table_refs = 1;
+        Ok(page)
+    }
+
+    /// Release the table ref on a page detached from any block table (the
+    /// spill half of spill/restore). Identical to `dec_table_ref`, exposed
+    /// publicly so the KVMem controller can retire a page it just removed
+    /// from a table.
+    pub fn release_bound_page(&mut self, phys: u32) -> Result<(), String> {
+        self.dec_table_ref(phys)
+    }
+
+    /// True when `phys` can be staged out to the KV working-set manager:
+    /// it is resident, exclusively owned by ONE block table (exactly one
+    /// table ref), and carries no cache or in-flight leases. Sealed pages
+    /// with ≥2 table refs (COW/prefix shares) are not evictable — the
+    /// bytes are still referenced by another table.
+    pub fn page_evictable(&self, phys: u32) -> bool {
+        if self.check_phys(phys).is_err() {
+            return false;
+        }
+        let meta = &self.page_meta[phys as usize];
+        matches!(meta.state, PageState::Private | PageState::Sealed)
+            && meta.table_refs == 1
+            && meta.cache_refs == 0
+            && meta.inflight_refs == 0
+    }
+
     // ── Prefix sharing (existing contract preserved) ──────────────────
 
     /// Share the first `n_pages` pages of `src` with `dst` by pushing the
@@ -848,7 +960,17 @@ impl PagePool {
             ));
         }
         for lp in 0..n_pages {
-            let phys = src.physical(lp).expect("src page exists");
+            let phys = match src.physical(lp) {
+                Some(p) => p,
+                None => {
+                    return Err(format!(
+                        "share_prefix: src logical page {} is spilled — a \
+                         non-resident prefix cannot be shared (restore it or \
+                         disable prefix sharing under KVMem)",
+                        lp
+                    ))
+                }
+            };
             self.check_phys(phys)?;
             let meta = &mut self.page_meta[phys as usize];
             meta.table_refs = meta
@@ -924,6 +1046,10 @@ impl PagePool {
     pub fn release_table(&mut self, table: &mut BlockTable) -> Result<(), String> {
         let mut had_error = false;
         for &phys in table.page_indices() {
+            // Spilled entries own no physical page — nothing to decrement.
+            if phys == SPILLED_PAGE {
+                continue;
+            }
             if let Err(_) = self.dec_table_ref(phys) {
                 had_error = true;
             }
@@ -952,8 +1078,12 @@ impl PagePool {
     ) -> Result<(), String> {
         let keep = table.num_pages().saturating_sub(n_pages);
         // Verify phase: every page about to be dropped must hold a table
-        // ref. dec_table_ref cannot fail after this.
+        // ref. dec_table_ref cannot fail after this. Spilled entries own no
+        // physical page and are dropped with the table slot.
         for &phys in &table.pages[keep..] {
+            if phys == SPILLED_PAGE {
+                continue;
+            }
             if self.page_meta[phys as usize].table_refs == 0 {
                 return Err(format!(
                     "free_pages_from_tail: table_refs underflow for phys {} \
@@ -964,6 +1094,9 @@ impl PagePool {
         }
         let freed = table.truncate(keep);
         for phys in freed {
+            if phys == SPILLED_PAGE {
+                continue;
+            }
             self.dec_table_ref(phys)?;
         }
         Ok(())
