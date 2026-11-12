@@ -14,7 +14,7 @@
 //   Enables dynamic allocation, prefix sharing, and over-subscription.
 
 use crate::kv_slots::{preflight_alloc, KvSlotDesc, R9700_VRAM_BYTES};
-use crate::page_pool::{BlockTable, PagePool, PAGE_TOKENS as POOL_PAGE_TOKENS};
+use crate::page_pool::{BlockTable, PagePool, PAGE_TOKENS as POOL_PAGE_TOKENS, SPILLED_PAGE};
 
 /// Slab capacities round up to this, so a future page size divides them.
 /// Matches the tile size the flash path walks KV in.
@@ -445,6 +445,103 @@ impl SlotPool {
     /// Get the block table for `slot`, if in paged mode.
     pub fn block_table(&self, slot: SlotId) -> Option<&BlockTable> {
         self.block_tables.get(slot.0).and_then(|bt| bt.as_ref())
+    }
+
+    // ── KVMem spill / restore hooks ────────────────────────────────────
+
+    /// Mutable access to `slot`'s block table for KVMem logical-page edits.
+    /// Marks the table dirty so the next forward's `upload_block_tables`
+    /// pushes the rewritten entries (spill/restore write the sentinel and
+    /// rebind physical pages directly).
+    pub fn edit_block_table(&mut self, slot: SlotId) -> Option<&mut BlockTable> {
+        self.block_tables.get(slot.0).and_then(|bt| bt.as_ref())?;
+        self.block_tables_dirty[slot.0] = true;
+        self.block_tables[slot.0].as_mut()
+    }
+
+    /// Stage logical page `lp` of `slot` OUT of the arena (KVMem spill,
+    /// commit half). The caller MUST have copied the page's bytes out
+    /// first — this only drops residency: the entry becomes
+    /// [`SPILLED_PAGE`] and the physical page returns to the pool. Returns
+    /// the released physical page (arena offsets for the copy were derived
+    /// from it).
+    ///
+    /// Refuses unless the page is exclusively table-owned
+    /// ([`PagePool::page_evictable`]) — a COW/prefix-shared or leased page
+    /// still has live readers.
+    pub fn stage_out_page(&mut self, slot: SlotId, lp: usize) -> Result<u32, String> {
+        let pool = self
+            .page_pool
+            .as_mut()
+            .ok_or_else(|| "stage_out_page: not in paged mode".to_string())?;
+        let bt = self
+            .block_tables
+            .get_mut(slot.0)
+            .and_then(|bt| bt.as_mut())
+            .ok_or_else(|| format!("stage_out_page: slot {} has no block table", slot.0))?;
+        let phys = match bt.raw_entry(lp) {
+            Some(SPILLED_PAGE) => {
+                return Err(format!(
+                    "stage_out_page: slot {} logical page {lp} is already spilled",
+                    slot.0
+                ))
+            }
+            Some(phys) => phys,
+            None => {
+                return Err(format!(
+                    "stage_out_page: slot {} has no logical page {lp} ({} pages)",
+                    slot.0,
+                    bt.num_pages()
+                ))
+            }
+        };
+        if !pool.page_evictable(phys) {
+            return Err(format!(
+                "stage_out_page: slot {} logical page {lp} -> phys {phys} is not \
+                 exclusively table-owned (state={:?}, refs={}) — refusing to spill",
+                slot.0,
+                pool.page_state(phys),
+                pool.refcount(phys)
+            ));
+        }
+        bt.unbind_physical(lp)?;
+        pool.release_bound_page(phys)?;
+        self.block_tables_dirty[slot.0] = true;
+        Ok(phys)
+    }
+
+    /// Bind a freshly allocated physical page into logical slot `lp`
+    /// (KVMem restore, commit half). `phys` must come from
+    /// [`PagePool::alloc_page_unbound`]; on a bind failure the page is
+    /// released so it cannot leak. The caller then copies the KVMem bytes
+    /// into `phys`'s arena rows before the next forward — same host thread,
+    /// so no kernel can observe the half-restored page in between.
+    pub fn bind_restored_page(
+        &mut self,
+        slot: SlotId,
+        lp: usize,
+        phys: u32,
+    ) -> Result<(), String> {
+        let bt = match self.block_tables.get_mut(slot.0).and_then(|bt| bt.as_mut()) {
+            Some(bt) => bt,
+            None => {
+                if let Some(pool) = self.page_pool.as_mut() {
+                    let _ = pool.release_bound_page(phys);
+                }
+                return Err(format!(
+                    "bind_restored_page: slot {} has no block table",
+                    slot.0
+                ));
+            }
+        };
+        if let Err(e) = bt.bind_physical(lp, phys) {
+            if let Some(pool) = self.page_pool.as_mut() {
+                let _ = pool.release_bound_page(phys);
+            }
+            return Err(e);
+        }
+        self.block_tables_dirty[slot.0] = true;
+        Ok(())
     }
 
     /// True when `slot`'s block table has changed since last upload.

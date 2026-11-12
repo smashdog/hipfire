@@ -151,6 +151,42 @@ __global__ void attention_flash_q8_0_tile_batched(
         return;
     }
 
+    // KVMem tile fast path: with tile-aligned pages (`page_tokens % tile_size
+    // == 0` — the production 128/128 shape, since tile_start is always a
+    // multiple of tile_size) every position in this tile resolves through ONE
+    // block-table entry. A tile whose page lives in the host store holds no K/V
+    // bytes in the arena, so publish the empty-partial contract and return
+    // BEFORE the per-position scan. Without this, a prompt longer than the
+    // resident budget pays the presence test for every spilled position of
+    // every head and row — once the host store holds most of the prompt, that
+    // per-position sweep is the dominant decode cost. Same values and same
+    // accumulation order as the per-token form for resident tiles.
+#ifdef HIPFIRE_KV_SLOT_PAGED
+    const bool tile_one_page = (slot_descs != nullptr)
+        && (desc.page_tokens > 0)
+        && (desc.page_tokens % tile_size == 0);
+    long long tile_page_base = 0;
+    if (tile_one_page) {
+        const int phys = desc.block_table[tile_start / desc.page_tokens];
+        if (phys < 0) {
+            if (tid == 0) {
+                float* pe = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
+                                     + tile_id * (2 + head_dim);
+                pe[0] = -1e30f;
+                pe[1] = 0.0f;
+            }
+            return;
+        }
+        tile_page_base = (long long)phys * desc.page_tokens * per_pos_bytes
+                       + (long long)(tile_start % desc.page_tokens) * per_pos_bytes;
+    }
+#else
+    // Legacy header: no block table, no page fields — every tile is resident
+    // and addresses through the contiguous descriptor path below.
+    const bool tile_one_page = false;
+    const long long tile_page_base = 0;
+#endif
+
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
     const int q_dim = n_heads * head_dim;
@@ -201,11 +237,23 @@ __global__ void attention_flash_q8_0_tile_batched(
             if (tid == 0) scores[t_local] = -INFINITY;
             continue;                      // t is wave-uniform, so all lanes skip together
         }
+        // KVMem residency: a spilled page holds no K bytes. Mask exactly like
+        // the window case; the tile-level guard after Phase B turns an
+        // all-masked tile into the empty-partial contract. Wave-uniform.
+        // Tile-aligned pages resolved residency once above.
+        if (!tile_one_page && !kv_page_present(desc, t)) {
+            if (tid == 0) scores[t_local] = -INFINITY;
+            continue;
+        }
+        const unsigned long long k_addr_off = tile_one_page
+            ? (unsigned long long)tile_page_base
+              + (unsigned long long)t_local * (unsigned long long)per_pos_bytes
+            : kv_offset_for_k(desc, t, per_pos_bytes);
         float partial = 0.0f;
         if (lane_one_q8_block && dpt == 8) {
             const int bi = d0 / 32;
             const int bj = d0 % 32;
-            const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, per_pos_bytes)
+            const unsigned char* kb = k_cache + k_addr_off
                                     + (kv_head_blk + bi) * 34;
             const float ks = (float)*((const _Float16*)kb);
             const unsigned long long packed = q8_tile_load_u64(kb + 2 + bj);
@@ -217,7 +265,7 @@ __global__ void attention_flash_q8_0_tile_batched(
         } else if (lane_one_q8_block && dpt == 4) {
             const int bi = d0 / 32;
             const int bj = d0 % 32;
-            const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, per_pos_bytes)
+            const unsigned char* kb = k_cache + k_addr_off
                                     + (kv_head_blk + bi) * 34;
             const float ks = (float)*((const _Float16*)kb);
             const unsigned int packed = q8_tile_load_u32(kb + 2 + bj);
@@ -232,7 +280,7 @@ __global__ void attention_flash_q8_0_tile_batched(
             for (int half = 0; half < 4; half++) {
                 const int k_bi = half * 4 + tid / 8;
                 const int k_off = (tid % 8) * 4;
-                const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, per_pos_bytes)
+                const unsigned char* kb = k_cache + k_addr_off
                                         + (kv_head_blk + k_bi) * 34;
                 const float ks = (float)*((const _Float16*)kb);
                 partial += mq[half * 4 + 0] * (ks * (float)((signed char)kb[2 + k_off + 0]))
@@ -245,7 +293,7 @@ __global__ void attention_flash_q8_0_tile_batched(
                 const int d = d0 + i;
                 const int bi = d / 32;
                 const int bj = d % 32;
-                const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, per_pos_bytes)
+                const unsigned char* kb = k_cache + k_addr_off
                                         + (kv_head_blk + bi) * 34;
                 const float ks = (float)*((const _Float16*)kb);
                 partial += mq[i] * (ks * (float)((signed char)kb[2 + bj]));
@@ -270,6 +318,22 @@ __global__ void attention_flash_q8_0_tile_batched(
         local_max = fmaxf(local_max, __shfl_xor(local_max, off));
     float tile_max = local_max;
 
+    // KVMem residency guard: a tile whose every key was masked (all pages
+    // spilled, or no key in the window) has tile_max == -INFINITY, and Phase C
+    // would evaluate expf(-INF - -INF) = NaN. Publish the empty-partial
+    // contract the shared reduce already skips (p[1] > 0) and return.
+    // Unreachable when every page is resident: the tile holds at least one
+    // causally-valid key, so Phase B always sees a finite score.
+    if (tile_max == -INFINITY) {
+        if (tid == 0) {
+            float* pe = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
+                                 + tile_id * (2 + head_dim);
+            pe[0] = -1e30f;
+            pe[1] = 0.0f;
+        }
+        return;
+    }
+
     // Phase C: exp + sum
     float local_sum = 0.0f;
     for (int i = tid; i < tile_len; i += 32) {
@@ -290,7 +354,17 @@ __global__ void attention_flash_q8_0_tile_batched(
         for (int t_local = 0; t_local < tile_len; t_local++) {
             const float w = scores[t_local];
             const int t = tile_start + t_local;
-            const unsigned char* vbh = v_cache + kv_offset_for_v(desc, t, per_pos_bytes)
+            // KVMem residency: a spilled page's weight is exactly zero (masked
+            // in Phase A) and its address would resolve through -1. Skip.
+            // Tile-aligned pages resolved residency once above.
+            if (!tile_one_page && !kv_page_present(desc, t)) {
+                continue;
+            }
+            const unsigned long long v_addr_off = tile_one_page
+                ? (unsigned long long)tile_page_base
+                  + (unsigned long long)t_local * (unsigned long long)per_pos_bytes
+                : kv_offset_for_v(desc, t, per_pos_bytes);
+            const unsigned char* vbh = v_cache + v_addr_off
                                      + (kv_head_blk + bi) * 34;
             const float vs = (float)*((const _Float16*)vbh);
             const unsigned long long packed = q8_tile_load_u64(vbh + 2 + bj);
@@ -306,7 +380,15 @@ __global__ void attention_flash_q8_0_tile_batched(
         for (int t_local = 0; t_local < tile_len; t_local++) {
             const float w = scores[t_local];
             const int t = tile_start + t_local;
-            const unsigned char* vbh = v_cache + kv_offset_for_v(desc, t, per_pos_bytes)
+            // KVMem residency: see the u64 branch above.
+            if (!tile_one_page && !kv_page_present(desc, t)) {
+                continue;
+            }
+            const unsigned long long v_addr_off = tile_one_page
+                ? (unsigned long long)tile_page_base
+                  + (unsigned long long)t_local * (unsigned long long)per_pos_bytes
+                : kv_offset_for_v(desc, t, per_pos_bytes);
+            const unsigned char* vbh = v_cache + v_addr_off
                                      + (kv_head_blk + bi) * 34;
             const float vs = (float)*((const _Float16*)vbh);
             const unsigned int packed = q8_tile_load_u32(vbh + 2 + bj);
@@ -320,7 +402,15 @@ __global__ void attention_flash_q8_0_tile_batched(
         for (int t_local = 0; t_local < tile_len; t_local++) {
             const float w = scores[t_local];
             const int t = tile_start + t_local;
-            const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
+            // KVMem residency: see the u64 branch above.
+            if (!tile_one_page && !kv_page_present(desc, t)) {
+                continue;
+            }
+            const unsigned long long v_addr_off = tile_one_page
+                ? (unsigned long long)tile_page_base
+                  + (unsigned long long)t_local * (unsigned long long)per_pos_bytes
+                : kv_offset_for_v(desc, t, per_pos_bytes);
+            const unsigned char* vb = v_cache + v_addr_off;
             for (int i = 0; i < dpt; i++) {
                 const int d = d0 + i;
                 const int bi = d / 32;

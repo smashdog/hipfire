@@ -352,6 +352,92 @@ fn main() {
             base_us = Some((us, name));
         }
     }
+    // ---- Paged twin identity check ----
+    // Same Q8 K/V bytes, but the arena is addressed through a permuted page
+    // table (the reverse permutation, so an aliasing or off-by-one page bug
+    // cannot pass). With every page resident the paged route must reproduce
+    // the descriptor-less WMMA output BIT FOR BIT — this is the KVMem
+    // verify-step numerics contract.
+    {
+        let page_tokens = 128usize;
+        let n_pages = max_seq / page_tokens;
+        let page_bytes = page_tokens * per_pos;
+        let mut hkp = vec![0u8; max_seq * per_pos];
+        let mut hvp = vec![0u8; max_seq * per_pos];
+        for l in 0..n_pages {
+            let p = n_pages - 1 - l;
+            hkp[p * page_bytes..(p + 1) * page_bytes]
+                .copy_from_slice(&hk[l * page_bytes..(l + 1) * page_bytes]);
+            hvp[p * page_bytes..(p + 1) * page_bytes]
+                .copy_from_slice(&hv[l * page_bytes..(l + 1) * page_bytes]);
+        }
+        let kp = gpu.alloc_tensor(&[max_seq * per_pos], DType::Q8_0).unwrap();
+        let vp = gpu.alloc_tensor(&[max_seq * per_pos], DType::Q8_0).unwrap();
+        gpu.hip.memcpy_htod(&kp.buf, &hkp).unwrap();
+        gpu.hip.memcpy_htod(&vp.buf, &hvp).unwrap();
+        let bt = gpu.alloc_tensor(&[n_pages], DType::F32).unwrap();
+        let bt_host: Vec<u8> = (0..n_pages)
+            .flat_map(|l| ((n_pages - 1 - l) as i32).to_ne_bytes())
+            .collect();
+        gpu.hip.memcpy_htod(&bt.buf, &bt_host).unwrap();
+        let desc = rdna_compute::kv_slots::KvSlotDesc {
+            block_table: bt.buf.as_ptr() as u64,
+            legacy_k_base: 0,
+            legacy_v_base: 0,
+            seq_len: seq_len as i32,
+            page_tokens: page_tokens as i32,
+        };
+        let desc_bytes: [u8; 32] = unsafe { std::mem::transmute(desc) };
+        let d_desc = gpu.alloc_tensor(&[8], DType::F32).unwrap();
+        gpu.hip.memcpy_htod(&d_desc.buf, &desc_bytes).unwrap();
+        let d_rslot = gpu.alloc_tensor(&[rows], DType::F32).unwrap();
+        let rs: Vec<u8> = (0..rows).flat_map(|_| 0i32.to_ne_bytes()).collect();
+        gpu.hip.memcpy_htod(&d_rslot.buf, &rs).unwrap();
+        // d_out currently holds the descriptor-less WMMA route's output.
+        let plain = gpu.download_f32(&d_out).unwrap();
+        let d_outp = gpu.zeros(&[rows * q_dim], DType::F32).unwrap();
+        let mut f = |gpu: &mut Gpu, _s: usize| -> bool {
+            gpu.attention_verify_wmma_q8_gfx1100_paged(
+                &d_q,
+                &kp,
+                &vp,
+                &d_outp,
+                &d_pos,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len,
+                rows,
+                &d_part,
+                &d_desc,
+                &d_rslot,
+                page_tokens,
+            )
+            .unwrap()
+        };
+        if !f(&mut gpu, 0) {
+            eprintln!("wmma-paged declined this shape");
+            ok = false;
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let paged = gpu.download_f32(&d_outp).unwrap();
+        let diff = plain
+            .iter()
+            .zip(&paged)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let max_abs = plain
+            .iter()
+            .zip(&paged)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let usp = time(&mut gpu, &mut cur, &mut f);
+        eprintln!(
+            "wmma-paged {usp:8.1} us  diff floats {diff} / {} max_abs {max_abs:.1e}",
+            plain.len()
+        );
+        ok &= diff == 0;
+    }
     if !ok {
         eprintln!("FAIL");
         std::process::exit(1);

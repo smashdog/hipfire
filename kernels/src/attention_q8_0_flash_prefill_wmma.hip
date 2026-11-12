@@ -183,6 +183,26 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
         seq_len = max(seq_len, positions[q_base + r] + 1);
 
     for (int kt = 0; kt < seq_len; kt += N_TILE) {
+        // KVMem paging: a fully absent page contributes nothing to any row.
+        // Every in-page key already fails kv_page_present, so Phase A zeroes
+        // its K fragment, its S column publishes -INFINITY, and Phase D adds
+        // P=0 — leaving m, l and O bitwise unchanged. Skipping the page's
+        // N_TILE-sized blocks wholesale therefore costs nothing numerically
+        // and makes the sweep scale with resident pages, not logical context.
+        // Only fires on page-aligned iteration boundaries of a page-aligned
+        // table. This source is also compiled without the paged header (the
+        // legacy non-paged module), where KvSlotDesc has no block table at
+        // all; the guard keeps that module byte-identical to upstream.
+#ifdef HIPFIRE_KV_SLOT_PAGED
+        if (desc.block_table != nullptr
+            && desc.page_tokens > 0
+            && (desc.page_tokens % N_TILE) == 0
+            && (kt % desc.page_tokens) == 0
+            && desc.block_table[kt / desc.page_tokens] < 0) {
+            kt += desc.page_tokens - N_TILE;
+            continue;
+        }
+#endif
         const int t_len = min(N_TILE, seq_len - kt);
 
         // ── Phase A: S = Q · K^T on the matrix cores ────────────────────
@@ -195,7 +215,10 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
         float8_t s_acc = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
         {
             const int my_k = kt + half;
-            const bool k_ok = (half < t_len);
+            // KVMem residency: an absent (spilled) key contributes nothing —
+            // its K fragment is zeroed exactly like an out-of-tile key. With
+            // every page present this is the unchanged `half < t_len` test.
+            const bool k_ok = (half < t_len) && kv_page_present(desc, my_k);
             // ONE shared slab offset (kv_offset_for_k, i.e. desc.k_base) for
             // both K and V, deliberately — see the file header comment and
             // attention_q8_0_flash_prefill.hip's identical note. v_base MUST
@@ -235,7 +258,8 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
             const int c  = half;              // key within tile
             float sv = s_acc[j] * scale_attn;
             const bool valid =
-                (r < rows) && (c < t_len) && ((kt + c) <= positions[q_base + r]);
+                (r < rows) && (c < t_len) && ((kt + c) <= positions[q_base + r])
+                && kv_page_present(desc, kt + c);
             // -INF (not f16 min) so a fully-masked row-tile yields m_new = -INF,
             // which the softmax guard turns into zero weight rather than exp(0)=1.
             S_lds[r * S_STRIDE + c] = valid ? (_Float16)sv : (_Float16)(-INFINITY);
@@ -277,7 +301,10 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
         const int v_blk = d_lo >> 5;                // block index (run-uniform)
         const int v_off = 2 + (d_lo & 31);          // byte offset within block
         for (int kr = 0; kr < N_TILE; ++kr) {
-            if (kr < t_len) {
+            // KVMem residency: a spilled key's V row is zero-filled exactly
+            // like a row past the tile end; its softmax weight is already 0
+            // from the `valid` mask above, so the staged zeros contribute 0.
+            if (kr < t_len && kv_page_present(desc, kt + kr)) {
                 const unsigned char* vb = v_cache + kv_offset_for_k(desc, kt + kr, row_stride)
                                         + kv_blk * 34 + v_blk * 34;
                 const float vs = (float)*((const _Float16*)vb);

@@ -89,6 +89,22 @@ __device__ __forceinline__ unsigned long long kv_offset_for_k(
     return s.legacy_k_base + (unsigned long long)pos * (unsigned long long)per_pos_bytes;
 }
 
+// Presence test for position `pos` (KVMem block residency).
+//
+// A block-table entry of -1 marks a logical page whose bytes are not resident
+// in the arena: the host spilled it to the KV working-set manager and released
+// the physical page. Kernels MUST NOT resolve an address through such an
+// entry; they mask the key out instead (the same contract the sliding-window
+// masks already use). Legacy descriptors (null block_table) are always
+// present, so every pre-KVMem launch takes the unchanged branch.
+__device__ __forceinline__ bool kv_page_present(const KvSlotDesc& s, int pos)
+{
+    if (s.block_table == nullptr) {
+        return true;
+    }
+    return s.block_table[pos / s.page_tokens] >= 0;
+}
+
 __device__ __forceinline__ unsigned long long kv_offset_for_v(
     const KvSlotDesc& s, int pos, int per_pos_bytes)
 {

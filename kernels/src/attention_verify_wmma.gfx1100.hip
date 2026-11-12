@@ -30,8 +30,29 @@
 //  * The two key-half streams are merged in LDS at the end; one partial per
 //    (row, head, span): [m (log2 units), l, pad, pad, O[256] in WMMA C order]
 //    reduced by attention_verify_wmma_reduce_gfx1100.
+//
+// Compiled twice. The default module (this file's source bytes, no descriptor
+// header) keeps the original 11-arg ABI and `key * 1088` addressing for the
+// contiguous KV cache. The slot engine builds a second, paged module from the
+// same body with the paged KvSlotDesc header prepended (HIPFIRE_KV_SLOT_PAGED),
+// which appends `slot_descs`/`row_slot` parameters: every 32-key tile then
+// resolves its page through the block table, and a tile whose page is absent
+// (-1, KVMem-spilled) is addressed at arena page 0 and masked to -inf. Pages
+// are `page_tokens` tokens, a host-gated multiple of VW_KT, so a tile never
+// straddles a page. With every page resident the bytes read and the arithmetic
+// are identical to the default module.
 #include <hip/hip_runtime.h>
 #include <stdint.h>
+
+#ifdef HIPFIRE_KV_SLOT_PAGED
+// Paged compile: the slot descriptor header (prepended by the Rust side) has
+// already defined KvSlotDesc / kv_slot_legacy / kv_page_present.
+#define VW_DESC_PARAMS , const KvSlotDesc* __restrict__ slot_descs, const int* __restrict__ row_slot
+#define VW_DESC_ARGS , slot_descs, row_slot
+#else
+#define VW_DESC_PARAMS
+#define VW_DESC_ARGS
+#endif
 
 #define VW_KT 32
 #define VW_KROW 132
@@ -173,7 +194,7 @@ static __device__ __forceinline__ void vw_body(
     float* __restrict__ partials,
     const int* __restrict__ positions,
     int n_heads, float scale_log2, int n_blk, int max_spans, int batch_offset, int rows,
-    uint32_t* __restrict__ lds)
+    uint32_t* __restrict__ lds VW_DESC_PARAMS)
 {
     using C = VwCfg<QT>;
     uint32_t* Kl = lds;
@@ -187,6 +208,14 @@ static __device__ __forceinline__ void vw_body(
     const int half = lane >> 4;
     const int kv_h = blockIdx.x;
     const int span_idx = blockIdx.y;   // this block owns 32-key tiles span_idx + n_blk * t
+
+#ifdef HIPFIRE_KV_SLOT_PAGED
+    // One descriptor for the whole step: the slot engine admits this route
+    // only with a single active slot, so every row maps to the same slot.
+    // Null table => legacy contiguous descriptors (base 0, full residency).
+    const int slot = (row_slot != nullptr) ? row_slot[batch_offset] : 0;
+    const KvSlotDesc desc = (slot_descs != nullptr) ? slot_descs[slot] : kv_slot_legacy(0, 0);
+#endif
 
     int seq_max = 0, seq_min = 0x7fffffff;
     for (int r = 0; r < rows; r++) {
@@ -258,16 +287,43 @@ static __device__ __forceinline__ void vw_body(
     }
     const size_t head_off = (size_t)kv_h * 272;
 
+    // Byte offset of 32-key tile starting at absolute position `kt`, and
+    // whether that tile is resident. Paged mode: one block-table lookup per
+    // tile (pages are a multiple of VW_KT tokens, so a tile never straddles
+    // one). An absent page owns no bytes in the arena — address the tile at
+    // arena page 0 instead (always mapped) and let the phase-B presence mask
+    // zero its scores; nothing reads stale or unmapped memory.
+    auto kv_tile_base = [&](int kt, bool& present) __attribute__((always_inline)) {
+        present = true;
+#ifdef HIPFIRE_KV_SLOT_PAGED
+        if (desc.block_table != nullptr) {
+            const int phys = desc.block_table[kt / desc.page_tokens];
+            if (phys < 0) {
+                present = false;
+                return (size_t)0;
+            }
+            return ((size_t)phys * (size_t)desc.page_tokens + (size_t)(kt % desc.page_tokens))
+                 * (size_t)1088;
+        }
+#endif
+        return (size_t)kt * (size_t)1088;
+    };
+
     auto load_tile = [&](const unsigned char* __restrict__ cache, int t, uint32_t (&dst)[C::UPT][9]) __attribute__((always_inline)) {
-        const int key0 = (span_idx + n_blk * t) * VW_KT + fk;
+        const int tile = span_idx + n_blk * t;
+        const int kt = tile * VW_KT;
+        const int key0 = kt + fk;
+        bool present;
+        const size_t base = kv_tile_base(kt, present);
         // Branch-free: keys past the end are clamped to the last valid row
         // (their scores are masked, and P = 0 times a finite V row adds 0),
         // so the waitcnt pass can track the prefetch precisely and no key
-        // past the last written position is ever read.
+        // past the last written position is ever read. Every key of a tile
+        // maps to `base + (key - kt) * 1088` — the same page by construction.
         #pragma unroll
         for (int u = 0; u < C::UPT; u++) {
             const int key = min(key0 + 16 * u, span_end - 1);
-            vw_load(cache + (size_t)key * 1088 + head_off, fb, dst[u]);
+            vw_load(cache + base + (size_t)(key - kt) * 1088 + head_off, fb, dst[u]);
         }
     };
     auto fill_k = [&](const uint32_t (&src)[C::UPT][9]) __attribute__((always_inline)) {
@@ -378,6 +434,18 @@ static __device__ __forceinline__ void vw_body(
                 if (kbase + 2 * j + half > pos_q) sacc[j] = -INFINITY;
             }
         }
+#ifdef HIPFIRE_KV_SLOT_PAGED
+        // KVMem: an absent (-1) page has no resident bytes — its 16 keys are
+        // spilled, so they publish -inf and contribute nothing to m, l or O
+        // (exact algebra, the same contract as the causal mask above). Must
+        // be UNCONDITIONAL: the causal mask only fires near the query tip,
+        // while a spilled page can sit anywhere below it. The tile was
+        // addressed at arena page 0, whose bytes this mask makes irrelevant.
+        if (!kv_page_present(desc, kt)) {
+            #pragma unroll
+            for (int j = 0; j < 8; j++) sacc[j] = -INFINITY;
+        }
+#endif
         float mx = sacc[0];
         #pragma unroll
         for (int j = 1; j < 8; j++) mx = fmaxf(mx, sacc[j]);
@@ -512,10 +580,10 @@ extern "C" __launch_bounds__(128 * QT) __global__ void NAME(                    
     const float* __restrict__ q, const unsigned char* __restrict__ k_cache,                           \
     const unsigned char* __restrict__ v_cache, float* __restrict__ partials,                          \
     const int* __restrict__ positions, int n_heads, float scale_log2, int n_blk, int max_spans,       \
-    int batch_offset, int rows) {                                                                     \
+    int batch_offset, int rows VW_DESC_PARAMS) {                                                      \
     __shared__ __attribute__((aligned(16))) uint32_t lds[VwCfg<QT>::LDS_DW];                          \
     vw_body<QT>(q, k_cache, v_cache, partials, positions, n_heads, scale_log2, n_blk, max_spans,      \
-                batch_offset, rows, lds);                                                             \
+                batch_offset, rows, lds VW_DESC_ARGS);                                                \
 }
 // QT = 16-query tiles: rows 1..=2 (qt1), 3..=5 (qt2), 6..=8 (qt3).
 VW_KERNEL(attention_verify_wmma_q8_qt1_gfx1100, 1)

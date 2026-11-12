@@ -1831,6 +1831,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "attention_verify_wmma_reduce_gfx1100"
             ]
         );
+        // Paged (KVMem) variant: same body over the block-table-addressed
+        // arenas, symbols renamed. Launched by
+        // `Gpu::attention_verify_wmma_q8_gfx1100_paged` for paged slots.
+        add!(
+            "attention_verify_wmma_gfx1100_paged",
+            kernels::attention_verify_wmma_paged_source(),
+            [
+                "attention_verify_wmma_q8_qt1_paged_gfx1100",
+                "attention_verify_wmma_q8_qt2_paged_gfx1100",
+                "attention_verify_wmma_q8_qt3_paged_gfx1100",
+                "attention_verify_wmma_reduce_gfx1100"
+            ]
+        );
         add!(
             "attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100",
             kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC,
@@ -1843,8 +1856,21 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
         add!(
             "attention_flash_q8_0_tile_gqa_gfx1100",
-            kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC,
+            // The body `#include`s kv_slot_desc.h (shared with its paged
+            // twin); the JIT cache has no -I to kernels/src, so the registry
+            // must hand the preloader the assembled source, exactly like the
+            // lazy `ensure_givens4_kernel` route builds it.
+            assemble_asym(kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC),
             ["attention_flash_q8_0_tile_gqa_gfx1100"]
+        );
+        // Paged (KVMem) twin of the GQA-shared decode tile: same body over
+        // block-table-addressed arenas. Launched by
+        // `Gpu::attention_flash_q8_0_gqa_decode_paged` for single-row paged
+        // decode.
+        add!(
+            "attention_flash_q8_0_tile_gqa_paged_gfx1100",
+            kernels::attention_flash_q8_0_tile_gqa_paged_source(),
+            ["attention_flash_q8_0_tile_gqa_paged_gfx1100"]
         );
         add!(
             "attention_q8_0_fa2_gqa_gfx1100",
@@ -6345,6 +6371,81 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_qkv_mq4g256v2_wmma_gfx1201_bt8",
                 "gemm_qkv_mq4g256v2_wmma_gfx1201_bt12"
             ]
+        );
+    }
+    // Escha-W2 (merged nw_escha_w2): H128 transform pair, trellis decode GEMVs
+    // and the batched routed executor kernels. Multi-entry modules must list
+    // every symbol — the module name itself is not a kernel.
+    add!(
+        "router_logits_round_f16_rne",
+        kernels::ROUTER_LOGITS_ROUND_F16_RNE_SRC,
+        ["router_logits_round_f16_rne"]
+    );
+    add!(
+        "escha_decode_tiles",
+        kernels::ESCHA_DECODE_TILES_SRC,
+        ["escha_decode_tiles"]
+    );
+    add!(
+        "escha_h128",
+        kernels::ESCHA_H128_SRC,
+        [
+            "escha_h128_in",
+            "escha_h128_out",
+            "escha_h128_in_batched",
+            "escha_h128_out_batched",
+            "escha_swiglu_batched"
+        ]
+    );
+    add!(
+        "escha_bare_to_outmajor",
+        kernels::ESCHA_BARE_TO_OUTMAJOR_SRC,
+        ["escha_bare_to_q8_0", "escha_bare_to_f32", "escha_bare_to_f16"]
+    );
+    add!(
+        "escha_moe_gemv_k8_indexed",
+        kernels::ESCHA_MOE_GEMV_K8_INDEXED_SRC,
+        [
+            "escha_gemv_q8_0_moe_k8_indexed_batched",
+            "escha_gemv_q8_0_wide_moe_k8_indexed_batched",
+            "escha_round_weights_f16_rne"
+        ]
+    );
+    add!(
+        "escha_moe_gemv_native",
+        kernels::ESCHA_MOE_GEMV_NATIVE_SRC,
+        [
+            "escha_gemv_native_k2_moe_k8_indexed_batched",
+            "escha_gemv_native_k3_moe_k8_indexed_batched",
+            "escha_gemv_native_k2_wide_moe_k8_indexed_batched",
+            "escha_gemv_native_k3_wide_moe_k8_indexed_batched",
+            "escha_gemv_f16_moe_k8_indexed_batched",
+            "escha_gemv_f16_wide_moe_k8_indexed_batched"
+        ]
+    );
+    add!(
+        "escha_moe_gemm_grouped",
+        kernels::ESCHA_MOE_GEMM_GROUPED_SRC,
+        [
+            "escha_gemm_grouped_k2_r4_c2",
+            "escha_gemm_grouped_k2_r8_c2",
+            "escha_gemm_grouped_k2_r8_c4",
+            "escha_gemm_grouped_k2_r8_c8",
+            "escha_gemm_grouped_k2_r16_c2",
+            "escha_gemm_grouped_k2_r16_c4",
+            "escha_gemm_grouped_k3_r4_c2",
+            "escha_gemm_grouped_k3_r8_c2",
+            "escha_gemm_grouped_k3_r8_c4",
+            "escha_gemm_grouped_k3_r8_c8",
+            "escha_gemm_grouped_k3_r16_c2",
+            "escha_gemm_grouped_k3_r16_c4"
+        ]
+    );
+    if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
+        add!(
+            "escha_moe_gemm_grouped_wmma",
+            kernels::ESCHA_MOE_GEMM_GROUPED_WMMA_SRC,
+            ["escha_gemm_grouped_wmma_k2", "escha_gemm_grouped_wmma_k3"]
         );
     }
     Ok(entries)
