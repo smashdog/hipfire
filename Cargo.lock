@@ -1465,6 +1465,8 @@ dependencies = [
  "hipfire-config",
  "hipfire-cpu",
  "hipfire-dispatch",
+ "hipfire-kvmem",
+ "hipfire-quantize",
  "hipfire-reap",
  "hipfire-runtime",
  "railgun",
@@ -1664,6 +1666,7 @@ dependencies = [
 name = "hipfire-dispatch"
 version = "0.4.6"
 dependencies = [
+ "half",
  "hip-bridge",
  "hipfire-config",
  "hipfire-cpu",
@@ -1752,6 +1755,13 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hipfire-kvmem"
+version = "0.4.5"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -3295,6 +3305,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "hipfire-kernel-abi",
+ "hipfire-quantize",
  "libloading",
  "peacemaker-ir",
  "peacemaker-isa",

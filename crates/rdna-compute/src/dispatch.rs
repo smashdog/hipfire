@@ -879,6 +879,16 @@ pub enum DType {
     MQ4G128V2,
     MQ4G128, // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
     MQ3G256V2,
+    /// Escha-W2 trellis, K=2, 16x16 tile, cbA hash codebook (hfq qt=42, 2.00 bpw).
+    /// Weights are stored in the ROTATED domain — a 128-point unnormalised
+    /// Walsh-Hadamard is applied to activations on BOTH sides of the matmul
+    /// (see `RotationPlan::EschaH128`). Reaching an unrotated Plain GEMV with
+    /// this dtype produces fluent-looking but silently wrong output, not a
+    /// crash — see `dtype_rotation_plan` / `KernelKey::for_gemv`.
+    Escha2T16,
+    /// Escha-W2 trellis, K=3, 16x16 tile, cbA hash codebook (hfq qt=43, 3.00 bpw).
+    /// Same rotated-domain contract as `Escha2T16`.
+    Escha3T16,
     /// MQ2-G256 v2 (qt=50): FWHT-rotated, 72 B/group, neutral Magnum V2.
     /// Per-group 72 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
     /// `[6..8)` fp16 z1, `[8..72)` 64 B 2-bit payload (4/B). Same half
@@ -1070,6 +1080,8 @@ impl DType {
             | DType::MQ4G256Lloyd
             | DType::MQ2G256GL
             | DType::MQ3G256GL
+            | DType::Escha2T16
+            | DType::Escha3T16
             | DType::HFP4G32
             | DType::MFP4G32
             | DType::MFP4G32Lloyd
@@ -3288,6 +3300,7 @@ impl Gpu {
                 ggml: Default::default(),
                 q8x_act: None,
                 mq6_fp8_x_rot: None,
+                escha_prefill: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,
                 fp16_x_scratch: None,
@@ -6676,6 +6689,25 @@ impl Gpu {
         }
         self.scratch
             .ensure_gemv_residual_tmp(&self.hip, self.device_id, min_elems)
+    }
+
+    /// Model-global Escha-W2 batched-prefill routed scratch, allocated on
+    /// first use and grown on demand. See
+    /// [`crate::scratch::EschaPrefillScratch`].
+    /// Returns VIEWS by value, not a borrow: the caller launches kernels
+    /// through `&mut Gpu` immediately afterwards, so a borrow of
+    /// `self.scratch` could not survive.
+    pub fn ensure_escha_prefill_scratch(
+        &mut self,
+        slots: usize,
+        hidden: usize,
+        mi: usize,
+    ) -> HipResult<crate::scratch::EschaPrefillViews> {
+        // bind_thread: skip — delegated to scratch.rs (takes device_id explicitly).
+        Ok(self
+            .scratch
+            .ensure_escha_prefill(&self.hip, self.device_id, slots, hidden, mi)?
+            .views(slots))
     }
 
     pub fn alloc_tensor(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {

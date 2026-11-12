@@ -53,6 +53,48 @@ use hipfire_runtime::serve_wait::WaitQueue;
 use hipfire_runtime::slot_batch::SlotBatch;
 use hipfire_runtime::tokenizer::Tokenizer;
 
+/// True when the operator asked for KVMem host offload (`HIPFIRE_KVMEM=1`).
+///
+/// A binary built without the `kvmem` feature refuses the knob instead of
+/// silently serving without offload: the operator asked for a specific
+/// residency policy, and quietly not applying it would look like the
+/// offload path was exercised when it was not.
+#[cfg(feature = "kvmem")]
+fn kvmem_requested() -> Result<bool, String> {
+    Ok(crate::kvmem_ctl::requested())
+}
+
+#[cfg(not(feature = "kvmem"))]
+fn kvmem_requested() -> Result<bool, String> {
+    match hipfire_config::developer_var("HIPFIRE_KVMEM")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .as_deref()
+    {
+        None | Some("0") | Some("off") | Some("false") => Ok(false),
+        Some(other) => Err(format!(
+            "HIPFIRE_KVMEM={other} needs a binary built with the `kvmem` \
+             feature (cargo build --features kvmem)"
+        )),
+    }
+}
+
+/// True when this engine actually owns KV page residency through KVMem.
+/// Call sites use it to bypass swap eviction / prefix reuse / page-demand
+/// gates that conflict with KVMem's exclusive page ownership.
+fn kvmem_enabled(rig: &Rig) -> bool {
+    #[cfg(feature = "kvmem")]
+    {
+        rig.model.kvmem.is_some()
+    }
+    #[cfg(not(feature = "kvmem"))]
+    {
+        let _ = rig;
+        false
+    }
+}
+
 /// Internal control plane for the engine thread. Public methods map onto these
 /// messages; the GPU rig stays exclusively on that thread.
 ///
@@ -366,7 +408,68 @@ impl hipfire_runtime::serve::SlotEngineHandle for SlotEngine {
         (*self).shutdown_engine()
     }
 }
-/// Everything the engine thread owns.
+/// Per-request MTP sampling/penalty configuration, parked on the rig at admit
+/// and applied on the slot's first draft step (a cold admit's `MtpSpecState`
+/// only exists after the first prefill chunk allocates it).
+///
+/// Sampling (`temp > 0`) drives the sampled draft + residual acceptance in
+/// `mtp_draft_phase_inner` / `mtp_batched_verify_accept_from_batch`; the
+/// penalties install the exact-AR history the verify rows scope against
+/// (`emitted ‖ candidates[..k]`, trailing `repeat_window`), mirroring the
+/// sequential drafter's `begin_window` per window.
+struct MtpReqSampling {
+    sampling: crate::mtp_spec::MtpSamplingConfig,
+    /// Full rendered prompt the request started from (`prompt_tokens` cold,
+    /// `extended` on a continuation). `sess.tokens[prompt_len..]` is the
+    /// emitted history the penalty rows scope against.
+    prompt_len: usize,
+    /// Trailing `repeat_window` tokens of that prompt (`set_prompt`).
+    prompt_tail: Vec<u32>,
+    /// Host RNG seed for the sampled accept rule (`request_rng_state`).
+    rng_seed: u64,
+    /// True once the slot's MTP state has this config installed; the penalty
+    /// window is still rebuilt from `emitted` on every later window.
+    applied: bool,
+}
+
+impl MtpReqSampling {
+    fn new(req: &SubmitRequest, prompt: &[u32]) -> Self {
+        let repeat_window = effective_repeat_window(
+            req.repeat_window,
+            req.repeat_penalty,
+            req.presence_penalty,
+            req.frequency_penalty,
+        );
+        Self {
+            sampling: crate::mtp_spec::MtpSamplingConfig {
+                temp: req.temperature.max(0.0),
+                // The AR slot sampler maps an absent/0 top-k onto its default
+                // 20-candidate pool (`SlotSampleParams::top_k` docs) and caps
+                // at 64; the verify softmax kernel takes that same cap.
+                top_k: if req.top_k > 0 {
+                    (req.top_k as usize).min(64)
+                } else {
+                    20
+                },
+                top_p: if req.top_p > 0.0 {
+                    req.top_p.min(1.0)
+                } else {
+                    1.0
+                },
+                min_p: req.min_p.clamp(0.0, 1.0),
+                repeat_penalty: req.repeat_penalty,
+                repeat_window,
+                presence_penalty: req.presence_penalty,
+                frequency_penalty: req.frequency_penalty,
+            },
+            prompt_len: prompt.len(),
+            prompt_tail: prompt[prompt.len().saturating_sub(repeat_window)..].to_vec(),
+            rng_seed: hipfire_runtime::spec::request_rng_state(req.seed as u64),
+            applied: false,
+        }
+    }
+}
+
 /// Upper bound on a request's token-penalty window (`repeat_window`). The
 /// penalty prepass is O(window²) per launch on device, and the per-slot
 /// window buffer is sized by this; the daemon clamps requests to the same
@@ -395,6 +498,9 @@ struct ModelRig {
     /// Per-slot MTP spec state. None for slots that haven't started MTP yet
     /// or when MTP is off. Allocated lazily on first MTP prefill.
     mtp_states: Vec<Option<crate::mtp_spec::MtpSpecState>>,
+    /// Per-slot MTP request sampling/penalty config, installed at admit and
+    /// applied on the slot's first draft step (see [`MtpReqSampling`]).
+    mtp_req_sampling: Vec<Option<MtpReqSampling>>,
     /// Batched scratch (+ per-row FWHT-rot buffer) for MTP head-KV prefill
     /// from the scheduler's batched prompt chunks. None when MTP is off.
     mtp_prefill_batched: Option<(crate::mtp_head::Qwen35MtpHeadBatchedScratch, GpuTensor)>,
@@ -436,6 +542,12 @@ struct ModelRig {
     /// Cross-session recurrent-state checkpoint pool (spec §4.5 C5).
     /// None when `prefix_cache` is off.
     checkpoint_pool: Option<crate::checkpoint::CheckpointPool<DeltaNetSnapshot>>,
+    /// KVMem host-offload controller. None when `HIPFIRE_KVMEM` is off (or
+    /// the crate was built without the `kvmem` feature). Owns the per-slot
+    /// host stores and the residency decision; the GPU KV stays in the paged
+    /// arenas, with unselected full pages replaced by `SPILLED_PAGE`.
+    #[cfg(feature = "kvmem")]
+    kvmem: Option<crate::kvmem_ctl::KvMemCtl>,
 }
 
 impl ModelRig {
@@ -902,7 +1014,30 @@ impl Rig {
         .map_err(|e| format!("kv mode {kv_mode:?}: {e}"))?;
         let per_pos_bytes = kv_plan.k_bytes_per_pos;
         let per_pos_v_bytes = kv_plan.v_bytes_per_pos;
-        let prefill_chunk = cfg.prefill_chunk.max(1).min(cfg.cap_tokens.max(1));
+        // Escha trellis checkpoints (wire qt 42/43 = Escha2T16/Escha3T16) have
+        // no batched DENSE-prefill kernel: the multi-slot slots ladder admits
+        // only plain/MQ/low-bit GEMM dtypes (`slots_proj_admissible`), and the
+        // batched escha GEMM (`EschaProj::forward` slots>1) is wired for MoE
+        // experts, not a dense linear. The verified escha path is the
+        // single-position lowered ladder (`forward_scratch_layers_paged_lowered`).
+        // Forcing prefill_chunk=1 makes every prefill step n==1, which routes
+        // through `use_reference_decode` in `forward_batch_slots_opts` — a
+        // branch that sits BEFORE the slots admission gate — into that same
+        // lowered path. This is exactly how the reference engine prefills escha
+        // (its dense generate falls back to per-token decode_step when the
+        // batched prefill is not admitted). Decode speed is untouched; only
+        // prefill is serialized, matching the reference's own escha prefill, so
+        // a stock-vs-KVMem decode A/B stays fair. Detected from the tensor
+        // manifest (no data read); qt 42/43 are exclusively escha wire ids.
+        let escha_model = hfq
+            .tensors()
+            .iter()
+            .any(|t| t.quant_type == 42 || t.quant_type == 43);
+        let prefill_chunk = if escha_model {
+            1
+        } else {
+            cfg.prefill_chunk.max(1).min(cfg.cap_tokens.max(1))
+        };
         // DFlash2 draft config pre-parse: the runtime block size B sets
         // `spec_rows` (verify rows per spec slot), which `max_batch` and the
         // verify tape are sized by — both allocated before the GPU-side
@@ -943,10 +1078,68 @@ impl Rig {
         // set_seq_len errors before any kernel writes through the missing
         // page); a larger count over-subscribes physical VRAM and is the
         // operator's call.
+        // ── KVMem host offload (HIPFIRE_KVMEM=1) ───────────────────────────
+        // KVMem takes over residency for the FullAttention pages: the pool
+        // keeps a bounded per-slot working set, and the rest of each
+        // conversation's KV lives in the host store, restored on selection.
+        // Requirements: the paged Q8 pool (the spill/restore path moves the
+        // packed Q8 rows verbatim and the masked kernels are Q8-only), and
+        // the batched VL path (the legacy sequential path writes through a
+        // flat slab view that paged mode cannot honour, and its single-token
+        // forwards bypass the step batch the statistics taps follow).
+        let kvmem_on = kvmem_requested()?;
+        let vl_sequential = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
+            .ok()
+            .is_some_and(|v| v == "1" || v == "on" || v == "true");
+        if kvmem_on {
+            if !matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Q8) {
+                return Err(format!(
+                    "HIPFIRE_KVMEM requires q8 KV (resolved {kv_mode:?}); the \
+                     spill/restore path moves packed Q8 rows and the paged \
+                     attention kernels are Q8-only"
+                ));
+            }
+            if cfg.is_vl && vl_sequential {
+                return Err(
+                    "HIPFIRE_KVMEM requires the batched VL path; unset \
+                     HIPFIRE_VL_SEQUENTIAL (the sequential path writes KV \
+                     outside the step batch KVMem statistics follow)"
+                        .to_string(),
+                );
+            }
+        }
         // Prefix cache requires paged KV: the radix index shares physical
         // pages across sessions via PagePool refcounting, which is only
         // available in paged mode. Force it on when prefix_cache is enabled.
-        let prefix_cache = cfg.prefix_cache;
+        // KVMem forces it OFF: the radix shares sealed pages (which the
+        // residency pass must never spill) and its cross-session reuse
+        // rewinds seq_len onto pages the host store already owns — both
+        // conflict with KVMem's exclusive page ownership. Cold prefill is
+        // the correct trade; the KVMem store is the cross-request cache.
+        let prefix_cache = cfg.prefix_cache && !kvmem_on;
+        if cfg.prefix_cache && kvmem_on {
+            eprintln!(
+                "  [hipfire] prefix cache disabled: HIPFIRE_KVMEM owns page \
+                 residency (cold prefill per request)"
+            );
+        }
+        // Resolve the KVMem pool geometry before the pool is sized: the
+        // plan's `pages_total` replaces the upstream legacy-equivalent count
+        // so every slot's resident working set fits with selection headroom.
+        #[cfg(feature = "kvmem")]
+        let kvmem_plan = if kvmem_on {
+            Some(crate::kvmem_ctl::resolve_plan(
+                cfg.n_slots,
+                cfg.cap_tokens,
+                prefill_chunk.max(spec_rows),
+            )?)
+        } else {
+            None
+        };
+        #[cfg(feature = "kvmem")]
+        let kvmem_pages = kvmem_plan.as_ref().map(|p| p.pages_total);
+        #[cfg(not(feature = "kvmem"))]
+        let kvmem_pages: Option<usize> = None;
         let paged_pages = if prefix_cache {
             let legacy_equivalent = cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
             // Cache-retained pages share the same physical pool as active slots.
@@ -965,6 +1158,11 @@ impl Rig {
                     .map(|p| p.max(1))
                     .unwrap_or_else(|| legacy_equivalent.saturating_add(cache_headroom)),
             )
+        } else if let Some(pages) = kvmem_pages {
+            // KVMem: the pool is the resident working set (default 64 blocks
+            // per slot), not the slot cap. Everything past it lives in the
+            // host store, so a large `multi_slot_ctx` no longer costs VRAM.
+            Some(pages)
         } else {
             match hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED")
                 .ok()
@@ -976,10 +1174,7 @@ impl Rig {
                     // forced the legacy sequential VL path — that path writes
                     // through a flat contiguous slab view which aliases every
                     // slot onto the arena prefix in paged mode.
-                    let sequential_vl = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
-                        .ok()
-                        .is_some_and(|v| v == "1" || v == "on" || v == "true");
-                    if cfg.is_vl && sequential_vl {
+                    if cfg.is_vl && vl_sequential {
                         eprintln!(
                             "  [hipfire] paged KV disabled: HIPFIRE_VL_SEQUENTIAL=1 \
                              requires contiguous KV slots"
@@ -1569,6 +1764,16 @@ impl Rig {
         let pbs = PrefillBatchScratch::new_opt(g.gpu.as_mut().unwrap(), &config, max_batch, false)
             .map_err(|e| format!("pbs: {e}"))?;
         g.pbs = Some(pbs);
+        // KVMem statistics taps: one small copy launch per FullAttention
+        // layer, sized to the step batch. Pure copy — an enabled tap leaves
+        // the forward bit-identical to an untapped one.
+        if kvmem_on {
+            g.pbs
+                .as_mut()
+                .unwrap()
+                .enable_kvmem_taps(g.gpu.as_mut().unwrap(), &config, cfg.n_slots)
+                .map_err(|e| format!("kvmem taps: {e}"))?;
+        }
         let scratch =
             Qwen35Scratch::new_with_kv_max(g.gpu.as_mut().unwrap(), &config, 64, cfg.cap_tokens)
                 .map_err(|e| format!("scratch: {e}"))?;
@@ -1619,9 +1824,6 @@ impl Rig {
         let vl_ext_devs: Vec<Option<GpuTensor>> = (0..cfg.n_slots).map(|_| None).collect();
         let vl_tower_jobs: Vec<Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob>> =
             (0..cfg.n_slots).map(|_| None).collect();
-        let vl_sequential = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
-            .ok()
-            .is_some_and(|v| v == "1" || v == "on" || v == "true");
         if vl_sequential && !matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Q8) {
             return Err(
                 "HIPFIRE_VL_SEQUENTIAL=1 writes KV through the q8-only flat slab \
@@ -1654,14 +1856,31 @@ impl Rig {
             dn_bytes,
         };
 
+        // KVMem turns KV into a fixed residency cost: the paged pool is sized
+        // once at load (the resident working set), and every logical page past
+        // it lives in the host store. A 256k-context request therefore costs
+        // the same VRAM as a 4k one. Charging upstream's full-context grant
+        // (`ctx × kv_bytes_per_token`) would demand ~9 GiB of KV credit for a
+        // 256k request on a 20 GiB card and refuse it outright — the exact
+        // configuration KVMem exists to serve. Charge the pool once (it is
+        // real, preallocated device memory, like the weights) and nothing per
+        // token; slot concurrency is bounded by the pool's slot count.
+        let (admission_weights_bytes, admission_kv_bytes_per_token) = if kvmem_on {
+            (resident_weight_bytes.saturating_add(kv_bytes), 0)
+        } else {
+            (
+                resident_weight_bytes,
+                (n_fa_layers * (per_pos_bytes + per_pos_v_bytes)) as u64,
+            )
+        };
         let mut adm = AdmissionController::new(
             ModelFootprint {
                 // `weights_bytes` is the loader's *device* number, so the VRAM
                 // charge cannot over-admit against what was really placed, and the
                 // unreclaimable `hipHostMalloc` bytes are charged to the host tier
                 // that exists for them.
-                weights_bytes: resident_weight_bytes,
-                kv_bytes_per_token: (n_fa_layers * (per_pos_bytes + per_pos_v_bytes)) as u64,
+                weights_bytes: admission_weights_bytes,
+                kv_bytes_per_token: admission_kv_bytes_per_token,
                 pinned_host_bytes,
             },
             vram_total as u64,
@@ -1703,6 +1922,26 @@ impl Rig {
         let scratch = g.scratch.take().unwrap();
         let logits_out = g.logits_out.take().unwrap();
         let out_tokens = g.out_tokens.take().unwrap();
+        // KVMem controller: host payload store + residency policy. Host-only
+        // construction (no GPU allocation); the per-slot stores are sized for
+        // this model's FullAttention geometry.
+        #[cfg(feature = "kvmem")]
+        let kvmem = match kvmem_plan {
+            Some(plan) => Some(crate::kvmem_ctl::KvMemCtl::new(
+                cfg.n_slots,
+                &plan,
+                &crate::kvmem_ctl::KvMemGeometry {
+                    n_fa_layers,
+                    n_heads: config.n_heads,
+                    n_kv_heads: config.n_kv_heads,
+                    head_dim: config.head_dim,
+                    per_pos_bytes,
+                    per_pos_v_bytes,
+                    max_rows: max_batch,
+                },
+            )?),
+            None => None,
+        };
         // MTP head-KV prefill scratch, sized for one scheduler prompt chunk.
         // Allocated after the guard commit (transactional ownership is no
         // longer needed past this point: everything above already committed).
@@ -1904,6 +2143,7 @@ impl Rig {
                 logits_out,
                 mtp_head,
                 mtp_states: (0..cfg.n_slots).map(|_| None).collect(),
+                mtp_req_sampling: (0..cfg.n_slots).map(|_| None).collect(),
                 mtp_prefill_batched,
                 spec_verify_tape,
                 mtp_prefill_hidden,
@@ -1916,6 +2156,8 @@ impl Rig {
                 vl_ext_devs,
                 vl_tower_jobs,
                 checkpoint_pool,
+                #[cfg(feature = "kvmem")]
+                kvmem,
             },
             out_tokens,
             sample_params,
@@ -2540,6 +2782,7 @@ impl ModelRig {
         mut gpu: &mut Gpu,
         slot: SlotId,
         work: &mut PendingWork,
+        emitted: &[u32],
     ) -> Result<crate::mtp_spec::MtpDraftOutput, String> {
         let head = self
             .mtp_head
@@ -2572,6 +2815,31 @@ impl ModelRig {
             if let Err(e) = state.mtp_scratch.ensure_compressed_logits(&mut gpu, cvs) {
                 self.mtp_states[slot.0] = Some(state);
                 return Err(format!("ensure head compressed logits: {e}"));
+            }
+        }
+
+        // Install this request's sampling/penalty config (parked by admit;
+        // a cold admit's state only exists from now on). `set_sampling`
+        // reseeds the draft RNG, so it runs exactly once per request — the
+        // per-window penalty history is rebuilt from `emitted` below instead.
+        let mut req_sampling = self.mtp_req_sampling[slot.0].take();
+        if let Some(cfg) = req_sampling.as_mut() {
+            if !cfg.applied {
+                state.set_sampling(cfg.sampling, cfg.rng_seed);
+                if cfg.sampling.penalized() {
+                    state.penalty = hipfire_runtime::spec_sampling::PenaltyHistory::new(
+                        cfg.sampling.repeat_window,
+                    );
+                    // Generation-only history: the prompt tail seeds row 0,
+                    // emitted tokens are added per window, exactly like AR's
+                    // `sess.tokens` tail window.
+                    state.penalty.set_prompt(&cfg.prompt_tail);
+                }
+                cfg.applied = true;
+            }
+            if cfg.sampling.penalized() {
+                // Row k of this window scopes `suffix_W(emitted ‖ c[..k])`.
+                state.penalty.begin_window(emitted);
             }
         }
 
@@ -2609,6 +2877,7 @@ impl ModelRig {
         })();
 
         self.mtp_states[slot.0] = Some(state);
+        self.mtp_req_sampling[slot.0] = req_sampling;
         outcome
     }
 }
@@ -2689,6 +2958,19 @@ impl ModelRig {
             work.next_pos = new_pos;
             pool.set_seq_len(slot, new_pos)
                 .map_err(|e| format!("mtp set_seq_len: {e}"))?;
+            // KVMem statistics: only the committed prefix of the verify rows
+            // survives (`advance` rows starting at `pos`); rejected draft rows
+            // are overwritten by later writes and never enter the host store.
+            #[cfg(feature = "kvmem")]
+            if let Some(ctl) = self.kvmem.as_mut() {
+                let taps = self
+                    .pbs
+                    .kvmem_taps
+                    .as_ref()
+                    .expect("kvmem controller without statistics taps");
+                ctl.feed_rows(gpu, taps, slot.0, pos, result.advance, hidden_row_offset)
+                    .map_err(|e| format!("kvmem statistics feed: {e}"))?;
+            }
 
             Ok(result.committed)
         })();
@@ -2805,6 +3087,26 @@ impl ModelRig {
             work.next_pos = new_pos;
             pool.set_seq_len(slot, new_pos)
                 .map_err(|e| format!("dflash set_seq_len: {e}"))?;
+            // KVMem statistics: `committed` is the kept prefix of the verify
+            // rows (seed + accepted drafts), written from `pos`; the rows past
+            // it are rejected drafts that never enter the host store.
+            #[cfg(feature = "kvmem")]
+            if let Some(ctl) = self.kvmem.as_mut() {
+                let taps = self
+                    .pbs
+                    .kvmem_taps
+                    .as_ref()
+                    .expect("kvmem controller without statistics taps");
+                ctl.feed_rows(
+                    gpu,
+                    taps,
+                    slot.0,
+                    pos,
+                    committed.len(),
+                    hidden_row_offset,
+                )
+                .map_err(|e| format!("kvmem statistics feed: {e}"))?;
+            }
             Ok(committed)
         })();
 
@@ -3149,11 +3451,13 @@ fn effective_repeat_window(
     }
 }
 
-/// True when the request asks for real sampling. Sampled requests decode AR
-/// for the same reason penalized ones do: the verify accept is a bare greedy
-/// argmax and cannot reproduce a sampled pick — running MTP anyway would emit
-/// a greedy/spec hybrid instead of the requested distribution. The daemon
-/// defaults temperature to 0.0 (greedy), so MTP stays on for default requests.
+/// True when the request asks for real sampling (temperature > 0).
+///
+/// Sampled requests now run MTP through residual acceptance
+/// (`mtp_sampled_accept` with the draft nucleus), which reproduces the AR
+/// distribution. The predicate survives for the routes that still require a
+/// deterministic greedy chain: the DFlash2 slot draft, and the prefix-resume
+/// drafter plan (a resumed request's head KV is zero for the reused span).
 fn request_sampled(req: &SubmitRequest) -> bool {
     req.temperature > 0.0
 }
@@ -3427,9 +3731,18 @@ fn commit_sampled_token(
         clear_work_slot(&mut work[s]);
         rig.model.clear_slot_vl_state(&mut rig.gpu, s);
         if matches!(reason, DoneReason::ClientGone) {
+            // Nobody will follow up on a vanished client, so hand the slot
+            // back at once.
             rig.swap.forget(session.0);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
         } else {
+            // Keep the session resident so its next turn can extend it in
+            // place. Under KVMem that reuse is the whole KV: the trunk pages
+            // (resident plus spilled payloads and their row statistics in
+            // the host store), the DeltaNet state and the MTP head KV all
+            // stay valid, so the shared prefix is never re-prefilled. LRU
+            // eviction (which closes rather than swaps under KVMem) reclaims
+            // the slot when someone else needs it.
             rig.sessions.touch(session);
         }
     } else {
@@ -4198,10 +4511,33 @@ fn run_loop(
                         // `remaining_prompt` is stashed so a later draft drop
                         // can restore it.
                         let seed = work[s].remaining_prompt.last().copied();
+                        // Token penalties scope the verify rows against this
+                        // request's emitted history (`sess.tokens` past the
+                        // rendered prompt); only penalized MTP requests need
+                        // it, so the others skip the copy.
+                        let emitted: Vec<u32> = match work[s].spec {
+                            SpecKind::Mtp => {
+                                let pl = rig.model.mtp_req_sampling[s]
+                                    .as_ref()
+                                    .filter(|c| c.sampling.penalized())
+                                    .map(|c| c.prompt_len);
+                                match pl {
+                                    Some(pl) => slots[s]
+                                        .as_ref()
+                                        .and_then(|f| rig.sessions.get(f.session))
+                                        .map(|sess| {
+                                            sess.tokens[pl.min(sess.tokens.len())..].to_vec()
+                                        })
+                                        .unwrap_or_default(),
+                                    None => Vec::new(),
+                                }
+                            }
+                            _ => Vec::new(),
+                        };
                         let outcome = match work[s].spec {
                             SpecKind::Mtp => rig
                                 .model
-                                .mtp_draft_step(&mut rig.gpu, SlotId(s), &mut work[s])
+                                .mtp_draft_step(&mut rig.gpu, SlotId(s), &mut work[s], &emitted)
                                 .map(SpecDraftRows::Mtp),
                             SpecKind::Dflash => rig
                                 .model
@@ -4368,6 +4704,41 @@ fn run_loop(
                     eligible[s] = granted_ids.contains(&f.session.0);
                 }
             }
+            // KVMem: a prompt that spills must hand its LAST token to the next
+            // step. The prompt-completing step is the one whose logits seed
+            // the answer, and its residency pass scores the host store against
+            // the Q tap of the previous row. Draining the prompt in one round
+            // makes that tap the previous chunk's last row — up to a page of
+            // filler before the question — so a needle at 50% of a long
+            // document is selected against the wrong query and never restored.
+            // Holding one token puts the tap immediately before it, on the
+            // question itself. Only spilling prompts are split: a prompt that
+            // fits the resident budget keeps the upstream single-round shape
+            // and its bit-exact kernel sequence.
+            #[cfg(feature = "kvmem")]
+            let hold_tail: Vec<bool> = match rig.model.kvmem.as_ref() {
+                Some(ctl) => {
+                    let budget = ctl.budget_blocks();
+                    work.iter()
+                        .map(|w| {
+                            let left = w.remaining_prompt.len();
+                            !w.decoding
+                                && left > 1
+                                && (w.next_pos + left).div_ceil(PAGE_TOKENS) > budget
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+            #[cfg(feature = "kvmem")]
+            let sched_batch = sched.next_batch_eligible_hold(
+                &mut work,
+                remaining_for_sched,
+                prefill_min_tokens,
+                &eligible,
+                &hold_tail,
+            );
+            #[cfg(not(feature = "kvmem"))]
             let sched_batch = sched.next_batch_eligible(
                 &mut work,
                 remaining_for_sched,
@@ -4482,6 +4853,63 @@ fn run_loop(
             };
             if batch.is_empty() {
                 continue;
+            }
+            // ── KVMem residency pass (HIPFIRE_KVMEM) ────────────────────────
+            // Runs BEFORE provisioning: a step's new pages come from the
+            // pool's free list, so the pages this step sheds must be back in
+            // it first. Restored pages are rebound in the slot's block table
+            // before the forward resolves its writes through it; every byte
+            // move is arena<->host memcpy, so a spill/restore round trips
+            // bit-exactly. Selection only touches pages strictly below the
+            // write frontier, so the step's own writes can never land on a
+            // sentinel entry.
+            #[cfg(feature = "kvmem")]
+            if rig.model.kvmem.is_some() {
+                let active: Vec<bool> = (0..n).map(|s| slots[s].is_some()).collect();
+                // Idle slots that still hold a resident session keep their
+                // KVMem host state: it backs the next turn's continuation
+                // prefix (the session was kept at terminal instead of being
+                // closed, see the terminal handler).
+                let resident: Vec<bool> = (0..n)
+                    .map(|s| {
+                        rig.sessions
+                            .iter()
+                            .any(|(_, sess)| sess.slot.map(|sl| sl.0) == Some(s))
+                    })
+                    .collect();
+                let prefill: Vec<bool> = (0..n).map(|s| !work[s].decoding).collect();
+                // The batch drained `remaining_prompt`, so an empty remainder
+                // means this chunk completes the prompt: its forward yields
+                // the logits the first answer token is sampled from, and the
+                // residency pass must have the answer's pages back by then.
+                let prefill_final: Vec<bool> = (0..n)
+                    .map(|s| !work[s].decoding && work[s].remaining_prompt.is_empty())
+                    .collect();
+                let step = {
+                    let ctl = rig.model.kvmem.as_mut().unwrap();
+                    let taps = rig
+                        .model
+                        .pbs
+                        .kvmem_taps
+                        .as_ref()
+                        .expect("kvmem controller without statistics taps");
+                    ctl.prepare_step(
+                        &rig.gpu,
+                        &mut rig.pool,
+                        taps,
+                        &active,
+                        &resident,
+                        &prefill,
+                        &prefill_final,
+                        &rig.model.k_arenas,
+                        &rig.model.v_arenas,
+                    )
+                };
+                if let Err(e) = step {
+                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                    poison = Some(e);
+                    break 'serve;
+                }
             }
             // Provision every slot's write frontier before any COW or kernel work.
             // If retained cache-only pages consumed the free list, evict unpinned
@@ -4983,6 +5411,58 @@ fn run_loop(
                 poison = Some(reason);
                 break 'serve;
             }
+            if std::env::var("HIPFIRE_KVMEM_TIME").map(|v| v == "1").unwrap_or(false) {
+                let _ = forward_ns;
+                eprintln!(
+                    "[kvmem-time] forward {} rows: {:.1} ms through sync",
+                    batch.total_rows(),
+                    t_forward.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            // ── KVMem statistics feed (HIPFIRE_KVMEM) ───────────────────────
+            // Every KV row this step wrote (prefill chunk or plain decode row)
+            // is summarized into the slot's host store now, from the taps the
+            // forward captured. Verify steps are fed in the accept path
+            // instead — only the committed prefix of their rows survives, and
+            // its size is not known until after the sampler reads the hidden
+            // rows. Fed positions are contiguous by construction: a slot's
+            // batch rows always start at the store's current length.
+            #[cfg(feature = "kvmem")]
+            if rig.model.kvmem.is_some() {
+                let mut row = 0usize;
+                let mut feed_err: Option<String> = None;
+                for s in 0..n {
+                    let m = batch.m_per_slot[s];
+                    if m == 0 {
+                        continue;
+                    }
+                    let row_start = row;
+                    let pos0 = batch.positions[row] as usize;
+                    row += m;
+                    if spec_drafts[s].is_some() {
+                        continue;
+                    }
+                    let fed = {
+                        let ctl = rig.model.kvmem.as_mut().unwrap();
+                        let taps = rig
+                            .model
+                            .pbs
+                            .kvmem_taps
+                            .as_ref()
+                            .expect("kvmem controller without statistics taps");
+                        ctl.feed_rows(&rig.gpu, taps, s, pos0, m, row_start)
+                    };
+                    if let Err(e) = fed {
+                        feed_err = Some(e);
+                        break;
+                    }
+                }
+                if let Some(e) = feed_err {
+                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                    poison = Some(e);
+                    break 'serve;
+                }
+            }
             if check_pool_invariants {
                 if let Some(pp) = rig.pool.page_pool() {
                     pp.check_invariants();
@@ -5397,6 +5877,13 @@ fn run_loop(
                     let row_off: usize = (0..s)
                         .map(|i| batch.m_per_slot.get(i).copied().unwrap_or(0))
                         .sum();
+                    if rig.gpu.slot_trace() {
+                        eprintln!(
+                            "[slot-trace] spec prefill slot {s} kind={:?} m={m} rp={}",
+                            work[s].spec,
+                            work[s].remaining_prompt.len()
+                        );
+                    }
                     let prefill_outcome: Result<(), String> = match work[s].spec {
                         SpecKind::Mtp => {
                             let chunk_tokens: Vec<u32> =
@@ -5594,10 +6081,13 @@ fn run_loop(
                         rig.swap.forget(session.0);
                         rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
                     } else {
-                        // state are exactly what a follow-up turn continuing this
-                        // conversation needs; closing here is what made multi-turn
-                        // reuse impossible. LRU eviction reclaims the slot when
-                        // someone else needs it.
+                        // Keep the session resident: the trunk KV (under KVMem
+                        // including the host store's statistics and spilled
+                        // pages), DeltaNet and MTP head state are exactly what a
+                        // follow-up turn continuing this conversation needs;
+                        // closing here is what made multi-turn reuse impossible.
+                        // LRU eviction reclaims the slot when someone else needs
+                        // it (closing, not swapping, under KVMem).
                         rig.sessions.touch(session);
                     }
                 } else {
@@ -6019,6 +6509,34 @@ fn admit(
                     .confirm_reentry(SessionId(*session), &req.convo, &busy)
             }
         };
+        // KVMem: a finished session is kept resident precisely so its next
+        // turn extends it in place — the trunk KV (resident pages plus
+        // spilled payloads and row statistics in the host store), the
+        // DeltaNet state and the MTP head KV all remain valid, so the shared
+        // prefix is never re-prefilled. A session that holds no slot has no
+        // host tier that could survive (a swap snapshot cannot represent
+        // spilled pages), so it is not resumable; the cold path re-prefills.
+        // The filter also refuses a session whose host store does not cover
+        // the slot's materialized prefix exactly — feeding rows onto any
+        // other prefix would break the store's contiguity contract.
+        #[cfg(feature = "kvmem")]
+        let matched = matched.filter(|existing| {
+            if !kvmem_enabled(rig) {
+                return true;
+            }
+            let Some(slot) = rig.sessions.get(*existing).and_then(|s| s.slot) else {
+                return false;
+            };
+            let held = rig
+                .pool
+                .descriptors()
+                .get(slot.0)
+                .map(|d| d.seq_len.max(0) as u32);
+            match (rig.model.kvmem.as_ref(), held) {
+                (Some(ctl), Some(held)) => ctl.fed_tokens(slot.0) == Some(held),
+                _ => false,
+            }
+        });
         if let Some(existing) = matched {
             let base = rig
                 .sessions
@@ -6127,7 +6645,13 @@ fn admit(
                 // otherwise the forward dies mid-prefill on "need N more
                 // pages". Evict radix leaves first, then LRU idle sessions;
                 // the matched session itself is never a victim.
-                if rig.pool.is_paged() {
+                //
+                // Under KVMem the question does not apply: the suffix keeps
+                // spilling into the host store as it grows, so demand is
+                // bounded by the resident budget + step headroom, not by the
+                // full context (and this check would reject every long
+                // continuation against a pool that only holds the budget).
+                if rig.pool.is_paged() && !kvmem_enabled(rig) {
                     // `held` = tokens already materialized in this slot's KV.
                     // For a RESIDENT session that is the descriptor's seq_len
                     // (the real frontier), NOT sess.next_pos — next_pos is
@@ -6272,6 +6796,48 @@ fn admit(
                 }
                 match rig.sessions.begin_turn(&mut rig.pool, existing, &extended) {
                     Ok(plan) => {
+                        // KVMem: the slot's host store must already cover
+                        // exactly the reuse point — the forwarded frontier
+                        // the block table represents. `begin_request` stamps
+                        // the turn boundary (the prompt-completing chunk only
+                        // scores retrieval when its Q tap came from THIS
+                        // request) and reports the stored length; feeding
+                        // rows onto any other prefix would break the store's
+                        // contiguity contract. Fail closed — close the
+                        // session so the slot and its host tier rebuild on
+                        // the next cold attempt — rather than corrupt it.
+                        #[cfg(feature = "kvmem")]
+                        if kvmem_enabled(rig) {
+                            let fed = rig
+                                .model
+                                .kvmem
+                                .as_mut()
+                                .map(|ctl| ctl.begin_request(slot.0))
+                                .transpose();
+                            let problem = match fed {
+                                Ok(Some(n)) if n as usize == plan.reused => None,
+                                Ok(Some(n)) => Some(format!(
+                                    "kvmem store holds {n} tokens but the \
+                                     continuation resumes at {}",
+                                    plan.reused
+                                )),
+                                Ok(None) => Some("kvmem controller missing".to_string()),
+                                Err(e) => Some(e),
+                            };
+                            if let Some(reason) = problem {
+                                let _ = send_event(
+                                    &req.reply,
+                                    Event::Rejected {
+                                        class: RejectClass::Internal,
+                                        reason,
+                                    },
+                                );
+                                rig.swap.forget(existing.0);
+                                rig.sessions.close(&mut rig.pool, &mut rig.adm, existing);
+                                lock_stats(stats).note_rejected();
+                                return;
+                            }
+                        }
                         if let Some(sess) = rig.sessions.get_mut(existing) {
                             sess.tokens = extended.clone();
                             sess.convo = req.convo.clone();
@@ -6312,8 +6878,9 @@ fn admit(
                             .unwrap_or(0);
                         // MTP: activate if enabled. Vision continuations stay on
                         // the sequential M-RoPE path (no MTP), matching cold
-                        // admits; penalized requests stay on AR (see
-                        // `request_penalized`). The head KV reset is only needed
+                        // admits; sampling and penalties ride the MTP path via
+                        // `mtp_req_sampling` (see the cold-admit note). The head
+                        // KV reset is only needed
                         // when the head KV was lost (swap-restore) or holds
                         // another session's rows: a session resident on this slot
                         // since its last turn keeps a head KV that matches its
@@ -6329,8 +6896,6 @@ fn admit(
                         let mtp_ok = rig.model.mtp_head.is_some()
                             && rig.model.mtp_k > 0
                             && req.visual_data.is_none()
-                            && !request_penalized(&req)
-                            && !request_sampled(&req)
                             && req.json_schema.is_none()
                             && mtp_head_kv_valid
                             && rig.model.mtp_states[slot.0].is_some();
@@ -6383,6 +6948,11 @@ fn admit(
                             SpecKind::Dflash
                         } else {
                             SpecKind::None
+                        };
+                        rig.model.mtp_req_sampling[slot.0] = if work[slot.0].spec == SpecKind::Mtp {
+                            Some(MtpReqSampling::new(&req, &extended))
+                        } else {
+                            None
                         };
                         if !work[slot.0].spec.active() {
                             if let Some(state) = rig.model.mtp_states[slot.0].as_mut() {
@@ -6514,12 +7084,24 @@ fn admit(
         .saturating_add(req.max_tokens.max(1))
         .min(rig.cap_tokens);
     let mut opened = admit_cold(rig, &mut cold_reuse, grant_tokens);
+    // KVMem: never *evict* a resident session to make room. Its pages are the
+    // residency decision KVMem already made, and a swap snapshot cannot
+    // represent spilled logical pages — a victim would be lost work at best
+    // and a corrupt snapshot at worst. A resident session is also never
+    // continuable under KVMem (every turn cold-prefills), so an idle one is
+    // simply closed: its slot and grant come back, and the slot's KVMem host
+    // tier is rebuilt when the new session begins. Without this a full slot
+    // set could only park (nothing else frees the slot), which is the
+    // serve-hang the terminal close above prevents.
     while opened.is_err() {
         // Re-derive the victim each pass: the previous park consumed it.
         let Some(victim) = rig.sessions.lru_idle_victim(&busy) else {
             break;
         };
-        if !evict(rig, victim, stats) {
+        if kvmem_enabled(rig) {
+            rig.swap.forget(victim.0);
+            rig.sessions.close(&mut rig.pool, &mut rig.adm, victim);
+        } else if !evict(rig, victim, stats) {
             let _ = send_event(
                 &req.reply,
                 Event::Rejected {
@@ -6653,6 +7235,26 @@ fn admit(
     // re-allocates lazily on its first prefill chunk.
     if let Some(st) = rig.model.dflash_states[slot.0].take() {
         st.free_gpu(&mut rig.gpu);
+    }
+
+    // Reset the KVMem host state for the new conversation. The slot may have
+    // been active a moment ago (its session closed during the last emit), and
+    // the new session's statistics must start at position 0 — a stale store
+    // length would make the first feed fail its contiguity check.
+    #[cfg(feature = "kvmem")]
+    if let Some(ctl) = rig.model.kvmem.as_mut() {
+        if let Err(e) = ctl.reset_slot(slot.0) {
+            let _ = send_event(
+                &req.reply,
+                Event::Rejected {
+                    class: RejectClass::Internal,
+                    reason: format!("kvmem reset failed: {e}"),
+                },
+            );
+            rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+            lock_stats(stats).note_rejected();
+            return;
+        }
     }
 
     // ── Prefix cache lookup (spec §4.5–4.6) ──────────────────────────────
@@ -6831,7 +7433,13 @@ fn admit(
     // "need N more pages". Evict LRU idle sessions (snapshot to swap, or
     // cold on snapshot failure) until the demand is backed; if no victim
     // remains, reject at admit instead of letting the forward die.
-    if rig.pool.is_paged() {
+    //
+    // KVMem skips this entirely: the prompt's length is NOT a page demand —
+    // everything past the per-slot residency budget is the host store's
+    // job, and the pool is sized for every slot's resident working set. The
+    // only growth a slot can need is its selection headroom, which the plan
+    // already reserved.
+    if rig.pool.is_paged() && !kvmem_enabled(rig) {
         let suffix_tokens = req.prompt_tokens.len().saturating_sub(prefix_reused);
         let needed_pages = suffix_tokens
             .saturating_add(req.max_tokens.max(1))
@@ -7040,15 +7648,16 @@ fn admit(
         work[slot.0].vl_prefill = None;
         work[slot.0].pos3_delta = 0; // fresh session: no image-turn offset
                                      // Activate MTP for text-only requests when the head is loaded.
-                                     // Penalized requests stay on AR: the verify accept is a bare greedy
-                                     // argmax and cannot reproduce penalize-then-argmax; sampled requests
-                                     // (temperature > 0) stay on AR for the same reason — the verify path
-                                     // cannot reproduce a sampled pick. Grammar-constrained requests also
-                                     // stay on AR: constrained MTP requires joint verification (applying
-                                     // grammar masks before acceptance, not only after a bad token has
-                                     // advanced state), which does not yet exist (spec §6 X2: "MTP +
-                                     // grammar → AR selected before execution until exact joint
-                                     // acceptance is implemented and validated").
+                                     // Sampling and token penalties ride the MTP path: the
+                                     // request's `MtpSamplingConfig` (parked in
+                                     // `mtp_req_sampling`) makes verify use residual acceptance
+                                     // against the penalized target nucleus, reproducing the AR
+                                     // distribution. Grammar-constrained requests stay on AR:
+                                     // constrained MTP requires joint verification (applying
+                                     // grammar masks before acceptance, not only after a bad token
+                                     // has advanced state), which does not yet exist (spec §6 X2:
+                                     // "MTP + grammar → AR selected before execution until exact
+                                     // joint acceptance is implemented and validated").
                                      // Radix-reuse retires drafting: the head's private KV is zero for
                                      // the reused span (shared pages carry only trunk KV), and drafting
                                      // over a zeroed prefix collapses acceptance to ~1 — pure overhead
@@ -7056,8 +7665,6 @@ fn admit(
                                      // identical output without the overhead.
         let mtp_ok = rig.model.mtp_head.is_some()
             && rig.model.mtp_k > 0
-            && !penalized
-            && !request_sampled(&req)
             && !grammar_constrained
             && reused == 0;
         // DFlash2 admit on the new-session arm: same request-shape gates as
@@ -7095,6 +7702,25 @@ fn admit(
         } else {
             SpecKind::None
         };
+        rig.model.mtp_req_sampling[slot.0] = if work[slot.0].spec == SpecKind::Mtp {
+            Some(MtpReqSampling::new(&req, &req.prompt_tokens))
+        } else {
+            None
+        };
+        if rig.gpu.slot_trace() {
+            eprintln!(
+                "[slot-trace] admit(cold) slot {} spec={:?} temp={} top_k={} top_p={} \
+                 penalized={} reused={} prompt={}",
+                slot.0,
+                work[slot.0].spec,
+                req.temperature,
+                req.top_k,
+                req.top_p,
+                penalized,
+                reused,
+                req.prompt_tokens.len()
+            );
+        }
     }
     rig.sample_params[slot.0] = sample_params;
     // A prefix-cache hit's shared pages are already radix-owned up to

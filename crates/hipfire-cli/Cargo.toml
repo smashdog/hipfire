@@ -9,6 +9,12 @@ build = "build.rs"
 name = "hipfire"
 path = "src/main.rs"
 
+[features]
+# KVMem host offload (HIPFIRE_KVMEM=1) for the Qwen3.5 multi-slot serve engine.
+# Off by default: it builds the kvmem C++ host library from KVMEM_ROOT (default
+# sibling ../kvmem).
+kvmem = ["hipfire-loader/kvmem"]
+
 
 [dependencies]
 anyhow.workspace = true

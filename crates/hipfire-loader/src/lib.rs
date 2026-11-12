@@ -3025,7 +3025,7 @@ fn finish_qwen35_load(
             // `ctx.path` is canonical, so a sidecar beside a symlinked trunk is not
             // its sibling; the CLI resolves that case into `ctx.mtp_path`. Direct
             // daemon clients keep the canonical-sibling lookup.
-            let (resolved, errors) = resolve_qwen35_mtp_head_sourced(
+            let (mut resolved, errors) = resolve_qwen35_mtp_head_sourced(
                 Path::new(ctx.path),
                 ctx.mtp_path.clone(),
                 (config.dim, config.vocab_size),
@@ -3033,6 +3033,29 @@ fn finish_qwen35_load(
                 physical_cap,
                 None,
             );
+            // Third packaging: the head carried as ordinary `mtp.*` tensors
+            // inside the trunk's own container, which is how the escha
+            // converter passes upstream's head through. Neither the HFBNDMTP
+            // trailer nor a sibling `.mtp` exists for those builds.
+            if resolved.is_none() {
+                match hipfire_arch_qwen35::mtp_head::load_mtp_head_from_trunk(
+                    Path::new(ctx.path),
+                    &mut *ctx.gpu,
+                    physical_cap,
+                ) {
+                    Ok(Some(h)) => {
+                        eprintln!(
+                            "  MTP head loaded (in-trunk mtp.* tensors): n_embd={} vocab={}",
+                            h.config.n_embd, h.config.vocab_size
+                        );
+                        resolved = Some((h, "in-trunk mtp.*".to_string()));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("  in-trunk mtp.* load failed: {e} — falling back to AR/n-gram");
+                    }
+                }
+            }
             if resolved.is_none() {
                 if ctx.spec.mtp == Some(true) {
                     let reason = if errors.is_empty() {

@@ -126,6 +126,12 @@ impl RowsRoute {
 // only at this step; not on any live path until wired behind HIPFIRE_FORWARD_LOWERED).
 pub mod superop;
 
+// Escha-W2 trellis transform tables (borrowed view). The dense decode path
+// runs these through `rdna_compute::escha_*` directly; only `EschaRoutedRefs`
+// is shared with the model crate. The routed-MoE executors that once lived
+// here were removed with the sealed-MoE rewrite (escha MoE is out of scope).
+pub mod escha;
+
 /// Generic-pipeline refusal for the typed-only formats: MQ4G128V2 (qt=53) and
 /// the planar MQ3-I4 / MQ2-I4 dtypes (qt=131..=134).
 fn reject_mq4g128v2(dtype: DType, family: &'static str) -> Result<(), DispatchError> {

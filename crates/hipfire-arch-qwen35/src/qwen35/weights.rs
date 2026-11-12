@@ -128,6 +128,47 @@ pub struct DeltaNetLayerWeights {
     pub w_gate: WeightTensor,   // mlp.gate_proj
     pub w_up: WeightTensor,     // mlp.up_proj
     pub w_down: WeightTensor,   // mlp.down_proj
+    /// Additive output biases, present only on escha dense exports
+    /// (Qwen3.8-27B). Base Qwen3.8-27B has `attention_bias: false` and no MLP
+    /// bias — these are Escha's end-to-end output correction, and they cannot
+    /// be folded into a weight because they are additive. `None` for every
+    /// other model, which is why they are Option rather than a zero vector:
+    /// a zero add per projection per layer is real work for no effect.
+    pub biases: Option<DeltaNetBiases>,
+    /// Escha trellis metadata, one per coded projection. `Some` only when the
+    /// weights are `Escha2T16`/`Escha3T16`, which is the signal this layer
+    /// must bypass the fused MQ paths entirely — each projection needs its
+    /// own rin-rotated activation, so FusedQkvza/gate_up have nothing to
+    /// share.
+    pub escha: Option<DeltaNetEscha>,
+}
+
+/// See `DeltaNetLayerWeights::escha`.
+pub struct DeltaNetEscha {
+    pub qkv: crate::qwen35::escha::EschaProj,
+    pub z: crate::qwen35::escha::EschaProj,
+    pub o: crate::qwen35::escha::EschaProj,
+    pub gate: crate::qwen35::escha::EschaProj,
+    pub up: crate::qwen35::escha::EschaProj,
+    pub down: crate::qwen35::escha::EschaProj,
+    /// `slots`-long run of zeros for the indexed GEMV; sized for the largest
+    /// batch the model was built for so decode (slots=1) reads a prefix.
+    pub ids: GpuTensor,
+    /// `0..MAX` — the grouped GEMM's slot permutation, which for a dense
+    /// linear is the identity.
+    pub iota: GpuTensor,
+}
+
+/// See `DeltaNetLayerWeights::biases`. Each is `[oc]` f32, applied to the
+/// projection's output. `in_proj_a`/`in_proj_b` have none — they are on
+/// escha's `ignore` list and ship as plain weights.
+pub struct DeltaNetBiases {
+    pub qkv: GpuTensor,
+    pub z: GpuTensor,
+    pub o: GpuTensor,
+    pub gate: GpuTensor,
+    pub up: GpuTensor,
+    pub down: GpuTensor,
 }
 
 /// Weights for a full attention (gated) layer — similar to Qwen3 but with q+gate split.
@@ -143,6 +184,35 @@ pub struct FullAttnLayerWeights {
     pub w_gate: WeightTensor,
     pub w_up: WeightTensor,
     pub w_down: WeightTensor,
+    /// See `DeltaNetLayerWeights::biases`.
+    pub biases: Option<FullAttnBiases>,
+    /// See `DeltaNetLayerWeights::escha`.
+    pub escha: Option<FullAttnEscha>,
+}
+
+/// See `DeltaNetLayerWeights::escha`.
+pub struct FullAttnEscha {
+    pub q: crate::qwen35::escha::EschaProj,
+    pub k: crate::qwen35::escha::EschaProj,
+    pub v: crate::qwen35::escha::EschaProj,
+    pub o: crate::qwen35::escha::EschaProj,
+    pub gate: crate::qwen35::escha::EschaProj,
+    pub up: crate::qwen35::escha::EschaProj,
+    pub down: crate::qwen35::escha::EschaProj,
+    pub ids: GpuTensor,
+    /// See `DeltaNetEscha::iota`.
+    pub iota: GpuTensor,
+}
+
+/// See `DeltaNetLayerWeights::biases`.
+pub struct FullAttnBiases {
+    pub q: GpuTensor,
+    pub k: GpuTensor,
+    pub v: GpuTensor,
+    pub o: GpuTensor,
+    pub gate: GpuTensor,
+    pub up: GpuTensor,
+    pub down: GpuTensor,
 }
 
 // ─── MoE FFN weights (Qwen3.5-MoE / A3B) ────────────────────────────────
@@ -224,9 +294,15 @@ pub(crate) fn bind_live_expert_cache(
 /// and every existing indexed dispatch keep their exact metadata and
 /// pointer-table ABI. Those views are non-owning subranges of these buffers;
 /// only these owner vecs may be returned to the GPU pool.
-pub(crate) struct PackedExpertOwners {
-    pub(crate) gate_up: Vec<GpuTensor>,
-    pub(crate) down: Vec<GpuTensor>,
+///
+/// Escha-W2 layers pack exactly one bucket per projection too (the loader
+/// decodes the trellis to a single Q8_0 blob per projection), so the escha
+/// producer wraps its one buffer in a one-element vec. `pub` because
+/// `examples/escha_moe_block_gate` loads a layer's experts directly and must
+/// free the owners exactly once across the crate boundary.
+pub struct PackedExpertOwners {
+    pub gate_up: Vec<GpuTensor>,
+    pub down: Vec<GpuTensor>,
 }
 
 impl PackedExpertOwners {
@@ -1675,6 +1751,17 @@ pub struct MoeFfnWeights {
         hipfire_dispatch::families::moe_expert_iu4::ExpertIu4Spec,
         bool,
     )>,
+
+    /// Escha-W2 (Task 10): per-layer H128 transform tables + decode scratch.
+    /// `Some` only for layers loaded from an Escha-W2 checkpoint.
+    ///
+    /// This is also the layer's escha MARKER. The loader decodes the trellis
+    /// and stores the experts as `Q8_0`, so `experts[i].gate_up.gpu_dtype` no
+    /// longer says "escha" by the time dispatch resolves the layer; only this
+    /// field does. `moe_ffn_decode_impl` threads it into
+    /// `MoeParams::escha`, whose `has_escha()` drives both the f16
+    /// router-logit round-trip and the H128-wrapped routed executor.
+    pub escha: Option<super::escha::EschaMoeTables>,
 }
 
 impl MoeFfnWeights {
@@ -1787,6 +1874,20 @@ impl LayerWeights {
                 l.w_gate.free_all(gpu);
                 l.w_up.free_all(gpu);
                 l.w_down.free_all(gpu);
+                if let Some(b) = l.biases {
+                    for t in [b.qkv, b.z, b.o, b.gate, b.up, b.down] {
+                        let _ = gpu.free_tensor(t);
+                    }
+                }
+                if let Some(e) = l.escha {
+                    for p in [e.qkv, e.z, e.o, e.gate, e.up, e.down] {
+                        let _ = gpu.free_tensor(p.rin);
+                        let _ = gpu.free_tensor(p.rout);
+                        let _ = gpu.free_tensor(p.ptr0);
+                    }
+                    let _ = gpu.free_tensor(e.ids);
+                    let _ = gpu.free_tensor(e.iota);
+                }
             }
             LayerWeights::FullAttn(l) => {
                 let _ = gpu.free_tensor(l.attn_norm);
@@ -1800,6 +1901,20 @@ impl LayerWeights {
                 l.w_gate.free_all(gpu);
                 l.w_up.free_all(gpu);
                 l.w_down.free_all(gpu);
+                if let Some(b) = l.biases {
+                    for t in [b.q, b.k, b.v, b.o, b.gate, b.up, b.down] {
+                        let _ = gpu.free_tensor(t);
+                    }
+                }
+                if let Some(e) = l.escha {
+                    for p in [e.q, e.k, e.v, e.o, e.gate, e.up, e.down] {
+                        let _ = gpu.free_tensor(p.rin);
+                        let _ = gpu.free_tensor(p.rout);
+                        let _ = gpu.free_tensor(p.ptr0);
+                    }
+                    let _ = gpu.free_tensor(e.ids);
+                    let _ = gpu.free_tensor(e.iota);
+                }
             }
             LayerWeights::DeltaNetMoe(l) => {
                 let _ = gpu.free_tensor(l.attn_norm);
@@ -3067,6 +3182,8 @@ impl Qwen35Weights {
                     w_gate: placeholder_weight(w_gate),
                     w_up: placeholder_weight(w_up),
                     w_down: placeholder_weight(w_down),
+                    biases: None,
+                    escha: None,
                 }),
                 Qwen35LayerSeal::FullAttn {
                     attn_norm,
@@ -3092,6 +3209,8 @@ impl Qwen35Weights {
                     w_gate: placeholder_weight(w_gate),
                     w_up: placeholder_weight(w_up),
                     w_down: placeholder_weight(w_down),
+                    biases: None,
+                    escha: None,
                 }),
                 Qwen35LayerSeal::DeltaNetMoe { .. } | Qwen35LayerSeal::FullAttnMoe { .. } => {
                     return Err(fail(dense_unsupported("MoE layer seal"), Vec::new()));
@@ -3270,6 +3389,27 @@ where
 /// shared sidecars, EP dummy buffers, and paged-mode's empty expert vector.
 /// Each callback invocation consumes one actual owning buffer exactly once.
 pub(crate) fn free_moe_ffn_with(ffn: MoeFfnWeights, free: &mut impl FnMut(GpuTensor)) {
+    // Escha-W2 transform tables + decode scratch. Owned outright (nothing
+    // aliases them), so free before the experts they describe.
+    if let Some(e) = ffn.escha {
+        for t in [
+            e.gate_up_rin,
+            e.gate_up_rout,
+            e.down_rin,
+            e.down_rout,
+            e.ids,
+            e.weights,
+            e.xh_gu,
+            e.mid_gu,
+            e.y_gu,
+            e.h,
+            e.xh_dn,
+            e.mid_dn,
+            e.y_dn,
+        ] {
+            free(t);
+        }
+    }
     free_weight_with(ffn.router, free);
     free_weight_with(ffn.shared_expert_gate, free);
     free_weight_with(ffn.shared_expert.gate, free);
@@ -3905,6 +4045,7 @@ mod tests {
             expert_table,
             expert_binding,
             expert_iu4: None,
+            escha: None,
         }
     }
 

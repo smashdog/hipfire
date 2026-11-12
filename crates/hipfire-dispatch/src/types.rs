@@ -112,6 +112,9 @@ pub enum RotationPlan {
     FwhtG128,
     Mq8Internal,
     Givens,
+    /// Escha-W2: unnormalised 128-point Walsh-Hadamard on BOTH sides,
+    /// RS = 1/sqrt(128), signs folded into rin/rout rather than seeded.
+    EschaH128,
 }
 
 /// Sign-domain plan for a dtype. `None` <=> no activation rotation required.
@@ -159,6 +162,12 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         FP8E4M3B128 | FP8E4M3PT => RotationPlan::None,
         // HC8E4M3Row (qt=57) is natural-basis: the HC mixer consumes unrotated activations.
         HC8E4M3Row => RotationPlan::None,
+        // Escha-W2: rotated-domain weights, 128-point Hadamard on both sides.
+        // Stated explicitly rather than left to the `_` fallthrough below —
+        // reaching RotationPlan::None here would skip the H128 pair and feed
+        // an unrotated activation through a rotated-domain weight, which is
+        // silent, fluent-looking garbage rather than a crash.
+        Escha2T16 | Escha3T16 => RotationPlan::EschaH128,
         _ => RotationPlan::None,
     }
 }
@@ -178,6 +187,15 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 | MQ4G128 | MQ4G128V2 | MFP4G32E8G128
         | MQ3I4G128R256 | MQ3I4G128R128 | MQ2I4G128R256 | MQ2I4G128R128 | E8PI4G128R256
         | E8PI4G128R128 => GemvVariant::Prerotated,
+        // Escha-W2: stated explicitly rather than left to the `_` fallthrough.
+        // No GEMV kernel exists yet, so this value is never actually launched —
+        // `for_gemv(_, Plain)` has no arm for these types (always Err), and
+        // `prepare_rotation_scratch` errors on `RotationPlan::EschaH128` before
+        // any rotate kernel runs, so the end-to-end path is Err regardless of
+        // what is returned here. Kept as `Plain` (the same value the `_` arm
+        // would produce) purely so a future reader sees this dtype was
+        // considered, not missed.
+        Escha2T16 | Escha3T16 => GemvVariant::Plain,
         _ => GemvVariant::Plain,
     }
 }
@@ -699,6 +717,16 @@ pub enum ArchPredicate {
     /// Gates the gfx906 wave64 `v_dot4_i32_i8` (sdot4) fused kernels (HFQ6/MQ6).
     /// This IS AMD "dp4a" — `v_dot4_i32_i8` INT8 dot4 accumulate, gfx906/gfx908.
     HasDp4a,
+    /// No kernel exists for this dtype yet; fail closed. Evaluates to `false`
+    /// on every architecture (see `eval_arch`), so any table registration
+    /// gated on this predicate is dead-on-arrival rather than silently
+    /// advertised as available everywhere. This is the correct default for a
+    /// dtype whose GEMV/GEMM kernel is future work — `Always` would be an
+    /// affirmatively wrong claim that compiles cleanly and only breaks at
+    /// runtime, on real hardware, the day someone registers the kernel.
+    /// MUST be replaced (not removed) with the kernel's real arch gate when
+    /// that kernel lands.
+    Unimplemented,
 }
 
 #[derive(Clone, Debug)]
@@ -1084,21 +1112,58 @@ impl KernelKey {
             // them, so resolution fails with MissingImpl; explicit so a future
             // ggml route has to decide its arch gate.
             GgmlQ4K | GgmlQ5K | GgmlQ6K | GgmlQ8_0 | GgmlIQ4XS => ArchPredicate::Always,
+            // Escha-W2: no GEMV kernel exists yet (Task 4 registers the ids/rotation
+            // plan only; the HIP kernels are future work), so there is no real
+            // hardware requirement to encode yet. `Unimplemented` fails closed on
+            // every arch (see its doc comment) rather than claiming — as `Always`
+            // would — that a kernel runs everywhere. It is inert today the same way
+            // `Always` was inert: `for_gemv` has no arm for these types (always Err)
+            // and `dtype_post_rotation_variant` never maps them to `Prerotated`, so
+            // neither call site in `pipeline/mod.rs` that guards on
+            // `dtype_arch_predicate(..).eval_arch()` can reach this value for Escha.
+            // The difference is what happens the day someone registers an Escha
+            // entry in `gemv_table.rs` without touching this function: `Always`
+            // would silently advertise it on every arch; `Unimplemented` fails
+            // closed with an explicit dispatch error instead. Replace with the
+            // real arch gate when the Escha GEMV kernel lands.
+            Escha2T16 | Escha3T16 => ArchPredicate::Unimplemented,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }
 
     /// Pipeline steps required for a given (DType, GemvVariant) pair.
-    pub fn gemv_steps(dtype: DType, variant: GemvVariant) -> &'static [PipelineOp] {
+    pub fn gemv_steps(
+        dtype: DType,
+        variant: GemvVariant,
+    ) -> Result<&'static [PipelineOp], DispatchError> {
         use DType::*;
         use GemvVariant::*;
         match variant {
             Plain => match dtype_rotation_plan(dtype) {
-                RotationPlan::Givens => &[PipelineOp::GivensRotate, PipelineOp::Gemv],
-                RotationPlan::None => &[PipelineOp::Gemv],
-                _ => &[PipelineOp::RotateFwht, PipelineOp::Gemv],
+                RotationPlan::Givens => Ok(&[PipelineOp::GivensRotate, PipelineOp::Gemv]),
+                RotationPlan::None => Ok(&[PipelineOp::Gemv]),
+                // Escha-W2: stated explicitly rather than left to the `_`
+                // catch-all below, which would mislabel the 128-point
+                // Hadamard as a `RotateFwht` step — a plausible-looking step
+                // list for a rotate kernel that does not exist. No caller
+                // reaches this today: `for_gemv(_, Plain)` already returns
+                // Err for Escha2T16/Escha3T16 (see
+                // `escha_types_never_resolve_to_plain`), so this arm is dead
+                // code, not a load-bearing runtime path. Return an explicit
+                // error instead of guessing a step list (or panicking) —
+                // callers already handle `for_gemv`'s Err the same way via
+                // `let Ok(..) else { continue }`. Replace with the real
+                // `[EschaRotate, Gemv]`-shaped step list when the H128
+                // rotate/GEMV kernels land.
+                RotationPlan::EschaH128 => Err(DispatchError::UnsupportedVariant {
+                    family: "gemv",
+                    variant: "Plain",
+                    arch: "",
+                    quant: "escha-w2 (no GEMV kernel exists yet)",
+                }),
+                _ => Ok(&[PipelineOp::RotateFwht, PipelineOp::Gemv]),
             },
-            Prerotated => &[PipelineOp::Gemv],
+            Prerotated => Ok(&[PipelineOp::Gemv]),
             WithResidual => {
                 let steps: &[PipelineOp] = match dtype {
                     MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ2G256V2 | MQ3G256V2 | MQ5G256V2
@@ -1110,7 +1175,7 @@ impl KernelKey {
                     ],
                     _ => &[PipelineOp::Gemv, PipelineOp::ResidualAdd],
                 };
-                steps
+                Ok(steps)
             }
             WithSwiGLUResidual => {
                 let steps: &[PipelineOp] = match dtype {
@@ -1123,7 +1188,7 @@ impl KernelKey {
                         PipelineOp::ResidualAdd,
                     ],
                 };
-                steps
+                Ok(steps)
             }
         }
     }
@@ -1166,6 +1231,17 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MFP2G32E8
             | ParoQ4G128
             | ParoQ4G64
+            // Escha-W2. Its plan is `RotationPlan::EschaH128` (see
+            // `dtype_rotation_plan` above), so it MUST answer true here.
+            // The two functions disagreeing is precisely the state in which
+            // one caller applies the H128 pair and another skips it — an
+            // unrotated activation through a rotated-domain weight, which is
+            // finite, fluent, wrong output rather than a crash.
+            // `rotation_plan_matches_legacy_needs_fwht` in dispatch-tests
+            // enforces the agreement; both types are in its
+            // `QUANTIZED_DTYPES` list so the enforcement is not vacuous.
+            | Escha2T16
+            | Escha3T16
     )
 }
 

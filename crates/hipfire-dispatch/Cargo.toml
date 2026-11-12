@@ -10,6 +10,10 @@ hipfire-cpu = { path = "../hipfire-cpu" }
 hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
 smallvec = "1.15.2"
+# Task 10 (Escha-W2): the routed combine must multiply by f16(score); `half`
+# is the workspace's RNE f32->f16 encoder and is already a transitive dep via
+# rdna-compute, so this adds no build cost.
+half.workspace = true
 
 [dev-dependencies]
 # Worker-count determinism tests build their own pools.

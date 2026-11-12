@@ -27,6 +27,13 @@ const QUANTIZED_DTYPES: &[DType] = &[
     DType::HFQ2G128,
     DType::HFQ6G256,
     DType::ParoQ4G128,
+    // Escha-W2. Listed so `rotation_plan_matches_legacy_needs_fwht` actually
+    // covers the two dtypes whose rotation plan is `EschaH128`. This branch
+    // reflowed that list without adding them, which let
+    // `dtype_needs_rotation` return false for an `EschaH128` dtype with no
+    // test to catch it.
+    DType::Escha2T16,
+    DType::Escha3T16,
     DType::Raw,
 ];
 
@@ -143,6 +150,14 @@ fn rotation_plan_covers_every_dtype() {
         RotationPlan::Mq8Internal
     );
     assert_eq!(dtype_rotation_plan(DType::ParoQ4G128), RotationPlan::Givens);
+    assert_eq!(
+        dtype_rotation_plan(DType::Escha2T16),
+        RotationPlan::EschaH128
+    );
+    assert_eq!(
+        dtype_rotation_plan(DType::Escha3T16),
+        RotationPlan::EschaH128
+    );
 }
 
 #[test]
@@ -285,4 +300,34 @@ fn rotate_variant_selection() {
         select_rotation_variant(RotationPlan::Givens, false, false),
         RotationVariant::Givens
     );
+}
+
+// ─── Escha-W2 registration (Task 4) ─────────────────────────────
+
+#[test]
+fn escha_types_use_the_escha_rotation_plan() {
+    use hipfire_dispatch::types::{dtype_rotation_plan, RotationPlan};
+    assert_eq!(
+        dtype_rotation_plan(DType::Escha2T16),
+        RotationPlan::EschaH128
+    );
+    assert_eq!(
+        dtype_rotation_plan(DType::Escha3T16),
+        RotationPlan::EschaH128
+    );
+}
+
+/// Escha weights are stored in the rotated domain. Reaching a Plain GEMV
+/// without the H128 pair does not crash — it produces coherent-looking
+/// garbage. Both types must therefore refuse to resolve to Plain, exactly as
+/// MQ4G128 does (see coverage_tests.rs).
+#[test]
+fn escha_types_never_resolve_to_plain() {
+    use hipfire_dispatch::types::{GemvVariant, KernelKey};
+    for dt in [DType::Escha2T16, DType::Escha3T16] {
+        assert!(
+            KernelKey::for_gemv(dt, GemvVariant::Plain, false).is_err(),
+            "{dt:?} must not have a Plain GEMV arm — that would skip the H128 pair"
+        );
+    }
 }

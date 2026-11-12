@@ -58,7 +58,10 @@ impl QuantType {
             35 => Some(Self::MFP4G32E8SOA),
             36 => Some(Self::MFP3G32E8),
             37 => Some(Self::MFP2G32E8),
-            42 => Some(Self::MFP4G32E8G128),
+            // qt=42/43 are Escha2T16/Escha3T16 on the wire (qwen35 escha
+            // checkpoints). MFP4G32E8G128 keeps a private bookkeeping id 136
+            // here; runtime DType interprets wire ids per architecture.
+            136 => Some(Self::MFP4G32E8G128),
             38 => Some(Self::MQ2G256GL),
             39 => Some(Self::MQ3G256GL),
             40 => Some(Self::TQ2G128),
@@ -79,6 +82,8 @@ impl QuantType {
             132 => Some(Self::MQ3I4G128R128),
             133 => Some(Self::MQ2I4G128R256),
             134 => Some(Self::MQ2I4G128R128),
+            42 => Some(Self::ESCHA2T16),
+            43 => Some(Self::ESCHA3T16),
             _ => None,
         }
     }
@@ -169,7 +174,10 @@ pub(crate) enum QuantType {
     // Drop-in cold tier for MQ3G256Lloyd (tag 3 → tag 5).
     MFP2G32E8 = 37, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1), 9 B/blk, 2.25 bpw.
     // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).
-    MFP4G32E8G128 = 42, // mfp4-E8 with a 128-wide FWHT rotation group. Wire layout
+    MFP4G32E8G128 = 136, // mfp4-E8 with a 128-wide FWHT rotation group. Wire layout
+    // Renumbered from 42: wire ids 42/43 belong to ESCHA2T16/ESCHA3T16
+    // (qwen35 escha checkpoints); this crate-private id is bookkeeping only,
+    // runtime DType interprets wire ids per architecture. Wire layout
     // BYTE-FOR-BYTE MFP4G32E8 (16-B hdr + (K/32) x 17 B blocks: 1 B E4M3 scale +
     // 4 x u32 E8 codewords, QUANT_STEP 0.88). The rotation width is not in the
     // bytes, so the row stride is identical to qt=34; only the segmentation the
@@ -273,6 +281,11 @@ pub(crate) enum QuantType {
     MQ2I4G128R256 = 133,
     /// MQ2-I4 down (qt=134, DESIGN F1/F2): W2 codec, R128 FWHT (seeds 43/1043).
     MQ2I4G128R128 = 134,
+    /// Escha-W2 trellis, K=2, 16x16 tile, cbA hash codebook (2.00 bpw).
+    /// Codes are stored verbatim from the source safetensors.
+    ESCHA2T16 = 42,
+    /// Escha-W2 trellis, K=3, 16x16 tile, cbA hash codebook (3.00 bpw).
+    ESCHA3T16 = 43,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -961,5 +974,16 @@ mod maple_dtype_tests {
                 .count();
             assert_eq!(hits, 1, "{qt:?} (id {id}) must resolve from exactly one id");
         }
+    }
+
+    /// from_u8 and the enum discriminants must agree — the doc comment on
+    /// from_u8 makes this a contract, and a drifted pair silently mislabels
+    /// every tensor written after it.
+    #[test]
+    fn escha_quant_types_round_trip() {
+        assert_eq!(QuantType::from_u8(42), Some(QuantType::ESCHA2T16));
+        assert_eq!(QuantType::from_u8(43), Some(QuantType::ESCHA3T16));
+        assert_eq!(QuantType::ESCHA2T16 as u8, 42);
+        assert_eq!(QuantType::ESCHA3T16 as u8, 43);
     }
 }

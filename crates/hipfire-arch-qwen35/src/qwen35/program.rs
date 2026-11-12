@@ -35,7 +35,7 @@ use hipfire_dispatch::pipeline::gated_mlp::{
 };
 use hipfire_dispatch::pipeline::hybrid::{
     AttentionKv, AttentionRow, AttentionTap, DeltaNetMixerOp, GatedAttentionOp, GdnState,
-    HybridDims, MixerOutput, MropeRope,
+    HybridDims, MixerOutput, MropeRope, PagedAttentionKv,
 };
 use hipfire_dispatch::pipeline::Step;
 use hipfire_runtime::llama::WeightTensor;
@@ -83,6 +83,7 @@ pub(crate) fn attention_kv<'a>(
     kv: &'a llama::KvCache,
     s: &Qwen35Scratch,
     layer_idx: usize,
+    paged: Option<PagedAttentionKv<'a>>,
 ) -> AttentionKv<'a> {
     AttentionKv {
         tier: KvTierInputs {
@@ -95,6 +96,7 @@ pub(crate) fn attention_kv<'a>(
         givens_cos: kv.givens_cos.as_ref(),
         givens_sin: kv.givens_sin.as_ref(),
         compact_offset: kv.compact_offset,
+        paged,
     }
 }
 
@@ -121,6 +123,9 @@ pub(crate) struct DecodeBinding<'a> {
     pub position: usize,
     /// Vision-language step: (t, h, w) RoPE sections read from `s.pos_buf3`.
     pub mrope_section: Option<[usize; 3]>,
+    /// Paged KVMem decode: `kv_cache` is then a view of the slot arenas and
+    /// `paged` carries this row's block-table address. `None` = contiguous.
+    pub paged: Option<PagedAttentionKv<'a>>,
 }
 
 impl<'a> DecodeBinding<'a> {
@@ -233,7 +238,7 @@ impl<'a> DecodeBinding<'a> {
                     q_norm,
                     k_norm,
                     wo: wo.dispatch_ref(),
-                    kv: attention_kv(self.kv_cache, s, layer_idx),
+                    kv: attention_kv(self.kv_cache, s, layer_idx, self.paged),
                     row: attention_row(s, self.position),
                     plain: &s.tmp,
                     x_rot: &s.x_rot,
