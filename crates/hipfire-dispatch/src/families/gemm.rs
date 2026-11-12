@@ -718,7 +718,11 @@ impl GemmFamily {
                 hip!(gpu.gemm_mq6g256v2_residual_wmma(w.buf, x, y, m, k, batch_size))
             }
             K::GemmMq3G256V2Residual => {
-                if mq3v25_a8_route(&gpu.flags, gpu.mq3v2_symmetric, batch_size) {
+                if gpu.q8x_verify_active(k, batch_size) {
+                    // Exact-gfx1100 int8 small-batch verify GEMV (gemv_q8x.rs).
+                    // lm_head keeps the exact WMMA path (GemmMq3G256V2BatchedLmhead).
+                    hip!(gpu.gemm_mq3g256v2_q8x(&[(w.buf, y, m)], x, k, batch_size, true))
+                } else if mq3v25_a8_route(&gpu.flags, gpu.mq3v2_symmetric, batch_size) {
                     hip!(gpu.gemm_mq3v25_residual_iu8(w.buf, x, y, m, k, batch_size, true))
                 } else if mq3v25_route(&gpu.flags, gpu.mq3v2_symmetric, batch_size, m) {
                     hip!(gpu.gemm_mq3v25_residual_iu4(w.buf, x, y, m, k, batch_size, true))

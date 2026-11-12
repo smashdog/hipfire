@@ -524,6 +524,77 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMV_MQ4G256V2_Q8X_V3_B5_RES_SRC,
             ["mq4v2_q8x_v3_b5_res", "mq4v2_q8x_v3_b5_res_multi"]
         );
+        // MQ3G256V2 (qt49, 3-bit) q8x verify twins; reuse mq4v2_q8x_quant above.
+        add!(
+            "mq3v2_q8x_v4_b2",
+            kernels::GEMV_MQ3G256V2_Q8X_V4_B2_SRC,
+            ["mq3v2_q8x_v4_b2", "mq3v2_q8x_v4_b2_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v4_b2_res",
+            kernels::GEMV_MQ3G256V2_Q8X_V4_B2_RES_SRC,
+            ["mq3v2_q8x_v4_b2_res", "mq3v2_q8x_v4_b2_res_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v4_b3",
+            kernels::GEMV_MQ3G256V2_Q8X_V4_B3_SRC,
+            ["mq3v2_q8x_v4_b3", "mq3v2_q8x_v4_b3_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v4_b3_res",
+            kernels::GEMV_MQ3G256V2_Q8X_V4_B3_RES_SRC,
+            ["mq3v2_q8x_v4_b3_res", "mq3v2_q8x_v4_b3_res_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v4_b4",
+            kernels::GEMV_MQ3G256V2_Q8X_V4_B4_SRC,
+            ["mq3v2_q8x_v4_b4", "mq3v2_q8x_v4_b4_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v4_b4_res",
+            kernels::GEMV_MQ3G256V2_Q8X_V4_B4_RES_SRC,
+            ["mq3v2_q8x_v4_b4_res", "mq3v2_q8x_v4_b4_res_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b2",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B2_SRC,
+            ["mq3v2_q8x_v3_b2", "mq3v2_q8x_v3_b2_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b2_res",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B2_RES_SRC,
+            ["mq3v2_q8x_v3_b2_res", "mq3v2_q8x_v3_b2_res_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b3",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B3_SRC,
+            ["mq3v2_q8x_v3_b3", "mq3v2_q8x_v3_b3_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b3_res",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B3_RES_SRC,
+            ["mq3v2_q8x_v3_b3_res", "mq3v2_q8x_v3_b3_res_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b4",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B4_SRC,
+            ["mq3v2_q8x_v3_b4", "mq3v2_q8x_v3_b4_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b4_res",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B4_RES_SRC,
+            ["mq3v2_q8x_v3_b4_res", "mq3v2_q8x_v3_b4_res_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b5",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B5_SRC,
+            ["mq3v2_q8x_v3_b5", "mq3v2_q8x_v3_b5_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b5_res",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B5_RES_SRC,
+            ["mq3v2_q8x_v3_b5_res", "mq3v2_q8x_v3_b5_res_multi"]
+        );
     }
     if matches!(arch, "gfx906" | "gfx942") {
         add!(

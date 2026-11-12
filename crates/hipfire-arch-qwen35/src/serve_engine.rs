@@ -1014,30 +1014,27 @@ impl Rig {
         .map_err(|e| format!("kv mode {kv_mode:?}: {e}"))?;
         let per_pos_bytes = kv_plan.k_bytes_per_pos;
         let per_pos_v_bytes = kv_plan.v_bytes_per_pos;
-        // Escha trellis checkpoints (wire qt 42/43 = Escha2T16/Escha3T16) have
-        // no batched DENSE-prefill kernel: the multi-slot slots ladder admits
-        // only plain/MQ/low-bit GEMM dtypes (`slots_proj_admissible`), and the
-        // batched escha GEMM (`EschaProj::forward` slots>1) is wired for MoE
-        // experts, not a dense linear. The verified escha path is the
-        // single-position lowered ladder (`forward_scratch_layers_paged_lowered`).
-        // Forcing prefill_chunk=1 makes every prefill step n==1, which routes
-        // through `use_reference_decode` in `forward_batch_slots_opts` — a
-        // branch that sits BEFORE the slots admission gate — into that same
-        // lowered path. This is exactly how the reference engine prefills escha
-        // (its dense generate falls back to per-token decode_step when the
-        // batched prefill is not admitted). Decode speed is untouched; only
-        // prefill is serialized, matching the reference's own escha prefill, so
-        // a stock-vs-KVMem decode A/B stays fair. Detected from the tensor
-        // manifest (no data read); qt 42/43 are exclusively escha wire ids.
-        let escha_model = hfq
-            .tensors()
-            .iter()
-            .any(|t| t.quant_type == 42 || t.quant_type == 43);
-        let prefill_chunk = if escha_model {
-            1
-        } else {
-            cfg.prefill_chunk.max(1).min(cfg.cap_tokens.max(1))
-        };
+        // Escha trellis checkpoints (wire qt 42/43) now batch prefill like every
+        // other model: the slot bodies run a grouped-GEMM escha arm (one weight
+        // read per (layer,batch)) and `qwen35_layer_batch_admissible` admits
+        // them, so the old `prefill_chunk=1` serialization workaround is gone.
+        let prefill_chunk = cfg.prefill_chunk.max(1).min(cfg.cap_tokens.max(1));
+        // Reference-test override: force the engine's prefill quantum independent
+        // of the wire/CLI scratch budget. The CLI clamps `max_batch_tokens` to
+        // `prefill_chunk * n_slots`, and FairQueue requires
+        // `max_batch_tokens >= n_slots + prefill_min_tokens`, so a wire
+        // `prefill_chunk=1` (scratch 1) is an invalid serve config for ANY model.
+        // Setting HIPFIRE_PREFILL_CHUNK_OVERRIDE=1 while leaving the CLI chunk at
+        // its default keeps the wire budget valid (FairQueue passes) yet drives
+        // every prefill step at n==1 -> use_reference_decode -> the lowered
+        // per-token ladder. This is the apples-to-apples serial reference for the
+        // batched-vs-serial recall A/B (same paged KV, attention, and decode; only
+        // the prefill quantum differs). Unset => no change (batched prefill).
+        let prefill_chunk = hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_OVERRIDE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.max(1).min(cfg.cap_tokens.max(1)))
+            .unwrap_or(prefill_chunk);
         // DFlash2 draft config pre-parse: the runtime block size B sets
         // `spec_rows` (verify rows per spec slot), which `max_batch` and the
         // verify tape are sized by — both allocated before the GPU-side

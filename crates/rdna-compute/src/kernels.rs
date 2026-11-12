@@ -2865,6 +2865,72 @@ pub const GEMV_MQ4G256V2_Q8X_V3_B5_SRC: &str =
 pub const GEMV_MQ4G256V2_Q8X_V3_B5_RES_SRC: &str =
     gemv_mq4g256v2_q8x_v3_source!("5", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b5_res");
 
+// MQ3G256V2 (qt49, 3-bit) q8x verify twins. Same activation quantizer
+// (GEMV_MQ4G256V2_Q8X_QUANT_SRC, format-agnostic) and LDS staging; the weight
+// payload is 104 B/group, 12 B/lane, codes 0..7 (gemv_mq3g256v2_q8x.hip).
+macro_rules! gemv_mq3g256v2_q8x_v4_source {
+    ($b:literal, $res:literal, $name:literal) => {
+        concat!(
+            "#define Q8X_GEMV4 1\n#define Q8X3_R 8\n#define Q8X3_P 3\n#define Q8X3_NT 1\n",
+            "#define Q8X3_LDSKB 64\n#define Q8X4_XP 0\n#define Q8X_BMAX ",
+            $b,
+            "\n",
+            $res,
+            "#define Q8X_KERNEL ",
+            $name,
+            "\n#define Q8X_MULTI_KERNEL ",
+            $name,
+            "_multi\n",
+            include_str!("../../../kernels/src/gemv_mq3g256v2_q8x.hip")
+        )
+    };
+}
+macro_rules! gemv_mq3g256v2_q8x_v3_source {
+    ($b:literal, $res:literal, $name:literal) => {
+        concat!(
+            "#define Q8X_GEMV3 1\n#define Q8X3_R 8\n#define Q8X3_W 2\n#define Q8X3_P 2\n",
+            "#define Q8X3_NT 1\n#define Q8X3_LDSKB 32\n#define Q8X_BMAX ",
+            $b,
+            "\n",
+            $res,
+            "#define Q8X_KERNEL ",
+            $name,
+            "\n#define Q8X_MULTI_KERNEL ",
+            $name,
+            "_multi\n",
+            include_str!("../../../kernels/src/gemv_mq3g256v2_q8x.hip")
+        )
+    };
+}
+pub const GEMV_MQ3G256V2_Q8X_V4_B2_SRC: &str =
+    gemv_mq3g256v2_q8x_v4_source!("2", "", "mq3v2_q8x_v4_b2");
+pub const GEMV_MQ3G256V2_Q8X_V4_B2_RES_SRC: &str =
+    gemv_mq3g256v2_q8x_v4_source!("2", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v4_b2_res");
+pub const GEMV_MQ3G256V2_Q8X_V4_B3_SRC: &str =
+    gemv_mq3g256v2_q8x_v4_source!("3", "", "mq3v2_q8x_v4_b3");
+pub const GEMV_MQ3G256V2_Q8X_V4_B3_RES_SRC: &str =
+    gemv_mq3g256v2_q8x_v4_source!("3", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v4_b3_res");
+pub const GEMV_MQ3G256V2_Q8X_V4_B4_SRC: &str =
+    gemv_mq3g256v2_q8x_v4_source!("4", "", "mq3v2_q8x_v4_b4");
+pub const GEMV_MQ3G256V2_Q8X_V4_B4_RES_SRC: &str =
+    gemv_mq3g256v2_q8x_v4_source!("4", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v4_b4_res");
+pub const GEMV_MQ3G256V2_Q8X_V3_B2_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("2", "", "mq3v2_q8x_v3_b2");
+pub const GEMV_MQ3G256V2_Q8X_V3_B2_RES_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("2", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v3_b2_res");
+pub const GEMV_MQ3G256V2_Q8X_V3_B3_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("3", "", "mq3v2_q8x_v3_b3");
+pub const GEMV_MQ3G256V2_Q8X_V3_B3_RES_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("3", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v3_b3_res");
+pub const GEMV_MQ3G256V2_Q8X_V3_B4_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("4", "", "mq3v2_q8x_v3_b4");
+pub const GEMV_MQ3G256V2_Q8X_V3_B4_RES_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("4", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v3_b4_res");
+pub const GEMV_MQ3G256V2_Q8X_V3_B5_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("5", "", "mq3v2_q8x_v3_b5");
+pub const GEMV_MQ3G256V2_Q8X_V3_B5_RES_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("5", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v3_b5_res");
+
 pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
