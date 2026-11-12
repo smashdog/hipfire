@@ -213,8 +213,40 @@ impl Scheduler {
         prefill_min_tokens: usize,
         eligible: &[bool],
     ) -> SlotBatch {
+        self.next_batch_eligible_hold(
+            work,
+            remaining_rows,
+            prefill_min_tokens,
+            eligible,
+            &[],
+        )
+    }
+
+    /// [`Self::next_batch_eligible`] with a per-slot `hold_tail` mask.
+    ///
+    /// `hold_tail[i]` makes a prefilling slot leave ONE prompt token for the
+    /// next step instead of draining its prompt this round. KVMem uses this
+    /// so the prompt-completing step is a single row whose preparation sees
+    /// the Q tap of the immediately preceding token — the actual question —
+    /// rather than the tap of the previous chunk's last row (up to a page
+    /// earlier). Non-KVMem callers pass an empty mask and are bit-identical
+    /// to the upstream scheduler.
+    pub fn next_batch_eligible_hold(
+        &mut self,
+        work: &mut [PendingWork],
+        remaining_rows: usize,
+        prefill_min_tokens: usize,
+        eligible: &[bool],
+        hold_tail: &[bool],
+    ) -> SlotBatch {
         let n = work.len();
-        let plan = self.allocate_rows(work, remaining_rows, prefill_min_tokens, eligible);
+        let plan = self.allocate_rows_hold(
+            work,
+            remaining_rows,
+            prefill_min_tokens,
+            eligible,
+            hold_tail,
+        );
         if let Some(c) = plan.next_prefill_cursor {
             self.prefill_cursor = c;
         }
@@ -292,6 +324,23 @@ impl Scheduler {
         prefill_min_tokens: usize,
         eligible: &[bool],
     ) -> RowAllocation {
+        self.allocate_rows_hold(
+            work,
+            remaining_rows,
+            prefill_min_tokens,
+            eligible,
+            &[],
+        )
+    }
+
+    fn allocate_rows_hold(
+        &self,
+        work: &[PendingWork],
+        remaining_rows: usize,
+        prefill_min_tokens: usize,
+        eligible: &[bool],
+        hold_tail: &[bool],
+    ) -> RowAllocation {
         let n = work.len();
         // ---- Phase 1: decode (1 row per runnable decode slot, slot order) ----
         // Admit decode lanes in slot order until the budget is exhausted; a
@@ -337,21 +386,35 @@ impl Scheduler {
                 // `page_align_take`). Both the rotated head allocation and
                 // the leftover distribution draw from this quota, so a
                 // trimmed head is not refilled within the same round.
-                let quota_of = |w: &PendingWork| -> usize {
-                    let left = w.remaining_prompt.len();
+                // The prompt a slot may consume this round. A held slot
+                // leaves its final token for the next step (see
+                // `next_batch_eligible_hold`); everything else is the real
+                // remainder. Alignment is computed against this held
+                // remainder, so the held tail is genuinely the only token
+                // left after the round.
+                let held_left = |i: usize| -> usize {
+                    let left = work[i].remaining_prompt.len();
+                    if hold_tail.get(i).copied().unwrap_or(false) && left > 1 {
+                        left - 1
+                    } else {
+                        left
+                    }
+                };
+                let quota_of = |i: usize| -> usize {
+                    let left = held_left(i);
                     if left == 0 {
                         return 0;
                     }
                     page_align_take(
                         self.chunk_size.min(left).max(prefill_min_tokens.min(left)),
-                        w.next_pos,
+                        work[i].next_pos,
                         left,
                         prefill_min_tokens,
                     )
                 };
                 let head = prefill_slots[start];
-                let head_remaining = work[head].remaining_prompt.len();
-                let head_take = quota_of(&work[head]).min(avail);
+                let head_remaining = held_left(head);
+                let head_take = quota_of(head).min(avail);
                 if head_take > 0 && head_remaining > 0 {
                     alloc[head] += head_take;
                     avail -= head_take;
@@ -368,8 +431,8 @@ impl Scheduler {
                         }
                         let i = prefill_slots[(start + k) % n_pr];
                         let already = alloc[i];
-                        let prompt_left = work[i].remaining_prompt.len().saturating_sub(already);
-                        let cap = quota_of(&work[i]).saturating_sub(already);
+                        let prompt_left = held_left(i).saturating_sub(already);
+                        let cap = quota_of(i).saturating_sub(already);
                         let take = cap.min(prompt_left).min(avail);
                         if take == 0 {
                             continue;

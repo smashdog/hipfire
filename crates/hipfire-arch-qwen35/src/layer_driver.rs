@@ -6,7 +6,10 @@
 //! `WeightBackend`. `load_weights` (HFQ), `load_weights_paroquant` (PaRo), and
 //! `load_layer_into` (multi-GPU HFQ) all funnel through `load_layer`.
 
-use crate::qwen35::weights::{free_moe_ffn_with, free_weight_with};
+use crate::qwen35::escha::EschaProj;
+use crate::qwen35::weights::{
+    free_moe_ffn_with, free_weight_with, DeltaNetBiases, DeltaNetEscha, FullAttnBiases, FullAttnEscha,
+};
 use crate::qwen35::{
     DeltaNetLayerWeights, DeltaNetMoeLayerWeights, FullAttnLayerWeights, FullAttnMoeLayerWeights,
     LayerType, LayerWeights, MoeFfnWeights, Qwen35Config,
@@ -41,6 +44,31 @@ struct PendingLayer {
     w_up: Option<WeightTensor>,
     w_down: Option<WeightTensor>,
     ffn: Option<MoeFfnWeights>,
+    // Escha dense sidecars. A layer is DeltaNet OR FullAttn, so the projection
+    // slots are shared by name where the projection is common (o/gate/up/down);
+    // qkv/z are DeltaNet-only and q/k/v FullAttn-only. Staged individually so a
+    // mid-build failure drains exactly the owners that exist, like the weights.
+    e_qkv: Option<EschaProj>,
+    e_z: Option<EschaProj>,
+    e_q: Option<EschaProj>,
+    e_k: Option<EschaProj>,
+    e_v: Option<EschaProj>,
+    e_o: Option<EschaProj>,
+    e_gate: Option<EschaProj>,
+    e_up: Option<EschaProj>,
+    e_down: Option<EschaProj>,
+    e_ids: Option<GpuTensor>,
+    e_iota: Option<GpuTensor>,
+    // Dense output biases (escha exports only); same shared-name scheme.
+    b_qkv: Option<GpuTensor>,
+    b_z: Option<GpuTensor>,
+    b_q: Option<GpuTensor>,
+    b_k: Option<GpuTensor>,
+    b_v: Option<GpuTensor>,
+    b_o: Option<GpuTensor>,
+    b_gate: Option<GpuTensor>,
+    b_up: Option<GpuTensor>,
+    b_down: Option<GpuTensor>,
 }
 
 impl PendingLayer {
@@ -83,12 +111,103 @@ impl PendingLayer {
         {
             b.free_tensor(tensor);
         }
+        for proj in [
+            self.e_qkv.take(),
+            self.e_z.take(),
+            self.e_q.take(),
+            self.e_k.take(),
+            self.e_v.take(),
+            self.e_o.take(),
+            self.e_gate.take(),
+            self.e_up.take(),
+            self.e_down.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            b.free_tensor(proj.rin);
+            b.free_tensor(proj.rout);
+            b.free_tensor(proj.ptr0);
+        }
+        for tensor in [
+            self.e_ids.take(),
+            self.e_iota.take(),
+            self.b_qkv.take(),
+            self.b_z.take(),
+            self.b_q.take(),
+            self.b_k.take(),
+            self.b_v.take(),
+            self.b_o.take(),
+            self.b_gate.take(),
+            self.b_up.take(),
+            self.b_down.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            b.free_tensor(tensor);
+        }
     }
 }
 
 /// Load one layer's weights. `load_moe` builds the MoE FFN block for MoE layers
 /// (format-specific: HFQ `load_moe_ffn` vs PaRo `paro_load_moe_ffn`), supplied by
 /// the caller so MoE layout stays arch-owned.
+/// Largest token batch an escha layer's `ids` table serves. Decode reads a
+/// 1-element prefix; batched prefill reads `n`. 4096 covers every prefill
+/// chunk hipfire issues and costs 16 KB per layer.
+const ESCHA_MAX_SLOTS: usize = 4096;
+
+/// Build an `EschaProj` from the backend's sidecars, or `None` when the
+/// weight is not a trellis code.
+fn eproj<B: WeightBackend>(
+    b: &mut B,
+    rel: &str,
+    w: &hipfire_runtime::llama::WeightTensor,
+) -> hip_bridge::HipResult<Option<crate::qwen35::escha::EschaProj>> {
+    Ok(b.escha_sidecars(rel, w)?
+        .map(|(rin, rout, ptr0)| crate::qwen35::escha::EschaProj { rin, rout, ptr0 }))
+}
+
+/// Every coded projection in a layer is escha or none is — the export does not
+/// mix. So probe one and require the rest, exactly as the biases do: a
+/// half-escha layer is a corrupt checkpoint, and falling back per projection
+/// would silently run some through the fused MQ paths on trellis bytes.
+fn need_eproj<B: WeightBackend>(
+    b: &mut B,
+    rel: &str,
+    w: &hipfire_runtime::llama::WeightTensor,
+) -> hip_bridge::HipResult<crate::qwen35::escha::EschaProj> {
+    eproj(b, rel, w)?.ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!("{rel}: layer has escha projections but this one is not coded"),
+        )
+    })
+}
+
+/// A bias that MUST be there.
+///
+/// Escha ships all of a layer's biases together or none, so once the first
+/// probe finds one the rest are mandatory. A half-biased layer is a corrupt
+/// checkpoint, and silently substituting zeros would degrade output without
+/// failing — the same trap as the dropped MTP head.
+fn need_bias<B: WeightBackend>(
+    b: &mut B,
+    rel: &str,
+    n: usize,
+) -> hip_bridge::HipResult<rdna_compute::GpuTensor> {
+    b.bias_opt(rel, n)?.ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{rel}: layer has some escha biases but not this one — a partially biased \
+                 layer is a corrupt checkpoint, not a model to run with zeros"
+            ),
+        )
+    })
+}
+
 pub(crate) fn load_layer<B: WeightBackend>(
     b: &mut B,
     config: &Qwen35Config,
@@ -122,6 +241,27 @@ pub(crate) fn load_layer<B: WeightBackend>(
                 "load_layer: missing staged owner ",
                 stringify!($slot)
             ))
+        };
+    }
+    // Stage an escha projection set or a bias set. Probe the first member; if
+    // it is absent the whole set is absent (a non-escha layer). If present,
+    // every other member is mandatory — the export never mixes coded and plain
+    // projections, nor partial biases — so each is staged with `stage!` and a
+    // failure drains the owners staged so far. The probe's own owner is parked
+    // in `pending` before the requires run so it is reclaimed on failure too.
+    macro_rules! stage_sidecars {
+        ($probe_slot:ident, $probe:expr, $($slot:ident => $load:expr),+ $(,)?) => {
+            match $probe {
+                Ok(None) => {}
+                Ok(Some(owner)) => {
+                    pending.$probe_slot = Some(owner);
+                    $( stage!($slot, $load); )+
+                }
+                Err(err) => {
+                    pending.cleanup(b);
+                    return Err(err);
+                }
+            }
         };
     }
 
@@ -179,6 +319,29 @@ pub(crate) fn load_layer<B: WeightBackend>(
                 w_down,
                 b.proj("mlp.down_proj", config.dim, config.hidden_dim)
             );
+            // Escha dense sidecars are keyed off each weight's dtype and device
+            // pointer, so they are built from the staged tensors. in_proj_a/b
+            // are on escha's ignore list and stay plain (no sidecar, no bias).
+            stage_sidecars!(
+                e_qkv,
+                eproj(b, "linear_attn.in_proj_qkv", pending.wqkv.as_ref().unwrap()),
+                e_z => need_eproj(b, "linear_attn.in_proj_z", pending.wz.as_ref().unwrap()),
+                e_o => need_eproj(b, "linear_attn.out_proj", pending.wo.as_ref().unwrap()),
+                e_gate => need_eproj(b, "mlp.gate_proj", pending.w_gate.as_ref().unwrap()),
+                e_up => need_eproj(b, "mlp.up_proj", pending.w_up.as_ref().unwrap()),
+                e_down => need_eproj(b, "mlp.down_proj", pending.w_down.as_ref().unwrap()),
+                e_ids => b.zeros_i32(ESCHA_MAX_SLOTS),
+                e_iota => b.iota_i32(ESCHA_MAX_SLOTS),
+            );
+            stage_sidecars!(
+                b_qkv,
+                b.bias_opt("linear_attn.in_proj_qkv.bias", qkv_dim),
+                b_z => need_bias(b, "linear_attn.in_proj_z.bias", d_inner),
+                b_o => need_bias(b, "linear_attn.out_proj.bias", config.dim),
+                b_gate => need_bias(b, "mlp.gate_proj.bias", config.hidden_dim),
+                b_up => need_bias(b, "mlp.up_proj.bias", config.hidden_dim),
+                b_down => need_bias(b, "mlp.down_proj.bias", config.dim),
+            );
             LayerWeights::DeltaNet(DeltaNetLayerWeights {
                 attn_norm: take!(attn_norm),
                 wqkv: take!(wqkv),
@@ -194,6 +357,24 @@ pub(crate) fn load_layer<B: WeightBackend>(
                 w_gate: take!(w_gate),
                 w_up: take!(w_up),
                 w_down: take!(w_down),
+                biases: pending.b_qkv.take().map(|qkv| DeltaNetBiases {
+                    qkv,
+                    z: take!(b_z),
+                    o: take!(b_o),
+                    gate: take!(b_gate),
+                    up: take!(b_up),
+                    down: take!(b_down),
+                }),
+                escha: pending.e_qkv.take().map(|qkv| DeltaNetEscha {
+                    qkv,
+                    z: take!(e_z),
+                    o: take!(e_o),
+                    gate: take!(e_gate),
+                    up: take!(e_up),
+                    down: take!(e_down),
+                    ids: take!(e_ids),
+                    iota: take!(e_iota),
+                }),
             })
         }
         (LayerType::FullAttention, false) => {
@@ -223,6 +404,28 @@ pub(crate) fn load_layer<B: WeightBackend>(
                 w_down,
                 b.proj("mlp.down_proj", config.dim, config.hidden_dim)
             );
+            stage_sidecars!(
+                e_q,
+                eproj(b, "self_attn.q_proj", pending.wq.as_ref().unwrap()),
+                e_k => need_eproj(b, "self_attn.k_proj", pending.wk.as_ref().unwrap()),
+                e_v => need_eproj(b, "self_attn.v_proj", pending.wv.as_ref().unwrap()),
+                e_o => need_eproj(b, "self_attn.o_proj", pending.wo.as_ref().unwrap()),
+                e_gate => need_eproj(b, "mlp.gate_proj", pending.w_gate.as_ref().unwrap()),
+                e_up => need_eproj(b, "mlp.up_proj", pending.w_up.as_ref().unwrap()),
+                e_down => need_eproj(b, "mlp.down_proj", pending.w_down.as_ref().unwrap()),
+                e_ids => b.zeros_i32(ESCHA_MAX_SLOTS),
+                e_iota => b.iota_i32(ESCHA_MAX_SLOTS),
+            );
+            stage_sidecars!(
+                b_q,
+                b.bias_opt("self_attn.q_proj.bias", q_out_dim),
+                b_k => need_bias(b, "self_attn.k_proj.bias", kv_dim),
+                b_v => need_bias(b, "self_attn.v_proj.bias", kv_dim),
+                b_o => need_bias(b, "self_attn.o_proj.bias", config.dim),
+                b_gate => need_bias(b, "mlp.gate_proj.bias", config.hidden_dim),
+                b_up => need_bias(b, "mlp.up_proj.bias", config.hidden_dim),
+                b_down => need_bias(b, "mlp.down_proj.bias", config.dim),
+            );
             LayerWeights::FullAttn(FullAttnLayerWeights {
                 attn_norm: take!(attn_norm),
                 wq: take!(wq),
@@ -235,6 +438,26 @@ pub(crate) fn load_layer<B: WeightBackend>(
                 w_gate: take!(w_gate),
                 w_up: take!(w_up),
                 w_down: take!(w_down),
+                biases: pending.b_q.take().map(|q| FullAttnBiases {
+                    q,
+                    k: take!(b_k),
+                    v: take!(b_v),
+                    o: take!(b_o),
+                    gate: take!(b_gate),
+                    up: take!(b_up),
+                    down: take!(b_down),
+                }),
+                escha: pending.e_q.take().map(|q| FullAttnEscha {
+                    q,
+                    k: take!(e_k),
+                    v: take!(e_v),
+                    o: take!(e_o),
+                    gate: take!(e_gate),
+                    up: take!(e_up),
+                    down: take!(e_down),
+                    ids: take!(e_ids),
+                    iota: take!(e_iota),
+                }),
             })
         }
         (LayerType::LinearAttention, true) => {
@@ -448,6 +671,7 @@ mod tests {
                 expert_table,
                 expert_binding,
                 expert_iu4: None,
+                escha: None,
             })
         }
 
@@ -476,6 +700,26 @@ mod tests {
 
         fn bias(&mut self, _rel: &str, _n: usize) -> HipResult<GpuTensor> {
             Err(HipError::new(0, "test backend does not load biases"))
+        }
+
+        fn bias_opt(&mut self, _rel: &str, _n: usize) -> HipResult<Option<GpuTensor>> {
+            Ok(None)
+        }
+
+        fn escha_sidecars(
+            &mut self,
+            _rel: &str,
+            _w: &WeightTensor,
+        ) -> HipResult<Option<(GpuTensor, GpuTensor, GpuTensor)>> {
+            Ok(None)
+        }
+
+        fn zeros_i32(&mut self, _n: usize) -> HipResult<GpuTensor> {
+            Err(HipError::new(0, "test backend does not build escha ids"))
+        }
+
+        fn iota_i32(&mut self, _n: usize) -> HipResult<GpuTensor> {
+            Err(HipError::new(0, "test backend does not build escha iota"))
         }
 
         fn free_tensor(&mut self, tensor: GpuTensor) {
@@ -549,6 +793,9 @@ mod tests {
                     w_gate,
                     w_up,
                     w_down,
+                    // The fault backend never produces escha sidecars or biases
+                    // (both probes return None), so there is nothing to free.
+                    ..
                 } = layer;
                 for tensor in [attn_norm, q_norm, k_norm, ffn_norm] {
                     backend.free_tensor(tensor);

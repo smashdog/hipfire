@@ -20,6 +20,9 @@
 # Exits nonzero if any assertion fails.
 
 set -uo pipefail
+# git localizes its human-facing messages; the assertions below match the
+# English strings, so pin the harness (and every git it spawns) to the C locale.
+export LC_ALL=C
 cd "$(dirname "$0")/.."
 REAL=$PWD
 SCRIPT=$REAL/scripts/fmt-sweep-rebase.sh

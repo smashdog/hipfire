@@ -17,6 +17,7 @@ use super::prefill::MOE_GROUPED_BLOCK_M;
 use super::weights::DeltaNetState;
 use super::weights::Qwen35Weights;
 use super::weights::StateQuant;
+use crate::kvmem_taps::KvMemTaps;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
 use hipfire_dispatch::pipeline::batched::run_plain_gemm_key;
@@ -71,6 +72,18 @@ pub struct PrefillBatchScratch {
     pub up_batch: GpuTensor,
     // SwiGLU output (FWHT-rotated for MQ4) feeding w_down.
     pub ffn_hidden_batch: GpuTensor,
+    /// Escha trellis scratch: the H128-rotated activations feeding one
+    /// projection's batched GEMV, `[max_batch, max(hidden_dim, dim)]`.
+    ///
+    /// Cannot share `x_rot_batch` or `ffn_hidden_batch`: each escha projection
+    /// rotates the SAME input with its OWN `rin`, and for `down_proj` the
+    /// ffn hidden state IS the input, so writing xh there would destroy it.
+    pub escha_xh_batch: GpuTensor,
+    /// Escha projection output before it is accumulated into the residual,
+    /// `[max_batch, dim]`. The fused epilogue writes straight into the
+    /// residual; the trellis GEMV has no residual variant, so out_proj and
+    /// down_proj land here first.
+    pub escha_y_batch: GpuTensor,
 
     // FWHT-rotated dn_normed [N × v_dim] feeding wo for MQ4 weights.
     // Decode path handles this via an internal mq_x_rot scratch inside
@@ -190,6 +203,13 @@ pub struct PrefillBatchScratch {
     // `new`); currently always allocated when LA layers exist, like the Q8
     // tape. s_tape_f32: [max_batch × n_v_heads × head_dim × head_dim] f32.
     pub dn_s_tape_f32: Option<GpuTensor>,
+
+    // ── KVMem host-offload statistics taps (None = disabled) ──
+    // Post-norm/pre-RoPE Q/K copies for the KVMem retrieval statistics. Only
+    // allocated when the serving engine enables KVMem (`enable_kvmem_taps`);
+    // otherwise the forward launches nothing extra and stays bit-identical.
+    // See `crate::kvmem_taps`.
+    pub kvmem_taps: Option<KvMemTaps>,
 }
 
 impl PrefillBatchScratch {
@@ -314,6 +334,10 @@ impl PrefillBatchScratch {
         let i_gate_ffn_batch = alloc!(&[max_batch * hidden_dim], DType::F32);
         let i_up_batch = alloc!(&[max_batch * hidden_dim], DType::F32);
         let i_ffn_hidden_batch = alloc!(&[fallback_rows * hidden_dim], DType::F32);
+        // Escha trellis scratch (see the struct fields): each projection rotates
+        // the same input with its own rin, so these cannot alias x_rot/ffn_hidden.
+        let i_escha_xh_batch = alloc!(&[max_batch * hidden_dim.max(dim)], DType::F32);
+        let i_escha_y_batch = alloc!(&[max_batch * dim], DType::F32);
         let i_dn_normed_rot_batch = alloc!(&[fallback_rows * v_dim], DType::F32);
         // F32 dtype = 4 bytes/element, same layout as i32. The rope /
         // attention / kv_write kernels cast the pointer to `const int*`,
@@ -559,6 +583,8 @@ impl PrefillBatchScratch {
             gate_ffn_batch: take!(i_gate_ffn_batch),
             up_batch: take!(i_up_batch),
             ffn_hidden_batch: take!(i_ffn_hidden_batch),
+            escha_xh_batch: take!(i_escha_xh_batch),
+            escha_y_batch: take!(i_escha_y_batch),
             dn_normed_rot_batch: take!(i_dn_normed_rot_batch),
             positions: take!(i_positions),
             rope_positions,
@@ -602,6 +628,7 @@ impl PrefillBatchScratch {
             dn_s_tape_q8: i_dn_s_tape_q8.map(|i| take!(i)),
             dn_s_tape_scales: i_dn_s_tape_scales.map(|i| take!(i)),
             dn_s_tape_f32: i_dn_s_tape_f32.map(|i| take!(i)),
+            kvmem_taps: None,
         })
     }
 
@@ -633,6 +660,8 @@ impl PrefillBatchScratch {
             self.gate_ffn_batch,
             self.up_batch,
             self.ffn_hidden_batch,
+            self.escha_xh_batch,
+            self.escha_y_batch,
             self.dn_normed_rot_batch,
             self.positions,
             self.pos3,
@@ -691,10 +720,47 @@ impl PrefillBatchScratch {
                 note(gpu.free_tensor(t));
             }
         }
+        if let Some(taps) = self.kvmem_taps {
+            note(gpu.free_tensor(taps.q_tap));
+            note(gpu.free_tensor(taps.k_tap));
+        }
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Allocate the KVMem statistics tap buffers for the multi-slot forward.
+    ///
+    /// `n_slots` is the owning slot pool's capacity; the buffers are sized
+    /// once and reused for every step. Enabling taps adds one small copy
+    /// kernel per FullAttention layer to each forward; nothing reads them
+    /// unless the engine's KVMem controller does, and the tap never modifies
+    /// Q/K, so an enabled-but-unread tap is still bit-identical.
+    pub fn enable_kvmem_taps(
+        &mut self,
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        n_slots: usize,
+    ) -> HipResult<()> {
+        if self.kvmem_taps.is_some() {
+            return Ok(());
+        }
+        let n_fa_layers = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == LayerType::FullAttention)
+            .count();
+        self.kvmem_taps = Some(KvMemTaps::new(
+            gpu,
+            n_fa_layers,
+            n_slots,
+            self.max_batch,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+        )?);
+        Ok(())
     }
 }
 /// Persistent fixed-slot state for independent-sequence Qwen3.5 decode.

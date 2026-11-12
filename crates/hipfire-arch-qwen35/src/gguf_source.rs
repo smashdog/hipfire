@@ -464,6 +464,30 @@ impl WeightBackend for GgufBackend<'_, '_> {
         )))
     }
 
+    fn bias_opt(&mut self, _rel: &str, _n: usize) -> HipResult<Option<GpuTensor>> {
+        // GGUF dense qwen35 exports carry no escha output biases; absence is a
+        // value here so the escha probe in `load_layer` resolves to None.
+        Ok(None)
+    }
+
+    fn escha_sidecars(
+        &mut self,
+        _rel: &str,
+        _w: &WeightTensor,
+    ) -> HipResult<Option<(GpuTensor, GpuTensor, GpuTensor)>> {
+        // GGUF weights are never trellis-coded (Escha2T16/Escha3T16).
+        Ok(None)
+    }
+
+    fn zeros_i32(&mut self, n: usize) -> HipResult<GpuTensor> {
+        self.gpu.upload_f32(&vec![f32::from_bits(0); n], &[n])
+    }
+
+    fn iota_i32(&mut self, n: usize) -> HipResult<GpuTensor> {
+        let v: Vec<f32> = (0..n).map(|i| f32::from_bits(i as u32)).collect();
+        self.gpu.upload_f32(&v, &[n])
+    }
+
     fn free_tensor(&mut self, tensor: GpuTensor) {
         let _ = self.gpu.free_tensor(tensor);
     }

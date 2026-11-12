@@ -984,6 +984,20 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Result<Qwen35Config,
     config_from_metadata_json(source.metadata_json())
 }
 
+/// Exact dense Qwen3.6-27B shape shared by its gfx1100 decode selectors.
+pub(crate) fn qwen36_27b_dense_shape(config: &Qwen35Config, n_v_heads: usize) -> bool {
+    config.dim == 5_120
+        && config.n_layers == 64
+        && config.n_heads == 24
+        && config.n_kv_heads == 4
+        && config.head_dim == 256
+        && config.linear_num_key_heads == 16
+        && config.linear_key_head_dim == 128
+        && n_v_heads == 48
+        && config.linear_value_head_dim == 128
+        && config.num_experts == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

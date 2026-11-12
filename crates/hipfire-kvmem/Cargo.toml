@@ -1,0 +1,16 @@
+[package]
+name = "hipfire-kvmem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "KVMem host-offload adapter for hipfire (C ABI over the portable kvmem library)"
+links = "kvmem_hipfire_shim"
+
+[lib]
+name = "hipfire_kvmem"
+path = "src/lib.rs"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"

@@ -8248,6 +8248,64 @@ pub const TOPK8_ROWS_MQ6G256V2_SRC: &str = concat!(
 );
 pub const REQUANT_G256_SRC: &str = include_str!("../../../kernels/src/requant_g256.hip");
 
+/// Escha-W2 one-shot tile decode: packed trellis code -> bare fp16 weights.
+/// No codebook LUT (65536 fp16 entries would be 128 KB, gfx1151 LDS is 64 KB);
+/// the codebook is computed inline per element. See the file for the G2 gate
+/// rationale (deliberately duplicates escha_ref.rs's lane maths in Rust).
+pub const ESCHA_DECODE_TILES_SRC: &str =
+    include_str!("../../../kernels/src/escha_decode_tiles.hip");
+
+/// Escha-W2 activation transforms: the 128-point Walsh-Hadamard applied to
+/// both sides of every escha matmul (`escha_h128_in`, `escha_h128_out`). Two
+/// entry points sharing one source file — see `ensure_kernel` call sites.
+pub const ESCHA_H128_SRC: &str = include_str!("../../../kernels/src/escha_h128.hip");
+
+/// Escha-W2 load-path transpose: `escha_decode_tiles` writes bare fp16
+/// IN-major `[ic, oc]` (escha's tile grid is in-major); hipfire's expert
+/// slots are OUT-major `[oc, ic]`. Two entry points — `escha_bare_to_q8_0`
+/// (production: transpose + Q8_0 re-quantise in one pass) and
+/// `escha_bare_to_f32` (the weight-exact control arm the G4 gate uses to
+/// separate wiring error from re-quantisation error).
+pub const ESCHA_BARE_TO_OUTMAJOR_SRC: &str =
+    include_str!("../../../kernels/src/escha_bare_to_outmajor.hip");
+
+/// Escha-W2 routed-expert GEMVs for the GPU-top-K (indexed) decode path, plus
+/// the device-side f16 round-trip of the combine weights. Three entry points:
+/// `escha_gemv_q8_0_moe_k8_indexed_batched`,
+/// `escha_gemv_q8_0_wide_moe_k8_indexed_batched` and
+/// `escha_round_weights_f16_rne`. The two GEMVs are per-slot-in/per-slot-out
+/// (both escha phases need that shape) verbatim transcriptions of `gemv_q8_0`
+/// / `gemv_q8_0_wide` — see the header of the .hip for why the pre-existing
+/// indexed Q8_0 MoE kernels cannot serve escha and why the accumulate order
+/// is copied rather than improved.
+pub const ESCHA_MOE_GEMV_K8_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/escha_moe_gemv_k8_indexed.hip");
+
+/// Escha-W2 routed-expert GEMVs that read the TRELLIS CODE DIRECTLY — the
+/// Phase-2 fused kernels. Six entry points: the four
+/// `escha_gemv_native_k{2,3}[_wide]_moe_k8_indexed_batched` production kernels
+/// and the two `escha_gemv_f16[_wide]_moe_k8_indexed_batched` reference arms
+/// they are gated bit-exactly against. Same lane mapping, accumulator count
+/// and reduction as [`ESCHA_MOE_GEMV_K8_INDEXED_SRC`]; the only difference is
+/// that the weight is decoded in-register from the code instead of read from
+/// an expanded Q8_0 copy. See the .hip header for why a block has to own a
+/// whole 16-wide tile column to reach the format's 0.25 B/weight floor.
+pub const ESCHA_MOE_GEMV_NATIVE_SRC: &str =
+    include_str!("../../../kernels/src/escha_moe_gemv_native.hip");
+
+/// Escha-W2 routed-expert GROUPED GEMM — the Phase-3 batched-prefill kernel.
+/// Same trellis decode as [`ESCHA_MOE_GEMV_NATIVE_SRC`] and the same lane ->
+/// contraction map, but `blockIdx.y` is an EXPERT rather than a (token,
+/// expert) slot: the expert's code is decoded once and spent across every
+/// token that routed to it, and a block owns `CTILES` adjacent tile columns so
+/// the activation is read once for all of them. See the .hip header for the
+/// traffic arithmetic and for which projections stay bit-identical to the
+/// slot-parallel kernel (the narrow ones) and which do not (the wide ones).
+pub const ESCHA_MOE_GEMM_GROUPED_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/escha_moe_gemm_grouped_wmma.hip");
+pub const ESCHA_MOE_GEMM_GROUPED_SRC: &str =
+    include_str!("../../../kernels/src/escha_moe_gemm_grouped.hip");
+
 /// Batched Q8_0 GEMM. Same per-row math as gemv_q8_0 but holds MAX_BATCH
 /// per-row accumulators in registers, broadcasting each weight load across
 /// all batch elements. Saves the (batch_size - 1)× weight re-reads of the
@@ -9382,6 +9440,20 @@ pub const ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC: &str =
 /// GQA group 6, tile 128, window 0. gfx1100 only.
 pub const ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_gqa.gfx1100.hip");
+/// Paged (KVMem) twin of [`ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC`]: the
+/// same file assembled against the paged `KvSlotDesc` header, which selects
+/// the `attention_flash_q8_0_tile_gqa_paged_gfx1100` entry (one block-table
+/// lookup per 128-key tile; a spilled page publishes the empty partial).
+/// Same partials as the legacy entry for resident pages, so the shared
+/// `attention_flash_asym_reduce_batched` consumes both unchanged.
+pub fn attention_flash_q8_0_tile_gqa_paged_source() -> String {
+    // The GQA body includes only `kv_slot_desc.h` from the kernel tree (no
+    // turbo/givens helpers), so the paged header is the whole substitution:
+    // it defines `HIPFIRE_KV_SLOT_PAGED` and thereby selects the paged entry.
+    let stripped = ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC
+        .replace("#include \"kv_slot_desc.h\"", "");
+    format!("{}\n{}", KV_SLOT_DESC_PAGED_H, stripped)
+}
 /// Load-ahead decode reduce + gate + AWQ MQ rotation
 /// (`attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100`):
 /// byte-identical to [`ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1100_SRC`]
@@ -9453,6 +9525,24 @@ pub const ATTENTION_VERIFY_GQA_GFX1201_SRC: &str =
 /// by 16-query tile count + `attention_verify_wmma_reduce_gfx1100`.
 pub const ATTENTION_VERIFY_WMMA_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/attention_verify_wmma.gfx1100.hip");
+
+/// Paged (slot-engine) variant of [`ATTENTION_VERIFY_WMMA_GFX1100_SRC`] for
+/// KVMem-spilled Q8 KV: the paged `KvSlotDesc` header (which defines
+/// `HIPFIRE_KV_SLOT_PAGED` and thereby the extra `slot_descs`/`row_slot`
+/// ABI + block-table addressing) plus the same body, with the three QT
+/// kernels renamed so they never share a function slot or JIT cache entry
+/// with the descriptor-less default module. The reduce kernel is shared
+/// verbatim — its ABI and arithmetic never touch KV — so it keeps its name
+/// and is also exported from this module.
+pub fn attention_verify_wmma_paged_source() -> String {
+    format!(
+        "#define attention_verify_wmma_q8_qt1_gfx1100 attention_verify_wmma_q8_qt1_paged_gfx1100\n\
+         #define attention_verify_wmma_q8_qt2_gfx1100 attention_verify_wmma_q8_qt2_paged_gfx1100\n\
+         #define attention_verify_wmma_q8_qt3_gfx1100 attention_verify_wmma_q8_qt3_paged_gfx1100\n\
+         {}{}",
+        KV_SLOT_DESC_PAGED_H, ATTENTION_VERIFY_WMMA_GFX1100_SRC
+    )
+}
 pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str = concat!(
     "#define VA_TURBO_COMMON_INLINED 1\n",
     include_str!("../../../kernels/src/turbo_common.h"),
@@ -9911,6 +10001,16 @@ pub const BF16_ROUND_TRIP_SRC: &str = include_str!("../../../kernels/src/bf16_ro
 /// `qwen4_bf16_round_trip`), kept out of the shipped module.
 pub const QWEN4_BF16_ROUND_TRIP_SRC: &str =
     include_str!("../../../kernels/src/qwen4_bf16_round_trip.hip");
+
+/// In-place F32 router-logits round-trip through f16 (round-to-nearest-even).
+/// Escha-only: EschaLabs' runtime selects MoE top-k from f16-rounded router
+/// logits; hipfire keeps logits F32 end-to-end everywhere else. Applied to
+/// `router_logits` before top-k ONLY when the layer's routed experts are
+/// Escha2T16/Escha3T16 (see `MoeDtypes::has_escha_experts` in
+/// hipfire-dispatch and `run_moe_decode`'s call site). See
+/// `kernels/src/router_logits_round_f16_rne.hip`.
+pub const ROUTER_LOGITS_ROUND_F16_RNE_SRC: &str =
+    include_str!("../../../kernels/src/router_logits_round_f16_rne.hip");
 
 /// Batched partial-interleaved RoPE — per-row positions read from a
 /// positions[] array. Used by the batched prefill FA path.
@@ -10615,6 +10715,11 @@ pub const DEINTERLEAVE_SRC: &str = include_str!("../../../kernels/src/deinterlea
 /// Batched deinterleave: same as DEINTERLEAVE but processes N tokens in one launch.
 pub const DEINTERLEAVE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deinterleave_batched.hip");
+
+/// KVMem statistics tap: copy the post-norm/pre-RoPE Q/K rows of one
+/// FullAttention layer before RoPE rotates them in place. Launcher lives in
+/// `kvmem_tap.rs`.
+pub const KVMEM_TAP_SRC: &str = include_str!("../../../kernels/src/kvmem_tap.hip");
 
 /// T-C Halo prefill fusion: batched deinterleave with the FullAttention Q
 /// RMSNorm folded in (gate passes through). See

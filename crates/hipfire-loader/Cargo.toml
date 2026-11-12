@@ -13,6 +13,10 @@ default = [
     "arch-deepseek4",
 ]
 arch-qwen35 = ["dep:hipfire-arch-qwen35"]
+# KVMem host offload for the Qwen3.5 multi-slot serve engine (HIPFIRE_KVMEM=1):
+# builds the kvmem host library (KVMEM_ROOT, default sibling ../kvmem) and
+# wires the residency controller into `hipfire serve`.
+kvmem = ["hipfire-arch-qwen35/kvmem"]
 arch-qwen35-vl = ["dep:hipfire-arch-qwen35-vl"]
 arch-llama = ["dep:hipfire-arch-llama"]
 arch-qwen2 = ["dep:hipfire-arch-qwen2"]

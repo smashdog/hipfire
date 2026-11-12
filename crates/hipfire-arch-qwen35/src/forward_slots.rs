@@ -110,6 +110,7 @@ use hipfire_dispatch::families::gemm::residual_gemm_key_for;
 use hipfire_dispatch::families::moe::{
     gated_moe_prefill_admissible, mq6_batched_admit_enabled_from_env,
 };
+use hipfire_dispatch::pipeline::batched_attention::{fa_pertoken_min_ctx, q8_multirow_attn_admitted};
 use hipfire_dispatch::pipeline::batched::{
     q8_prefill_wmma_enabled, run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key,
     run_plain_gemm_key, run_residual_gemm_key,
@@ -122,7 +123,7 @@ use hipfire_dispatch::types::KernelKey;
 use hipfire_runtime::kv_mode::KvMode;
 use hipfire_runtime::llama::{
     fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_batched_for,
-    rotate_x_mq_batched_for, EmbeddingFormat, WeightTensor,
+    rotate_x_mq_batched_for, EmbeddingFormat, KvCache, VMode, WeightTensor,
 };
 use rdna_compute::kv_slots::{build_tiles, KvSlotDesc};
 use rdna_compute::slot_pool::{SlotId, SlotPool};
@@ -372,6 +373,22 @@ pub(crate) enum LayerKvAddr<'a> {
         desc_staging: &'a SlotDescStaging,
         single_slot: Option<(u64, usize)>,
         n_tiles: Option<usize>,
+        /// `Some(logical_ctx)` when this step is a paged spec-verify step
+        /// (KVMem pool, single active slot, rows in the reference's multirow
+        /// envelope past the per-token crossover): the attend step then runs
+        /// the reference's own split-K WMMA verifier, descriptor-driven.
+        /// `None` keeps the tiles/scalar ladder below.
+        paged_verify: Option<usize>,
+        /// Paged single-row decode admission (KVMem): `Some(logical_ctx)` when
+        /// exactly one slot contributes exactly one row and the tier is Q8.
+        /// Routes the attend to the paged twin of the reference's GQA-shared
+        /// decode tile (`attention_flash_q8_0_tile_gqa_gfx1100`), whose one
+        /// workgroup per (kv head, tile) reads each K/V tile once. The generic
+        /// paged tile ladder instead launches one workgroup per (q head, tile)
+        /// — six K/V reads per kv head — which measured 46.4 ms/step against
+        /// the reference's 26.7 ms at 56k on the 7900 XT. `None` keeps the
+        /// ladder.
+        paged_decode: Option<usize>,
     },
     Vmm(vmm::VmmLayerKv<'a>),
 }
@@ -396,6 +413,8 @@ fn layer_kv_write_attend(
             desc_staging,
             single_slot,
             n_tiles,
+            paged_verify,
+            paged_decode,
         } => {
             // Batched KV write — slot-aware, ONE launch per arena across every
             // slot, on the engine's resolved KV tier (`kv.mode`). Both arenas
@@ -449,6 +468,8 @@ fn layer_kv_write_attend(
                         nt,
                     )
                 }),
+                *paged_verify,
+                *paged_decode,
             )
         }
         LayerKvAddr::Vmm(layer) => vmm::vmm_kv_write_attend(gpu, config, layer, pbs, n),
@@ -475,8 +496,24 @@ fn slots_proj_admissible(dt: DType, arch: &str) -> bool {
             | DType::MQ3G256V2
             | DType::MQ3G256Lloyd
             | DType::MQ2G256V2
+            // PrismML Bonsai ternary/binary: flat (unrotated) G128 containers.
+            // They never take a fused launch (no FusedQkvza/Qkv/GateUp key
+            // exists for them) — plan_proj_group_dtypes forces them onto the
+            // per-projection plain-GEMM Mixed path, and slots_residual_proj
+            // accumulates wo/w_down with plain GEMM + add (no residual kernel).
+            | DType::TQ2G128
+            | DType::BQ1G128
     );
     member && is_batchable_la(dt, arch)
+}
+
+/// Flat lowbit Bonsai containers (ternary TQ2G128 / binary BQ1G128). Unrotated
+/// like Q8_0, but with their own tiled prefill GEMM keys and NO residual GEMM
+/// kernel — the residual role accumulates via plain GEMM + `add_inplace_f32`,
+/// exactly the Q8 non-WMMA fork. Kept separate from `slots_weight_rotated`
+/// (they read the natural-basis normed activation, never the FWHT-rotated one).
+fn slots_is_lowbit(dt: DType) -> bool {
+    matches!(dt, DType::TQ2G128 | DType::BQ1G128)
 }
 
 /// Dtypes whose stored weights are offline-FWHT-rotated over G256 groups:
@@ -522,6 +559,10 @@ fn lm_head_slots_admissible(dt: DType) -> bool {
             | DType::MQ2G256V2
             | DType::HFQ3G256
             | DType::F16
+            // Bonsai flat lowbit head: Step::Gemv + dispatch_ref resolves
+            // GemvTQ2G128 / GemvBQ1G128 (natural basis, no rotation).
+            | DType::TQ2G128
+            | DType::BQ1G128
     )
 }
 
@@ -555,6 +596,11 @@ fn slots_plain_gemm_key(dt: DType) -> Option<KernelKey> {
         DType::MQ5G256V2 => KernelKey::GemmMq5G256V2,
         DType::MQ3G256V2 => KernelKey::GemmMq3G256V2,
         DType::MQ2G256V2 => KernelKey::GemmMq2G256V2,
+        // Flat lowbit Bonsai: the tiled prefill GEMMs (same keys
+        // `plain_gemm_key_for` resolves). Explicit run_key bypasses the
+        // BatchGe(32) auto-resolve shape gate, so decode row counts work too.
+        DType::TQ2G128 => KernelKey::GemmTQ2G128Prefill,
+        DType::BQ1G128 => KernelKey::GemmBQ1G128Prefill,
         _ => return None,
     })
 }
@@ -584,6 +630,7 @@ fn slots_residual_gemm_key(dt: DType) -> Option<KernelKey> {
 fn slots_check_residual_weight(w: &WeightTensor, name: &str, arch: &str) -> HipResult<()> {
     let dt = w.gpu_dtype;
     if dt == DType::Q8_0
+        || slots_is_lowbit(dt)
         || (slots_proj_admissible(dt, arch)
             && (slots_weight_rotated(dt) || slots_residual_gemm_key(dt).is_some()))
     {
@@ -616,7 +663,13 @@ fn plan_proj_group_dtypes(members: &[(DType, bool)], arch: &str) -> Result<Group
         }
     }
     let d0 = members[0].0;
-    if members.iter().all(|(dt, _)| *dt == d0) {
+    // Flat lowbit (Bonsai TQ2/BQ1) has NO fused qkvza/qkv/gate_up kernel on any
+    // arch, so a uniform lowbit group must NOT take the Uniform fused launch
+    // (fused_*_key_for would fall through to HFQ4 and mis-read the G128 blocks).
+    // Force it onto the per-projection plain-GEMM Mixed path; the mixed logic
+    // below then yields Mixed{needs_rot:false, needs_norm:true} (every member
+    // is flat and has a plain key). Mirrors plan_q8_fused_or_plain for Q8.
+    if members.iter().all(|(dt, _)| *dt == d0) && !slots_is_lowbit(d0) {
         return Ok(GroupPlan::Uniform(d0));
     }
     // AWQ in a mixed group: a flat member's sidecar has no fused kernel to
@@ -883,6 +936,27 @@ fn slots_residual_proj(
     let dt = w.gpu_dtype;
     if dt == DType::Q8_0 {
         return q8_residual_proj(gpu, w, x, y, q8_scratch, n, q8_wmma_arch);
+    }
+    if slots_is_lowbit(dt) {
+        // No residual GEMM kernel exists for the flat lowbit containers.
+        // Mirror the Q8 non-WMMA fork: plain GEMM into the caller's dead
+        // scratch, then an explicit f32 add into the residual stream. `x` is
+        // the natural-basis (unrotated) activation — lowbit weights are not
+        // FWHT-rotated, so it must NOT read rot_scratch.
+        let s = q8_scratch.sub_offset(0, n * w.m);
+        run_plain_gemm_key(
+            gpu,
+            slots_plain_gemm_key(dt).expect("lowbit residual has a plain key"),
+            &w.buf,
+            dt,
+            x,
+            &s,
+            w.m,
+            w.k,
+            n,
+        )?;
+        let y_n = y.sub_offset(0, n * w.m);
+        return gpu.add_inplace_f32(&y_n, &s);
     }
     if slots_weight_rotated(dt) {
         return mq4_residual_proj(gpu, w, x, y, rot_scratch, n);
@@ -2307,6 +2381,8 @@ fn tier_attend_slots(
     row_slot_dev: &GpuTensor,
     single_slot: Option<(u64, usize)>,
     multi_slot_tiles: Option<(&GpuTensor, &GpuTensor, &GpuTensor, usize)>,
+    paged_verify: Option<usize>,
+    paged_decode: Option<usize>,
 ) -> HipResult<()> {
     if kv.is_q8() {
         return q8_attend_slots(
@@ -2327,6 +2403,8 @@ fn tier_attend_slots(
             row_slot_dev,
             single_slot,
             multi_slot_tiles,
+            paged_verify,
+            paged_decode,
         );
     }
     let d = Some(descs_dev);
@@ -2565,7 +2643,41 @@ fn q8_attend_slots(
     row_slot_dev: &GpuTensor,
     single_slot: Option<(u64, usize)>,
     multi_slot_tiles: Option<(&GpuTensor, &GpuTensor, &GpuTensor, usize)>,
+    paged_verify: Option<usize>,
+    paged_decode: Option<usize>,
 ) -> HipResult<()> {
+    // ── Paged spec-verify attention (KVMem) ────────────────────────────────
+    // The reference dispatches a multirow verify step (n in 4..=32 past the
+    // per-token crossover) to its split-K WMMA verifier. A paged slot must
+    // mirror that: its descriptor-driven fallback is the query-tiled PREPILL
+    // kernel, which for a 4-row verify step launches one workgroup per head
+    // sweeping the whole logical KV (grid [n_tiles=1, n_heads]) — the
+    // dominant cost of every MTP/DFlash decode step at long context, and a
+    // different numerics class from the reference. Admission is computed at
+    // the step level (single active slot, reference multirow envelope, exact
+    // gfx1100 inside the launcher); Ok(false) falls through to the ladder
+    // below — never an error.
+    if let Some(ctx_len) = paged_verify {
+        let page_tokens = rdna_compute::page_pool::PAGE_TOKENS;
+        if gpu.attention_verify_wmma_q8_gfx1100_paged(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ctx_len,
+            batch_size,
+            flash_partials,
+            descs_dev,
+            row_slot_dev,
+            page_tokens,
+        )? {
+            return Ok(());
+        }
+    }
     if let Some((k_base, slab_bytes)) = single_slot {
         if q8_flash_prefill_wmma_eligible(gpu, head_dim, batch_size) {
             let k_view = k_cache.sub_offset(k_base as usize, slab_bytes);
@@ -2645,6 +2757,38 @@ fn q8_attend_slots(
             8192
         }
     });
+    // ── Paged GQA-shared decode (KVMem) ────────────────────────────────────
+    // Single-row, single-slot Q8 decode. At every context length the
+    // reference sequential engine's decode route is the flash tile kernel
+    // (`attention_flash_q8_0_tile_gqa_gfx1100`) plus the shared reduce — not
+    // the scalar batched kernel, which the ladder below picks under the
+    // 8192 gfx1100 crossover. This paged twin reads each kv head's K/V tile
+    // once per kv head like the reference (partials byte-identical; the
+    // shared reduce consumes them unchanged), so it is BOTH the parity route
+    // and the fast one: the scalar fallback measured 375 us/layer vs 17 us
+    // for the reference on gfx1100. The old `ctx_len > crossover` guard made
+    // short-context decode 22x slower per layer and diverged numerically
+    // from stock. Ok(false) (shape outside the GQA-6 / head_dim-256
+    // envelope, non-gfx1100) falls through to the ladder.
+    if let Some(ctx_len) = paged_decode {
+        if gpu.attention_flash_q8_0_gqa_decode_paged(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                ctx_len,
+                flash_partials,
+                descs_dev,
+                row_slot_dev,
+            )?
+        {
+            return Ok(());
+        }
+    }
     if max_ctx_len <= crossover {
         gpu.attention_q8_0_kv_batched_masked_slots(
             q,
@@ -2705,6 +2849,9 @@ fn run_fullattn_layer_slots(
     n: usize,
     physical_cap: usize,
     max_ctx_len: usize,
+    // FullAttention ordinal of this layer (0-based over the model's FA
+    // layers). Indexes the KVMem tap buffers; harmless when taps are off.
+    kv_layer_idx: usize,
     // When true, `pbs.pos3` carries per-row M-RoPE phases: dispatch the
     // batched M-RoPE kernel instead of the 1D one. Text rows carry [p, p, p]
     // (bit-identical angles); only VL image/post-image rows genuinely differ.
@@ -2833,6 +2980,21 @@ fn run_fullattn_layer_slots(
         config.norm_eps,
     )?;
 
+    // 4b. KVMem statistics tap — AFTER k_norm, BEFORE RoPE (RoPE rotates
+    // Q/K in place, and the statistics frame is post-norm/pre-RoPE). Pure
+    // copy: Q/K are unchanged, so the arithmetic below stays bit-identical.
+    // No-op unless the engine allocated the taps (`pbs.kvmem_taps`).
+    if let (Some(taps), LayerKvAddr::Arena { desc_staging, .. }) = (pbs.kvmem_taps.as_ref(), addr) {
+        taps.tap_layer(
+            gpu,
+            kv_layer_idx,
+            &pbs.fa_q_batch,
+            &pbs.fa_k_batch,
+            &desc_staging.row_slot_dev,
+            n,
+        )?;
+    }
+
     // 5. RoPE — slot-agnostic (SP2 Task 2): indexes by global flat row via
     // `pbs.positions`, which SlotBatch already fills per-slot-absolute and
     // global-row-indexed. No compaction in the slot path yet, so
@@ -2947,6 +3109,8 @@ fn run_fullattn_moe_layer_slots(
     physical_cap: usize,
     max_ctx_len: usize,
     weights_moe_has_mq6: bool,
+    // FullAttention ordinal of this layer — indexes the KVMem tap buffers.
+    kv_layer_idx: usize,
     use_mrope: bool,
 ) -> HipResult<()> {
     // Layer span (opt-in trace only): attention half vs MoE FFN body. Host
@@ -3076,6 +3240,19 @@ fn run_fullattn_moe_layer_slots(
         config.norm_eps,
     )?;
 
+    // 4b. KVMem statistics tap — AFTER k_norm, BEFORE RoPE (see the dense
+    // body's identical site; pure copy, no arithmetic change).
+    if let (Some(taps), LayerKvAddr::Arena { desc_staging, .. }) = (pbs.kvmem_taps.as_ref(), addr) {
+        taps.tap_layer(
+            gpu,
+            kv_layer_idx,
+            &pbs.fa_q_batch,
+            &pbs.fa_k_batch,
+            &desc_staging.row_slot_dev,
+            n,
+        )?;
+    }
+
     // 5. RoPE — slot-agnostic (SP2 Task 2). VL steps (use_mrope) dispatch
     // the batched M-RoPE kernel over `pbs.pos3`; text rows carry [p, p, p],
     // bit-identical to the 1D kernel's angles.
@@ -3184,6 +3361,113 @@ fn run_fullattn_moe_layer_slots(
         );
     }
     moe_result
+}
+
+/// Single-row paged decode through the reference's own kernel ladder.
+///
+/// [`forward_batch_slots`] normally runs the slots GEMM ladder, which at
+/// n == 1 is both numerically different from the reference sequential
+/// decode (WMMA GEMM vs GEMV, batched norms vs the fused decode norms) and
+/// measurably slower per step on gfx1100. This fork hands the row to
+/// [`crate::qwen35::forward::forward_scratch_layers_paged`]: the reference's
+/// `DecodeBinding` layer loop with each full-attention layer bound to the
+/// slot's block table. The hidden state moves `pbs.x_batch` row 0 → `s.x` →
+/// back; the per-slot lm_head still runs from `pbs.x_batch` in
+/// [`final_logits_per_slot`], unchanged.
+///
+/// The Q8 arenas are viewed in model-layer order (null tensors on DeltaNet
+/// layers), the same shape `ModelRig::slot_kv_view` gives the contiguous
+/// engine — the paged kernels only use those tensors as arena bases.
+#[allow(clippy::too_many_arguments)]
+fn paged_decode_reference_layers(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    batch: &SlotBatch,
+    pool: &SlotPool,
+    slot_idx: usize,
+    dn_states: &[DeltaNetState],
+    k_arenas: &[GpuTensor],
+    v_arenas: &[GpuTensor],
+    desc_staging: &SlotDescStaging,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    ctx_len: usize,
+    layer_end: usize,
+) -> HipResult<()> {
+    let dim = config.dim;
+    let row_bytes = dim * 4;
+    // Hidden state of the decode row in; the reference writes the same
+    // logical position into pos_buf before its layer loop (the RoPE angle
+    // and the paged tile/reduce causal bound both read pos_buf[0]).
+    gpu.memcpy_dtod_at_auto(&s.x.buf, 0, &pbs.x_batch.buf, 0, row_bytes)?;
+    let pos = batch.positions[0] as usize;
+    let pos_i32 = pos as i32;
+    gpu.hip.memcpy_htod(&s.pos_buf, &pos_i32.to_ne_bytes())?;
+
+    // Borrowed Q8 view of the paged arenas, model-layer order.
+    let phys_cap = pool.cap_tokens();
+    let mut k_gpu = Vec::with_capacity(config.n_layers);
+    let mut v_gpu = Vec::with_capacity(config.n_layers);
+    let mut fa = 0usize;
+    for t in &config.layer_types {
+        if *t == LayerType::FullAttention {
+            k_gpu.push(k_arenas[fa].sub_offset(0, k_arenas[fa].numel()));
+            v_gpu.push(v_arenas[fa].sub_offset(0, v_arenas[fa].numel()));
+            fa += 1;
+        } else {
+            k_gpu.push(GpuTensor::null_for_test());
+            v_gpu.push(GpuTensor::null_for_test());
+        }
+    }
+    let kv_view = KvCache {
+        k_gpu,
+        v_gpu,
+        k_scales: Vec::new(),
+        v_scales: Vec::new(),
+        kv_dim: config.n_kv_heads * config.head_dim,
+        max_seq: phys_cap,
+        physical_cap: phys_cap,
+        n_kv_heads: config.n_kv_heads,
+        head_dim: config.head_dim,
+        quantized: true,
+        quant_q8: true,
+        quant_int8: false,
+        quant_hfq4: false,
+        quant_asym4: false,
+        quant_asym3: false,
+        quant_asym2: false,
+        boundary_layers: 0,
+        givens_cos: None,
+        givens_sin: None,
+        quant_fwht: false,
+        quant_bf16: false,
+        quant_fp8: false,
+        v_mode: VMode::Q8,
+        layer_is_boundary: Vec::new(),
+        compact_offset: 0,
+    };
+    crate::qwen35::forward::forward_scratch_layers_paged(
+        gpu,
+        weights,
+        config,
+        pos,
+        &kv_view,
+        &dn_states[slot_idx],
+        s,
+        hipfire_dispatch::pipeline::hybrid::PagedAttentionKv {
+            positions: &pbs.positions,
+            descs: &desc_staging.descs_dev,
+            row_slot: &desc_staging.row_slot_dev,
+            ctx_len,
+        },
+        pbs.kvmem_taps.as_ref(),
+        &desc_staging.row_slot_dev,
+        layer_end,
+    )?;
+    // Back into the [n_slots × dim] batch buffer the head reads.
+    gpu.memcpy_dtod_at_auto(&pbs.x_batch.buf, 0, &s.x.buf, 0, row_bytes)?;
+    Ok(())
 }
 
 /// Final output norm + per-slot last-token logits. Gathers only the last
@@ -4197,6 +4481,33 @@ pub fn upload_step_inputs(
     // flags without their contents ever reaching the device — stale page
     // mappings, i.e. silent cross-session corruption.
     upload_block_tables(gpu, pool, desc_staging)?;
+    // Diagnostic (`HIPFIRE_KVMEM_VERIFY=1`): read the device block table back
+    // and compare it with the host table the kernels are about to index
+    // through — a stale upload would silently hide restored pages.
+    if pool.is_paged()
+        && std::env::var("HIPFIRE_KVMEM_VERIFY").map(|v| v == "1").unwrap_or(false)
+    {
+        for slot_idx in 0..pool.descriptors().len() {
+            let (Some(bt), Some(dev)) = (
+                pool.block_table(SlotId(slot_idx)),
+                desc_staging.block_table_devs.get(slot_idx),
+            ) else {
+                continue;
+            };
+            let n = bt.page_indices().len();
+            let mut got = vec![0u8; n * 4];
+            gpu.hip.memcpy_dtoh_at(&mut got, &dev.buf, 0)?;
+            let mut want = Vec::with_capacity(n * 4);
+            for e in bt.page_indices() {
+                want.extend_from_slice(&e.to_ne_bytes());
+            }
+            let mism = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+            eprintln!(
+                "[kvmem-verify] pre-forward slot {slot_idx} table {n} pages, \
+                 device mismatch bytes {mism}"
+            );
+        }
+    }
     if pool.descriptors_dirty() {
         let desc_bytes = pack_descs(pool.descriptors());
         gpu.hip
@@ -4454,6 +4765,32 @@ pub fn forward_batch_slots_opts(
                 .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
             pool.mark_uploaded();
         }
+        // Diagnostic (`HIPFIRE_KVMEM_VERIFY=1`): device table vs host table
+        // immediately before the kernels, to catch stale page mappings.
+        if pool.is_paged()
+            && std::env::var("HIPFIRE_KVMEM_VERIFY").map(|v| v == "1").unwrap_or(false)
+        {
+            for slot_idx in 0..pool.descriptors().len() {
+                let (Some(bt), Some(dev)) = (
+                    pool.block_table(SlotId(slot_idx)),
+                    desc_staging.block_table_devs.get(slot_idx),
+                ) else {
+                    continue;
+                };
+                let n = bt.page_indices().len();
+                let mut got = vec![0u8; n * 4];
+                gpu.hip.memcpy_dtoh_at(&mut got, &dev.buf, 0)?;
+                let mut want = Vec::with_capacity(n * 4);
+                for e in bt.page_indices() {
+                    want.extend_from_slice(&e.to_ne_bytes());
+                }
+                let mism = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+                eprintln!(
+                    "[kvmem-verify] pre-forward slot {slot_idx} table {n} pages, \
+                     device mismatch bytes {mism}"
+                );
+            }
+        }
     }
 
     let physical_cap = pool.cap_tokens();
@@ -4485,6 +4822,64 @@ pub fn forward_batch_slots_opts(
         let k_base = pool.descriptors()[slot_idx].legacy_k_base;
         let slab_bytes = pool.arena_bytes() / n_slots;
         Some((k_base, slab_bytes))
+    } else {
+        None
+    };
+
+    // Paged spec-verify admission (see `q8_attend_slots`): mirror the
+    // reference's multirow dispatch envelope so MTP/DFlash verify steps ride
+    // the reference's own split-K WMMA verifier (its numerics class, and at
+    // long context ~40x less work than the prefill-tile sweep) instead of
+    // the one-workgroup-per-head paged prefill kernel. `logical_ctx` is the
+    // ctx the reference passes (`max position + 1`), deliberately NOT the
+    // physical-cap-clamped `max_ctx_len`: the verifier's span count depends
+    // on it, and it must stay identical to the reference's for the same
+    // conversation regardless of how many KV pages the pool holds.
+    let paged_verify: Option<usize> = if pool.is_paged() && kv.is_q8() && active_slots == 1 {
+        let logical_ctx = batch
+            .positions
+            .iter()
+            .copied()
+            .max()
+            .map(|p| p as usize + 1)
+            .unwrap_or(0);
+        let admitted = q8_multirow_attn_admitted(
+            gpu.arch.as_str(),
+            true,
+            config.head_dim,
+            n,
+            logical_ctx,
+            fa_pertoken_min_ctx(gpu.arch.as_str()),
+            false,
+            false,
+            gpu.graphs.capture_mode,
+            gpu.replay.is_recording(),
+            false,
+        );
+        // The verifier's own envelope (1..=8 rows: MTP K=3 -> 4, DFlash B
+        // per block). Larger multirow blocks keep the tiles ladder below.
+        (admitted && n <= 8).then_some(logical_ctx)
+    } else {
+        None
+    };
+
+    // Paged single-row decode admission (see `q8_attend_slots`). Exactly one
+    // slot with exactly one row is pure decode below the row axis, which is
+    // the reference's own `batch_size == 1` shape; on gfx1100 that shape
+    // decodes through the GQA-shared tile (one workgroup per (kv head, tile),
+    // each K/V tile read once). The generic paged ladder's tile launches one
+    // workgroup per (q head, tile) — six reads of the same K/V per kv head —
+    // which measured 46.4 ms/step against the reference's 26.7 ms at 56k on
+    // the 7900 XT (spec off, same model/document). Paged mode never captures
+    // decode graphs (see `forward_batch_slots_graphed_opts`), so routing this
+    // launch to the reference's kernel class cannot desync a capture.
+    let paged_decode: Option<usize> = if pool.is_paged()
+        && kv.is_q8()
+        && active_slots == 1
+        && n == 1
+        && hipfire_config::developer_bool("HIPFIRE_KVMEM_GQA_DECODE", true)
+    {
+        Some(max_ctx_len)
     } else {
         None
     };
@@ -4527,8 +4922,8 @@ pub fn forward_batch_slots_opts(
     // layer" upload policy.
     let n_tiles: Option<usize> = if kv.is_q8()
         && single_slot.is_none()
-        && active_slots > 1
         && n > active_slots
+        && paged_verify.is_none()
         && q8_flash_prefill_wmma_eligible(gpu, config.head_dim, n)
     {
         let (tile_slot, tile_row0, tile_qbase) = build_tiles(&batch.m_per_slot, WMMA_M_TILE);
@@ -4557,30 +4952,71 @@ pub fn forward_batch_slots_opts(
 
     // ── 4. Per-layer loop ─────────────────────────────────────────────────
     let layer_end = config.n_layers.min(max_layer.unwrap_or(usize::MAX));
-    run_layers_slots(
-        gpu,
-        weights,
-        config,
-        batch,
-        &*dn_states,
-        |kv_layer_idx| LayerKvAddr::Arena {
-            k_cache: &k_arenas[kv_layer_idx],
-            v_cache: &v_arenas[kv_layer_idx],
+    // Paged single-row decode of a dense model runs the REFERENCE's own
+    // decode ladder (`paged_decode_reference_layers`): one row through one
+    // slot is exactly the reference's `batch_size == 1` shape, and the slots
+    // GEMM ladder both diverges numerically (WMMA GEMM vs GEMV, batched vs
+    // fused norms) and measured ~40% slower per step once the attention tile
+    // and KV writer were matched on gfx1100. Text-only and unspec-captured
+    // by construction: VL rows carry M-RoPE / external embeddings and spec
+    // steps are multi-row, so both keep the slots ladder.
+    let use_reference_decode = paged_decode.is_some()
+        && n == 1
+        && active_slots == 1
+        && config.num_experts == 0
+        && !use_mrope
+        && !use_ext
+        && spec_capture.is_none();
+    if use_reference_decode {
+        let slot_idx = batch
+            .m_per_slot
+            .iter()
+            .position(|&m| m > 0)
+            .expect("active_slots == 1 implies exactly one active slot");
+        paged_decode_reference_layers(
+            gpu,
+            weights,
+            config,
+            batch,
+            pool,
+            slot_idx,
+            &*dn_states,
+            k_arenas,
+            v_arenas,
             desc_staging,
-            single_slot,
-            n_tiles,
-        },
-        kv,
-        pbs,
-        s,
-        q8_wmma_arch,
-        n,
-        physical_cap,
-        max_ctx_len,
-        use_mrope,
-        layer_end,
-        spec_capture.as_deref_mut(),
-    )?;
+            pbs,
+            s,
+            paged_decode.unwrap(),
+            layer_end,
+        )?;
+    } else {
+        run_layers_slots(
+            gpu,
+            weights,
+            config,
+            batch,
+            &*dn_states,
+            |kv_layer_idx| LayerKvAddr::Arena {
+                k_cache: &k_arenas[kv_layer_idx],
+                v_cache: &v_arenas[kv_layer_idx],
+                desc_staging,
+                single_slot,
+                n_tiles,
+                paged_verify,
+                paged_decode,
+            },
+            kv,
+            pbs,
+            s,
+            q8_wmma_arch,
+            n,
+            physical_cap,
+            max_ctx_len,
+            use_mrope,
+            layer_end,
+            spec_capture.as_deref_mut(),
+        )?;
+    }
 
     if max_layer.is_some() {
         // Early-exit for bisection: mirror the reference's `do_lm_head =
@@ -4677,6 +5113,7 @@ where
                     n,
                     physical_cap,
                     max_ctx_len,
+                    kv_layer_idx,
                     use_mrope,
                 )?;
                 kv_layer_idx += 1;
@@ -4711,6 +5148,7 @@ where
                     physical_cap,
                     max_ctx_len,
                     weights.moe_has_mq6,
+                    kv_layer_idx,
                     use_mrope,
                 )?;
                 kv_layer_idx += 1;
@@ -4973,7 +5411,6 @@ mod tests {
         // Out-of-scope containers refuse at admission.
         for dt in [
             DType::MQ4G256V2Lloyd,
-            DType::TQ2G128,
             DType::HFQ4G128,
             DType::F16,
         ] {
@@ -4982,6 +5419,29 @@ mod tests {
                 "{dt:?} must not be admitted"
             );
         }
+        // Flat lowbit Bonsai containers ARE admitted, but never as a Uniform
+        // fused group: a uniform lowbit group is forced onto the per-projection
+        // plain-GEMM Mixed path (no fused qkvza/qkv/gate_up key exists for them,
+        // and the fused_*_key_for wildcard would mis-read G128 at HFQ4 stride).
+        for dt in [DType::TQ2G128, DType::BQ1G128] {
+            assert!(slots_proj_admissible(dt, arch), "{dt:?} must be admitted");
+            assert!(slots_is_lowbit(dt), "{dt:?} must be lowbit");
+            assert!(!slots_weight_rotated(dt), "{dt:?} is flat, not rotated");
+            assert!(slots_plain_gemm_key(dt).is_some(), "{dt:?} needs a plain key");
+            assert_eq!(
+                plan_proj_group_dtypes(&[m(dt), m(dt)], arch),
+                Ok(GroupPlan::Mixed {
+                    needs_rot: false,
+                    needs_norm: true
+                }),
+                "{dt:?} uniform group must lower to plain Mixed, never Uniform fused"
+            );
+            // A lowbit residual role is admitted (plain GEMM + add, no key).
+            assert!(slots_residual_gemm_key(dt).is_none(), "{dt:?} has no residual kernel");
+        }
+        // lm_head admits the flat lowbit head (Step::Gemv -> GemvTQ2/BQ1G128).
+        assert!(lm_head_slots_admissible(DType::TQ2G128));
+        assert!(lm_head_slots_admissible(DType::BQ1G128));
     }
 
     #[test]

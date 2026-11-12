@@ -1015,9 +1015,17 @@ pub(super) fn decode(
                         pos,
                         layer_idx,
                         delta_layer_idx,
+                        k_dim: config.linear_num_key_heads * config.linear_key_head_dim,
+                        v_dim: config.linear_num_value_heads * config.linear_value_head_dim,
+                        n_v_heads: config.linear_num_value_heads,
+                        hd: config.linear_key_head_dim,
                         precomputed_attn_x_rot: false,
                         fa_output_prerotated: false,
                         defer_routed_combine: false,
+                        paged: None,
+                        kvmem_taps: None,
+                        row_slot: None,
+                        fa_layer_idx: 0,
                     };
                     run_layer_program(gpu, &ctx, &program, &mut bind)
                         .map_err(|e| HipError::new(0, &e.to_string()))
@@ -1356,9 +1364,17 @@ pub(super) fn decode(
                         pos,
                         layer_idx,
                         delta_layer_idx,
+                        k_dim: config.linear_num_key_heads * config.linear_key_head_dim,
+                        v_dim: config.linear_num_value_heads * config.linear_value_head_dim,
+                        n_v_heads: config.linear_num_value_heads,
+                        hd: config.linear_key_head_dim,
                         precomputed_attn_x_rot: false,
                         fa_output_prerotated: false,
                         defer_routed_combine: false,
+                        paged: None,
+                        kvmem_taps: None,
+                        row_slot: None,
+                        fa_layer_idx: 0,
                     };
                     if let (true, Some(l)) = (split_dn_prep, &dn_view) {
                         gpu.conv1d_silu_split_qknorm(

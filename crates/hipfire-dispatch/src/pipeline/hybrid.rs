@@ -1050,6 +1050,24 @@ pub struct AttentionKv<'a> {
     pub givens_sin: Option<&'a GpuTensor>,
     /// Logical positions evicted ahead of the physical slot (KV compaction).
     pub compact_offset: usize,
+    /// Paged KVMem addressing. When set, K/V live in a block-table-addressed
+    /// arena: `kv_attention` writes and attends through `paged` and ignores
+    /// `tier`/`compact_offset`/`givens_*`. Single decode row only.
+    pub paged: Option<PagedAttentionKv<'a>>,
+}
+
+/// Paged KVMem addressing of one decode row: the row's absolute position
+/// (device i32, one element), its slot's block table (device `KvSlotDesc`
+/// array) and slot id (device i32, one element) — the buffers the slots
+/// engine uploads per step to `SlotDescStaging`.
+#[derive(Clone, Copy)]
+pub struct PagedAttentionKv<'a> {
+    pub positions: &'a GpuTensor,
+    pub descs: &'a GpuTensor,
+    pub row_slot: &'a GpuTensor,
+    /// Context cap the tile grid and reduce span are sized from (the slots
+    /// engine's `max_ctx_len`).
+    pub ctx_len: usize,
 }
 
 /// The decode row one attention layer reads and writes.
@@ -1089,6 +1107,16 @@ pub fn kv_attention(
     wo: &WeightRef<'_>,
     kv_write_prewritten: bool,
 ) -> Result<bool, DispatchError> {
+    if let Some(paged) = kv.paged.as_ref() {
+        if kv_write_prewritten {
+            return Err(DispatchError::Hip(
+                "paged KV attention: the folded FA prep KV write reads a \
+                 contiguous cache and cannot address a block table"
+                    .into(),
+            ));
+        }
+        return kv_attention_paged(gpu, dims, kv, row, wo, paged);
+    }
     let plan = kv.tier_plan(gpu, row.position)?;
     let route = |write, attend| plan.write_key == write && plan.attend_key == attend;
     let fused_epilogue_route = attention_epilogue_route_supported(
@@ -1139,6 +1167,101 @@ pub fn kv_attention(
     }
     execute_steps(gpu, ctx, &[Step::Attend { plan, io }])?;
     Ok(fused_epilogue)
+}
+
+/// Paged KVMem decode attention: write this row's Q8_0 K/V through the
+/// slot's block table and attend the block-table-addressed GQA tile.
+///
+/// Kernel-for-kernel the reference's own single-row decode: the Q8_0 writer
+/// (`kv_cache_write_q8_0_batched`'s paged module) quantizes with the same
+/// `amax/127` + round-to-nearest + f16-scale arithmetic as the reference's
+/// `kv_cache_write_q8_0_pair`, the tile publishes the same `[2 + head_dim]`
+/// partials, and the reduce is the same gated AWQ-rotation kernel — the only
+/// difference is that the tile base resolves through the block table, so
+/// spilled pages read as empty partials instead of absent rows.
+fn kv_attention_paged(
+    gpu: &mut Gpu,
+    dims: &HybridDims,
+    kv: &AttentionKv<'_>,
+    row: &AttentionRow<'_>,
+    wo: &WeightRef<'_>,
+    paged: &PagedAttentionKv<'_>,
+) -> Result<bool, DispatchError> {
+    // One row, so the writer's row chunking is a single launch per tensor.
+    gpu.kv_cache_write_q8_0_batched_slots(
+        kv.k_cache,
+        row.k,
+        paged.positions,
+        dims.n_kv_heads,
+        dims.head_dim,
+        1,
+        Some(paged.descs),
+        Some(paged.row_slot),
+        false,
+    )
+    .map_err(hip)?;
+    gpu.kv_cache_write_q8_0_batched_slots(
+        kv.v_cache,
+        row.v,
+        paged.positions,
+        dims.n_kv_heads,
+        dims.head_dim,
+        1,
+        Some(paged.descs),
+        Some(paged.row_slot),
+        true,
+    )
+    .map_err(hip)?;
+    if fused_attention_epilogue(gpu, dims, wo) {
+        if let Some(awq) = wo.awq_scale {
+            let ran = gpu
+                .attention_flash_q8_0_gqa_decode_paged_gated(
+                    row.q,
+                    kv.k_cache,
+                    kv.v_cache,
+                    row.out,
+                    row.gate,
+                    awq,
+                    row.pos_buf,
+                    dims.n_heads,
+                    dims.n_kv_heads,
+                    dims.head_dim,
+                    paged.ctx_len,
+                    row.flash_partials,
+                    paged.descs,
+                    paged.row_slot,
+                )
+                .map_err(hip)?;
+            if ran {
+                return Ok(true);
+            }
+        }
+    }
+    let ran = gpu
+        .attention_flash_q8_0_gqa_decode_paged(
+            row.q,
+            kv.k_cache,
+            kv.v_cache,
+            row.out,
+            paged.positions,
+            dims.n_heads,
+            dims.n_kv_heads,
+            dims.head_dim,
+            paged.ctx_len,
+            row.flash_partials,
+            paged.descs,
+            paged.row_slot,
+        )
+        .map_err(hip)?;
+    if !ran {
+        return Err(DispatchError::Hip(
+            "paged KV attention: the paged GQA decode kernels do not admit \
+             this shape (gfx1100, head_dim 256, 6 q heads per kv head, \
+             tile 128); refusing to fall back to a contiguous-cache kernel"
+                .into(),
+        ));
+    }
+    Ok(false)
 }
 
 /// Full-attention sublayer: norm → q(+gate)/k/v projection → Q/gate split,
@@ -1209,13 +1332,18 @@ impl GatedAttentionOp<'_> {
             fused_attention_prep(gpu, dims) && self.tap.is_none() && self.mrope.is_none();
         // Fold the Q8_0 KV write into the prep epilogue. Requires the
         // non-compact decode route: pos_buf must hold the physical position
-        // when the folded writer reads it.
-        let kv_write_fold =
-            if fused_prep && self.kv.compact_offset == 0 && fused_attention_kv_write(gpu, dims) {
-                kv_write_fold_route_supported(&self.kv.tier_plan(gpu, row.position)?)
-            } else {
-                false
-            };
+        // when the folded writer reads it. Paged KVMem has no contiguous slot
+        // to fold into (the folded writer cannot resolve a block table), so
+        // the write stays in `kv_attention`'s paged arm.
+        let kv_write_fold = if self.kv.paged.is_none()
+            && fused_prep
+            && self.kv.compact_offset == 0
+            && fused_attention_kv_write(gpu, dims)
+        {
+            kv_write_fold_route_supported(&self.kv.tier_plan(gpu, row.position)?)
+        } else {
+            false
+        };
         if !fused_prep {
             gpu.deinterleave_f32(self.q_gate, row.q, row.gate, dims.n_heads, dims.head_dim)
                 .map_err(hip)?;

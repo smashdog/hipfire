@@ -561,7 +561,13 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
         "MQ4G256 k=8 must be GPU-top-K-indexable"
     );
     assert!(
-        check_moe_decode_supported(res_k8.use_gpu_topk, 8, 64, /*resident=*/ false).is_ok(),
+        check_moe_decode_supported(
+            res_k8.use_gpu_topk,
+            8,
+            64,
+            /*resident=*/ false
+        )
+        .is_ok(),
         "GPU-top-K path is valid even under paged (non-resident) residency"
     );
 
@@ -577,7 +583,10 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
 
     // (b) routed dtype on NEITHER path: not GPU-top-K AND no resident experts.
     assert!(
-        check_moe_decode_supported(/*use_gpu_topk=*/ false, 4, 64, /*resident=*/ false).is_err(),
+        check_moe_decode_supported(
+            /*use_gpu_topk=*/ false, 4, 64, /*resident=*/ false
+        )
+        .is_err(),
         "non-fast-path dtype with no resident experts has no runnable path — reject gracefully"
     );
 }
@@ -618,6 +627,7 @@ fn paro_g64_and_g128_never_share_a_route() {
     // Only the G128 dtype is admitted into the G128-only MoE tier list.
     assert!(!crate::families::moe::MIXED_SUPPORTED_TIERS.contains(&ParoQ4G64));
 }
+
 
 /// LAYER 1c — Q8/Paro were gapped in MULTIPLE GEMV variants: o_proj used Residual,
 /// then the FFN/qkv used Prerotated (the second panic domino). Lock every variant

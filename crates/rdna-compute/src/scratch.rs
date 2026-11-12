@@ -553,6 +553,17 @@ pub struct ScratchState {
     /// `FeatureFlags::pm_decode` snapshot for the load funnel: accepted
     /// [`crate::pm_decode_twins`] replace their HIP modules (exact gfx1201).
     pub(crate) pm_decode: bool,
+    /// Escha-W2 BATCHED-PREFILL routed scratch. See [`EschaPrefillScratch`].
+    ///
+    /// Lives here, on the per-GPU scratch state, rather than on the model's
+    /// `PrefillBatchScratch`, for two reasons. It is MODEL-GLOBAL — one copy
+    /// serves all 40 layers, because the routed half of a layer is fully
+    /// consumed before the next layer's begins — and the per-layer escha
+    /// scratch it mirrors is only `[k]` slots (~272 KB); a `[max_batch x k]`
+    /// version PER LAYER would be ~3 GB. It is also grows-never-shrinks and
+    /// lazily allocated, exactly like `gemv_residual_tmp` and
+    /// `paro_fused_scratch` beside it, so a non-escha model never pays a byte.
+    pub escha_prefill: Option<EschaPrefillScratch>,
 }
 
 // ── Planned-route kernel barrier ─────────────────────────────────────────
@@ -876,6 +887,105 @@ fn bind_predicted_modules(
         }
     }
     Ok(stats)
+}
+
+/// Scratch for `escha_routed_prefill_indexed`: the per-slot buffers of the
+/// eight-phase escha routed pipeline, sized for `slots = n_tokens * k` rather
+/// than decode's `k`.
+///
+/// ONE device allocation carved into seven views. The packing matters: the HIP
+/// allocator rounds every allocation to a 2 MiB granule, and seven separate
+/// buffers would charge that seven times for buffers that are always allocated
+/// and freed together (the same lesson `PackedExpertOwners` records at a much
+/// larger scale — 20,480 allocations became 80 and 30.4 GB came back).
+///
+/// At A3B shapes with `max_batch = 256`, `k = 8` (2 048 slots, hidden 2 048,
+/// mi 512) this is `2048 * (3*2048 + 6*512 + 1) * 4 B` = ~75 MB total, for the
+/// whole model.
+pub struct EschaPrefillScratch {
+    /// Slot capacity this was sized for (`n_tokens * k`).
+    pub slots: usize,
+    /// Model hidden size the views were carved against.
+    pub hidden: usize,
+    /// Routed-expert intermediate size the views were carved against.
+    pub mi: usize,
+    /// The single owning allocation. Every field below is a non-owning view.
+    owner: DeviceBuffer,
+    /// `[slots]` f32 — f16-rounded combine weights.
+    pub weights: GpuTensor,
+    /// `[slots, hidden]` f32.
+    pub xh_gu: GpuTensor,
+    /// `[slots, 2*mi]` f32.
+    pub mid_gu: GpuTensor,
+    /// `[slots, 2*mi]` f32.
+    pub y_gu: GpuTensor,
+    /// `[slots, mi]` f32.
+    pub h: GpuTensor,
+    /// `[slots, mi]` f32.
+    pub xh_dn: GpuTensor,
+    /// `[slots, hidden]` f32.
+    pub mid_dn: GpuTensor,
+    /// `[slots, hidden]` f32 — the per-slot expert outputs the combine reduces.
+    pub y_dn: GpuTensor,
+}
+
+/// Non-owning views of exactly the LIVE prefix of an [`EschaPrefillScratch`].
+///
+/// Returned by value so the caller does not hold a borrow of `Gpu` across the
+/// kernel launches that consume it — `ensure_escha_prefill_scratch` needs
+/// `&mut Gpu`, and so does every launch, so a `&EschaPrefillScratch` tied to
+/// `gpu.scratch` could not survive the first launch.
+///
+/// Every field is a `sub_offset` alias: dropping one is a no-op, and none of
+/// them may be passed to `free_tensor`. The owning allocation stays in
+/// `ScratchState::escha_prefill`.
+pub struct EschaPrefillViews {
+    /// Live slot count these views were cut to (`n_tokens * k`).
+    pub slots: usize,
+    pub weights: GpuTensor,
+    pub xh_gu: GpuTensor,
+    pub mid_gu: GpuTensor,
+    pub y_gu: GpuTensor,
+    pub h: GpuTensor,
+    pub xh_dn: GpuTensor,
+    pub mid_dn: GpuTensor,
+    pub y_dn: GpuTensor,
+}
+
+impl EschaPrefillScratch {
+    /// Cut views of the first `slots` slots.
+    ///
+    /// The `escha_h128_batched` / GEMV wrappers validate buffer lengths
+    /// EXACTLY, so they must be handed the live prefix rather than the whole
+    /// (larger) capacity — and that exactness is deliberate: it is what turns
+    /// a slot-count mistake into a rejected launch instead of a silent
+    /// out-of-range write.
+    pub fn views(&self, slots: usize) -> EschaPrefillViews {
+        let (hidden, mi) = (self.hidden, self.mi);
+        EschaPrefillViews {
+            slots,
+            weights: self.weights.sub_offset(0, slots),
+            xh_gu: self.xh_gu.sub_offset(0, slots * hidden),
+            mid_gu: self.mid_gu.sub_offset(0, slots * 2 * mi),
+            y_gu: self.y_gu.sub_offset(0, slots * 2 * mi),
+            h: self.h.sub_offset(0, slots * mi),
+            xh_dn: self.xh_dn.sub_offset(0, slots * mi),
+            mid_dn: self.mid_dn.sub_offset(0, slots * hidden),
+            y_dn: self.y_dn.sub_offset(0, slots * hidden),
+        }
+    }
+
+    /// f32 elements one slot occupies across all seven buffers.
+    ///
+    /// Pure, so the packing arithmetic is checkable without a GPU — and it
+    /// must be, because a wrong stride here puts every slot after the first at
+    /// a wrong offset, which is finite, plausible, wrong output rather than a
+    /// fault.
+    pub fn elems_per_slot(hidden: usize, mi: usize) -> usize {
+        // weights(1) + xh_gu(hidden) + mid_gu(2mi) + y_gu(2mi) + h(mi)
+        //            + xh_dn(mi) + mid_dn(hidden) + y_dn(hidden)
+        1 + 3 * hidden + 6 * mi
+    }
 }
 
 // ── Shared kernel dispatch helpers ──────────────────────────────────────
@@ -2148,6 +2258,80 @@ impl ScratchState {
         Ok(())
     }
 
+    /// Ensure the Escha-W2 batched-prefill routed scratch can serve `slots`
+    /// slots at this model's `hidden` / `mi`, growing on demand.
+    ///
+    /// Reallocates whenever the request exceeds the current capacity OR the
+    /// shapes differ — `hidden` / `mi` are fixed per model, so a shape change
+    /// means a different model on the same `Gpu`, and reusing views carved for
+    /// the old shapes would silently read the wrong strides.
+    pub fn ensure_escha_prefill(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        slots: usize,
+        hidden: usize,
+        mi: usize,
+    ) -> HipResult<&EschaPrefillScratch> {
+        crate::graph::bind_thread(hip, device_id)?;
+        let fits = self
+            .escha_prefill
+            .as_ref()
+            .is_some_and(|e| e.slots >= slots && e.hidden == hidden && e.mi == mi);
+        if !fits {
+            let per_slot = EschaPrefillScratch::elems_per_slot(hidden, mi);
+            let total = slots.checked_mul(per_slot).ok_or_else(|| {
+                hip_bridge::HipError::new(0, "escha prefill scratch size overflow")
+            })?;
+            let owner = hip.malloc(total * 4)?;
+            // Carve seven views out of one allocation, in declaration order.
+            // `off` counts f32 ELEMENTS; each view is a non-owning alias, so
+            // dropping them is a no-op and only `owner` holds the memory.
+            let base = owner.as_ptr() as *mut u8;
+            let mut off = 0usize;
+            let mut carve = |len: usize| -> GpuTensor {
+                // SAFETY: `off + len <= total` by construction (the sum of the
+                // seven lengths is exactly `slots * per_slot`), and the view
+                // never outlives `owner`, which is moved into the struct below
+                // and only replaced by this same function.
+                let t = GpuTensor {
+                    buf: unsafe { DeviceBuffer::from_raw(base.add(off * 4) as *mut _, len * 4) },
+                    shape: vec![len],
+                    dtype: DType::F32,
+                };
+                off += len;
+                t
+            };
+            let weights = carve(slots);
+            let xh_gu = carve(slots * hidden);
+            let mid_gu = carve(slots * 2 * mi);
+            let y_gu = carve(slots * 2 * mi);
+            let h = carve(slots * mi);
+            let xh_dn = carve(slots * mi);
+            let mid_dn = carve(slots * hidden);
+            let y_dn = carve(slots * hidden);
+            debug_assert_eq!(off, total, "escha prefill scratch carve must be exact");
+            if let Some(prev) = self.escha_prefill.take() {
+                hip.free(prev.owner)?;
+            }
+            self.escha_prefill = Some(EschaPrefillScratch {
+                slots,
+                hidden,
+                mi,
+                owner,
+                weights,
+                xh_gu,
+                mid_gu,
+                y_gu,
+                h,
+                xh_dn,
+                mid_dn,
+                y_dn,
+            });
+        }
+        Ok(self.escha_prefill.as_ref().unwrap())
+    }
+
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
     pub fn ensure_mq_signs(
         &mut self,
@@ -2340,6 +2524,23 @@ impl ScratchState {
     /// When either recorder is active (`capture_mode` or `replay.is_recording()`)
     /// the kernel always runs so the tape stays complete; the skip only applies
     /// to the live non-recording path. Returns the FP16 device pointer.
+    ///
+    /// # The pointer key is only sound for back-to-back same-`x` dispatches
+    ///
+    /// It identifies the SOURCE BUFFER, not its CONTENTS. A caller that hands
+    /// this a stable scratch allocation whose contents are rewritten between
+    /// calls — a per-layer activation buffer, which is most of them — gets the
+    /// first layer's conversion for every subsequent layer, silently. Two
+    /// call sites have already been bitten (the MTP lm_head, τ 1.85 → 1.01;
+    /// Escha-W2's `wo`) and both were fixed by switching to
+    /// [`Self::convert_fp16_x_uncached`].
+    ///
+    /// So: use this ONLY when the same `x` is consumed by several dispatches
+    /// with nothing writing to it in between (the Q/K/V case it was built
+    /// for). If `x` is a per-layer or per-step buffer, use
+    /// `convert_fp16_x_uncached`; one extra elementwise kernel is far cheaper
+    /// than the GEMM it feeds, and is always correct. Writers of a cached
+    /// buffer may instead call [`Self::invalidate_x_caches_for`].
     pub fn ensure_fp16_x(
         &mut self,
         hip: &HipRuntime,
@@ -2457,6 +2658,27 @@ impl ScratchState {
     /// every layer), where pointer-keyed caching would read stale FP16.
     /// Always launches; both recorders observe the same launch via
     /// `launch_maybe_blob`'s unified `record || capture_mode || force_blob` gate.
+    ///
+    /// # It also INVALIDATES the cache, and must
+    ///
+    /// This writes the SHARED `fp16_x_scratch` — the same buffer
+    /// [`Self::ensure_fp16_x`] hands out — so after it runs, any cached
+    /// `fp16_x_source_ptr` marker describes a buffer that no longer holds that
+    /// pointer's data. Leaving the marker set makes the very next
+    /// `ensure_fp16_x` for that pointer a CACHE HIT onto this call's
+    /// conversion of a completely different tensor.
+    ///
+    /// That is not hypothetical. On Escha-W2 batched prefill it fired every
+    /// layer: `wo` (`gemm_q8_0_residual_wmma`, cached) converted
+    /// `dn_normed_batch` in layer 0; `wqkv` (`gemm_q8_0_wmma`, uncached)
+    /// overwrote the scratch with `x_rot_batch` in layer 1; layer 1's `wo`
+    /// then hit the stale marker and multiplied its weights by the LA
+    /// rmsnorm output (magnitude ~7.5e-1) instead of the gated-norm output
+    /// (~1.9e-3) — a ~400x amplification, finite and fluent, that showed up
+    /// only as a moved argmax. The DeepSeek-V4 gfx942 call site had already
+    /// discovered this and nulls the marker by hand after calling; doing it
+    /// here makes that hand-repair unnecessary and closes the same hole for
+    /// every other caller.
     pub fn convert_fp16_x_uncached(
         &mut self,
         hip: &HipRuntime,
@@ -5311,5 +5533,29 @@ fn upload_ordered(
             hip.stream_synchronize(stream)
         }
         None => hip.memcpy_htod(dst, src),
+    }
+}
+
+#[cfg(test)]
+mod escha_prefill_scratch_tests {
+    use super::EschaPrefillScratch;
+
+    /// The carve arithmetic at the real A3B shapes. A wrong `elems_per_slot`
+    /// puts every buffer after the first at a wrong offset — plausible,
+    /// finite, wrong values rather than a fault — and the `debug_assert_eq!`
+    /// in `ensure_escha_prefill` that would catch it is compiled out of the
+    /// release build this actually runs in.
+    #[test]
+    fn elems_per_slot_matches_the_a3b_shapes() {
+        // hidden = 2048, mi = 512.
+        // weights 1 + xh_gu 2048 + mid_gu 1024 + y_gu 1024 + h 512
+        //   + xh_dn 512 + mid_dn 2048 + y_dn 2048
+        assert_eq!(EschaPrefillScratch::elems_per_slot(2048, 512), 9217);
+        // The whole-model footprint the design is sized against: max_batch 256
+        // x k 8 = 2048 slots. ~75 MB, ONE copy for all 40 layers (a per-layer
+        // one would be ~3 GB).
+        let bytes = 2048 * EschaPrefillScratch::elems_per_slot(2048, 512) * 4;
+        assert_eq!(bytes, 75_505_664);
+        assert!(bytes < 80 << 20);
     }
 }
