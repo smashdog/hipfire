@@ -276,6 +276,26 @@ mod ffi {
             aggregation: u32,
             out: *mut f64,
         ) -> c_int;
+
+        pub fn hk_page_softmax_scores(
+            keys: *const HkRawStore,
+            blocks: u32,
+            accepted_through: u64,
+            block_tokens: u32,
+            budget_blocks: u32,
+            sink_blocks: u32,
+            recent_blocks: u32,
+            q_data: *const f32,
+            layer_rows: *const u32,
+            layers: u32,
+            rows: u32,
+            query_heads: u32,
+            kv_heads: u32,
+            head_dim: u32,
+            attention_scale: f32,
+            aggregation: u32,
+            out: *mut f64,
+        ) -> c_int;
     }
 }
 
@@ -697,6 +717,77 @@ pub fn mean_key_retrieval_scores(
             head_dim,
             query_heads,
             kv_heads,
+            aggregation.as_u32(),
+            out.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(err_from_last());
+    }
+    Ok(out)
+}
+
+/// Query-span page-softmax retrieval scores (one per block).
+///
+/// `q_data` is `layers * rows * query_heads * head_dim` FP32 post-RMSNorm /
+/// pre-RoPE Q rows in layer/token/head/channel order; `layer_rows[l]` is the
+/// number of present rows for layer `l` (`<= rows`). The accepted index is
+/// frozen from `accepted_through` / `block_tokens` / `budget_blocks` /
+/// `sink_blocks` / `recent_blocks`; `blocks` must equal the resulting frame
+/// block count. Each block's softmax mass is averaged over the query rows
+/// (FP16-rounded operands; `attention_scale == 0` selects `1/sqrt(head_dim)`).
+/// Selection math only: it mutates no payload, frontier or residency.
+#[allow(clippy::too_many_arguments)]
+pub fn page_softmax_scores(
+    keys: &RawStore,
+    blocks: u32,
+    accepted_through: u64,
+    block_tokens: u32,
+    budget_blocks: u32,
+    sink_blocks: u32,
+    recent_blocks: u32,
+    q_data: &[f32],
+    layer_rows: &[u32],
+    layers: u32,
+    rows: u32,
+    query_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    attention_scale: f32,
+    aggregation: GqaAggregation,
+) -> Result<Vec<f64>> {
+    let need = layers as usize * rows as usize * query_heads as usize * head_dim as usize;
+    if q_data.len() < need {
+        return Err(KvMemError(format!(
+            "query rows too short: {} < {need}",
+            q_data.len()
+        )));
+    }
+    if layer_rows.len() < layers as usize {
+        return Err(KvMemError(format!(
+            "layer_rows too short: {} < {layers}",
+            layer_rows.len()
+        )));
+    }
+    let mut out = vec![0.0f64; blocks as usize];
+    clear_error();
+    let rc = unsafe {
+        ffi::hk_page_softmax_scores(
+            keys.ptr.as_ptr(),
+            blocks,
+            accepted_through,
+            block_tokens,
+            budget_blocks,
+            sink_blocks,
+            recent_blocks,
+            q_data.as_ptr(),
+            layer_rows.as_ptr(),
+            layers,
+            rows,
+            query_heads,
+            kv_heads,
+            head_dim,
+            attention_scale,
             aggregation.as_u32(),
             out.as_mut_ptr(),
         )
