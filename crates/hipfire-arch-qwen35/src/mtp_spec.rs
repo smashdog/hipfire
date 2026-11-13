@@ -2219,6 +2219,39 @@ fn mtp_penalty_apply_row(
 /// the window's candidates from `candidates[..n_verify - 1]` (so rejected /
 /// pruned draft-phase pushes never survive), uploads the history once, then
 /// launches one prepass per non-empty row. No-op unless `sampling.penalized()`.
+///
+/// Drafter-agnostic: MTP and the DFlash2 slot verify both call this with their
+/// own [`PenaltyHistory`] + repeat buffer. The caller must have run
+/// `penalty.begin_window(emitted)` for this window.
+pub(crate) fn spec_apply_verify_penalties(
+    gpu: &mut Gpu,
+    penalty: &mut hipfire_runtime::spec_sampling::PenaltyHistory,
+    repeat_buf: &GpuTensor,
+    logits_view: &GpuTensor,
+    candidates: &[u32],
+    n_verify: usize,
+    vocab: usize,
+    sampling: &MtpSamplingConfig,
+) -> HipResult<()> {
+    if !sampling.penalized() {
+        return Ok(());
+    }
+    mtp_penalty_require_window(penalty)?;
+    debug_assert!(n_verify >= 1 && candidates.len() + 1 >= n_verify);
+    penalty.rewind_drafts();
+    for &c in &candidates[..n_verify - 1] {
+        penalty.push_draft(c);
+    }
+    mtp_penalty_upload_history(gpu, penalty, repeat_buf)?;
+    for k in 0..n_verify {
+        let row = logits_view.sub_offset(k * vocab, vocab);
+        mtp_penalty_apply_row(gpu, penalty, repeat_buf, &row, k, vocab, sampling)?;
+    }
+    Ok(())
+}
+
+/// MTP wrapper around [`spec_apply_verify_penalties`] that also records the
+/// per-window host-side penalty cost under `HIPFIRE_MTP_PHASE_TIMING=1`.
 fn mtp_apply_verify_penalties(
     gpu: &mut Gpu,
     state: &mut MtpSpecState,
@@ -2232,25 +2265,16 @@ fn mtp_apply_verify_penalties(
         return Ok(());
     }
     let t0 = MtpPenaltyTiming::start();
-    mtp_penalty_require_window(&state.penalty)?;
-    debug_assert!(n_verify >= 1 && candidates.len() + 1 >= n_verify);
-    state.penalty.rewind_drafts();
-    for &c in &candidates[..n_verify - 1] {
-        state.penalty.push_draft(c);
-    }
-    mtp_penalty_upload_history(gpu, &state.penalty, &state.mtp_sample_repeat_buf)?;
-    for k in 0..n_verify {
-        let row = logits_view.sub_offset(k * vocab, vocab);
-        mtp_penalty_apply_row(
-            gpu,
-            &state.penalty,
-            &state.mtp_sample_repeat_buf,
-            &row,
-            k,
-            vocab,
-            sampling,
-        )?;
-    }
+    spec_apply_verify_penalties(
+        gpu,
+        &mut state.penalty,
+        &state.mtp_sample_repeat_buf,
+        logits_view,
+        candidates,
+        n_verify,
+        vocab,
+        sampling,
+    )?;
     if t0.is_some() {
         let uploads = u32::from(!state.penalty.tokens().is_empty());
         let launches = (0..n_verify)
@@ -2377,7 +2401,7 @@ fn mtp_verify_accept_impl(
     if use_sampling {
         hit_eos = mtp_sampled_accept(
             gpu,
-            state,
+            &mut state.rng,
             &logits_view,
             draft_softmaxes,
             draft_probs,
@@ -3188,7 +3212,7 @@ pub fn mtp_batched_verify_accept_from_batch(
         let mut accept_count = 0usize;
         let hit_eos = mtp_sampled_accept(
             gpu,
-            state,
+            &mut state.rng,
             &logits_view,
             &draft.draft_softmaxes,
             &draft.draft_probs,
@@ -4836,9 +4860,9 @@ pub fn spec_step_mtp_compressed(
 /// empty). RNG draw count/order is identical to the learned-draft path.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-fn mtp_sampled_accept(
+pub(crate) fn mtp_sampled_accept(
     gpu: &mut Gpu,
-    state: &mut MtpSpecState,
+    rng: &mut MtpRng,
     logits_view: &GpuTensor,
     draft_softmaxes: &[Vec<f32>],
     draft_probs: &[f32],
@@ -4902,7 +4926,7 @@ fn mtp_sampled_accept(
         let target_row_k = target_row_at(k);
         let p_d = draft_probs[k].max(f32::MIN_POSITIVE);
         let p_t = target_row_k[candidates[k] as usize];
-        let u = state.rng.next_uniform_f32();
+        let u = rng.next_uniform_f32();
         if u * p_d <= p_t {
             // Accept.
             committed.push(candidates[k]);
@@ -4916,7 +4940,7 @@ fn mtp_sampled_accept(
             // across the MISMATCHED per-side nuclei. Both rows are full-vocab
             // length `vocab` (different zero-support), so sample_residual's
             // element-wise subtraction is well-formed.
-            let u2 = state.rng.next_uniform_f32();
+            let u2 = rng.next_uniform_f32();
             let bonus = if point_mass {
                 sample_residual_point_mass(&target_row_k, candidates[k], u2)
             } else {
@@ -4935,7 +4959,7 @@ fn mtp_sampled_accept(
         // All `drafts_generated` accepted (and none was EOS): sample the bonus
         // from the target nucleus at position `*accept_count` (== drafts_generated).
         let row = target_row_at(*accept_count);
-        let u = state.rng.next_uniform_f32();
+        let u = rng.next_uniform_f32();
         let bonus = sample_categorical(&row, u);
         committed.push(bonus);
         if bonus == eos_token_id {

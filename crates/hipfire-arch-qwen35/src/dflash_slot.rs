@@ -14,7 +14,8 @@
 //!    `[seed, drafts…]` the caller injects into the next `SlotBatch`.
 //! 2. `dflash_slot_verify_accept` — after the batched forward, norm the
 //!    slot's verify rows out of `pbs.x_batch`, run the trunk lm_head over
-//!    them, greedy-accept the draft prefix, repair the DeltaNet state on a
+//!    them, apply the exact-AR penalty prepass, accept the draft prefix
+//!    (greedy argmax or sampled residual), repair the DeltaNet state on a
 //!    partial accept (snapshot restore + tape replay), and scatter the kept
 //!    rows' extract-layer hiddens from the step's staging into the slot's
 //!    `target_hidden` ring.
@@ -27,11 +28,16 @@
 //!   captured into shared staging by [`crate::forward_slots::SpecVerifyCapture`]
 //!   during the forward and scattered into the slot's interleaved
 //!   `target_hidden` after accept;
-//! * no DDTree, no PLD spine, no CACTUS, no ngram-block, no repeat-penalty —
-//!   the slot path is the DFlash2 selector chain only (the only draft shape
-//!   admitted by [`load_dflash_shared`]);
-//! * greedy verify only (temp==0 admission is enforced by the caller, the
-//!   same gate MTP uses);
+//! * no DDTree, no PLD spine, no CACTUS, no ngram-block — the slot path is
+//!   the DFlash2 selector chain only (the only draft shape admitted by
+//!   [`load_dflash_shared`]);
+//! * greedy AND sampled verify: temp==0 takes the argmax-match prefix rule,
+//!   temp>0 takes point-mass residual acceptance (the selector's proposals
+//!   are deterministic, q = δ(c)), reproducing the AR nucleus exactly like
+//!   the MTP slot path;
+//! * exact-AR token penalties: every verify row is penalized against
+//!   `emitted ‖ earlier drafts` before the accept rule, via the same prepass
+//!   the MTP slot verify uses ([`crate::mtp_spec::spec_apply_verify_penalties`]);
 //! * windowed draft context is honoured for all-sliding DFlash2 drafts
 //!   (their seed backfill is a no-op); split drafts fall back to Legacy
 //!   capped mode because `draft_seed_backfill` needs a host hidden shadow
@@ -41,11 +47,15 @@ use hip_bridge::HipResult;
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::spec::accept_greedy_prefix;
+use hipfire_runtime::spec_sampling::PenaltyHistory;
 use rdna_compute::slot_pool::SlotId;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
 use crate::forward_slots::SpecHiddenCapture;
+use crate::mtp_spec::{
+    mtp_sampled_accept, spec_apply_verify_penalties, MtpRng, MtpSamplingConfig, PENALTY_REPEAT_CAP,
+};
 use crate::qwen35::{DeltaNetState, PrefillBatchScratch, Qwen35Config, Qwen35Weights};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, VerifyScratch};
 
@@ -124,6 +134,23 @@ pub struct DflashSlotState {
     pub seeded_through: usize,
     /// In-flight draft output between the draft step and the verify accept.
     pub draft: Option<DflashSlotDraft>,
+    /// This request's sampling/penalty config, installed by the draft step
+    /// from the admit-parked [`crate::serve_engine`]-side request sampling
+    /// (default neutral until then). Drives the verify accept rule (greedy
+    /// argmax vs point-mass residual sampling) and the penalty prepass.
+    pub sampling: MtpSamplingConfig,
+    /// Per-request exact-AR penalty history (window 0 = penalties inactive).
+    /// The draft step installs `PenaltyHistory::new(w)` and calls
+    /// `begin_window(emitted)` before every verify, mirroring the MTP slot
+    /// path so penalized requests reproduce AR's penalize-then-argmax.
+    pub penalty: PenaltyHistory,
+    /// Device repeat-history buffer for the penalty prepass (raw u32 ids in an
+    /// F32-typed tensor), sized `PENALTY_REPEAT_CAP + block_size + 1` like
+    /// MTP's `mtp_sample_repeat_buf`. Only written when `sampling.penalized()`.
+    pub repeat_buf: GpuTensor,
+    /// Host RNG for the sampled (point-mass residual) accept rule; reseeded
+    /// per request from the parked config. Unused on greedy requests.
+    pub rng: MtpRng,
 }
 
 impl DflashSlotState {
@@ -131,6 +158,7 @@ impl DflashSlotState {
         self.scratch.free_gpu(gpu);
         self.verify_scratch.free_gpu(gpu);
         self.trunk_snap.free_gpu(gpu);
+        let _ = gpu.free_tensor(self.repeat_buf);
         if let Some(d) = self.draft {
             d.free_gpu(gpu);
         }
@@ -378,6 +406,11 @@ pub fn new_dflash_slot_state(
     .map_err(|e| format!("VerifyScratch: {e}"))?;
     let trunk_snap =
         DeltaNetSnapshot::new_for(gpu, dn_state).map_err(|e| format!("DeltaNetSnapshot: {e}"))?;
+    // Penalty repeat-history buffer: base history (≤ PENALTY_REPEAT_CAP) plus
+    // this window's B−1 draft pushes, same sizing as MTP's repeat buffer.
+    let repeat_buf = gpu
+        .alloc_tensor(&[PENALTY_REPEAT_CAP + b + 1], DType::F32)
+        .map_err(|e| format!("DFlash repeat_buf: {e}"))?;
     Ok(DflashSlotState {
         scratch,
         verify_scratch,
@@ -385,6 +418,10 @@ pub fn new_dflash_slot_state(
         session: None,
         seeded_through: 0,
         draft: None,
+        sampling: MtpSamplingConfig::default(),
+        penalty: PenaltyHistory::default(),
+        repeat_buf,
+        rng: MtpRng::new(42),
     })
 }
 
@@ -719,28 +756,74 @@ pub fn dflash_slot_verify_accept(
     )
     .map_err(|e| format!("verify lm_head: {e}"))?;
 
-    // Argmax per verify row, one packed D2H.
-    let argmax_v = st.verify_scratch.argmax.sub_offset(0, n_verify);
-    gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)
-        .map_err(|e| format!("verify argmax: {e}"))?;
-    let mut argmax_host: Vec<i32> = vec![0; n_verify];
-    {
-        let bytes: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, n_verify * 4)
-        };
-        gpu.hip
-            .memcpy_dtoh(bytes, &argmax_v.buf)
-            .map_err(|e| format!("verify argmax dtoh: {e}"))?;
-    }
-    let target_pick: Vec<u32> = argmax_host.into_iter().map(|x| x as u32).collect();
+    // Exact-AR penalties on every verify row before the accept rule reads it
+    // (greedy argmax or sampled nucleus): row k scores c_k under the history
+    // `emitted ‖ c[..k]`. No-op (no upload/launch) unless the request is
+    // penalized. Same prepass the MTP slot verify runs.
+    let candidates = &draft.verify_tokens[1..];
+    spec_apply_verify_penalties(
+        gpu,
+        &mut st.penalty,
+        &st.repeat_buf,
+        &logits_view,
+        candidates,
+        n_verify,
+        vocab,
+        &st.sampling,
+    )
+    .map_err(|e| format!("verify penalties: {e}"))?;
 
-    // Greedy accept: drafts = verify_tokens[1..] (the B−1 proposals);
-    // target_pick[i] is the trunk's pick at verify row i. committed =
-    // accepted drafts + bonus (seed excluded — it was committed last cycle).
-    let accepted =
-        accept_greedy_prefix(&draft.verify_tokens[1..], &target_pick, Some(eos_token_id));
-    let mut committed = accepted.committed;
-    let mut hit_eos = accepted.hit_eos;
+    // Accept. Greedy: argmax per verify row (one packed D2H), host prefix
+    // rule. Sampled (temp > 0): point-mass residual acceptance — the DFlash2
+    // selector's proposals are deterministic (q = δ(c)), the same draft shape
+    // the MTP path handles for external ngram/PLD takeovers — so the committed
+    // stream follows the penalized AR nucleus instead of collapsing to the
+    // greedy chain. Both exclude the seed and include the bonus.
+    let drafts_generated = n_verify - 1;
+    let (mut committed, mut hit_eos) = if st.sampling.is_greedy() {
+        let argmax_v = st.verify_scratch.argmax.sub_offset(0, n_verify);
+        gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)
+            .map_err(|e| format!("verify argmax: {e}"))?;
+        let mut argmax_host: Vec<i32> = vec![0; n_verify];
+        {
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, n_verify * 4)
+            };
+            gpu.hip
+                .memcpy_dtoh(bytes, &argmax_v.buf)
+                .map_err(|e| format!("verify argmax dtoh: {e}"))?;
+        }
+        let target_pick: Vec<u32> = argmax_host.into_iter().map(|x| x as u32).collect();
+        // target_pick[i] is the trunk's pick at verify row i; committed =
+        // accepted drafts + bonus (seed was committed last cycle).
+        let accepted = accept_greedy_prefix(candidates, &target_pick, Some(eos_token_id));
+        (accepted.committed, accepted.hit_eos)
+    } else {
+        let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
+        let mut accept_count = 0usize;
+        // Point-mass draft distribution: q(c_k) = 1 for every proposal.
+        let draft_probs = vec![1.0f32; drafts_generated];
+        let hit_eos = mtp_sampled_accept(
+            gpu,
+            &mut st.rng,
+            &logits_view,
+            &[],
+            &draft_probs,
+            candidates,
+            drafts_generated,
+            vocab,
+            /* point_mass */ true,
+            st.sampling.temp,
+            st.sampling.top_p,
+            st.sampling.top_k,
+            st.sampling.min_p,
+            eos_token_id,
+            &mut committed,
+            &mut accept_count,
+        )
+        .map_err(|e| format!("verify sampled accept: {e}"))?;
+        (committed, hit_eos)
+    };
 
     // Clamp to the commit budget and truncate on an auxiliary eot inside the
     // kept prefix — mirrors mtp_batched_verify_accept_from_batch exactly so

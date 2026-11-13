@@ -604,9 +604,7 @@ mod tests {
             decoding,
             vl_prefill: None,
             spec,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: crate::spec_retire::SpecRetire::default(),
             pos3_delta: 0,
         }
     }
