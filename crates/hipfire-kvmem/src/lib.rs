@@ -246,6 +246,8 @@ mod ffi {
             capacity: u32,
         ) -> u32;
         pub fn hk_kv_store_set_retrieval_scores(ks: *mut HkKvStore, scores: *const f64, n: u32);
+        pub fn hk_kv_store_begin_retrieval_round(ks: *mut HkKvStore);
+        pub fn hk_kv_store_commit_retrieval_round(ks: *mut HkKvStore) -> c_int;
         pub fn hk_kv_store_prefill_needs_offload(
             ks: *const HkKvStore,
             resident_tokens: u32,
@@ -571,6 +573,25 @@ impl KvStore {
         checked(|| unsafe {
             ffi::hk_kv_store_set_retrieval_scores(p, scores.as_ptr(), scores.len() as u32)
         })
+    }
+
+    /// Open an LRFU retrieval round. No-op (and error-free) when lrfu is off, so
+    /// the default Retrieval path is unaffected. Must precede set_retrieval_scores
+    /// when lrfu is on; pair with commit_retrieval_round after pick_topk_blocks.
+    pub fn begin_retrieval_round(&self) -> Result<()> {
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe { ffi::hk_kv_store_begin_retrieval_round(p) })
+    }
+
+    /// Close the round and reward the picked blocks. Returns Ok(false) when lrfu
+    /// is off (nothing committed); Ok(true) when a round was committed.
+    pub fn commit_retrieval_round(&self) -> Result<bool> {
+        let p = self.ptr.as_ptr();
+        let mut committed = false;
+        checked(|| unsafe {
+            committed = ffi::hk_kv_store_commit_retrieval_round(p) != 0;
+        })?;
+        Ok(committed)
     }
 
     pub fn prefill_needs_offload(
