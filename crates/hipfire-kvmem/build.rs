@@ -83,6 +83,9 @@ fn main() {
         .warnings(false)
         .flag_if_supported("-O2")
         .flag_if_supported("-fno-strict-aliasing")
+        // Enable `#pragma omp simd` reductions in the host recall kernels
+        // (page-softmax dot product). SIMD-only: no OpenMP runtime is linked.
+        .flag_if_supported("-fopenmp-simd")
         .include(&include)
         .include(&shim_dir)
         .include(&host_src);
