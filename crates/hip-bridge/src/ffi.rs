@@ -3903,6 +3903,50 @@ impl HipRuntime {
         self.check(code, "hipMemcpyAsync H2D offset")
     }
 
+    /// [`Self::memcpy_htod_async_at`] with an optional stream: `None` orders the
+    /// copy on the legacy null stream, for callers that have no stream installed
+    /// yet (e.g. KV residency transfers during prefill, before decode-graph
+    /// capture installs one). A pinned `src` makes this a plain stream-ordered
+    /// DMA; the caller keeps `src` unchanged until the stream reaches the copy.
+    pub fn memcpy_htod_async_at_on(
+        &self,
+        dst: &DeviceBuffer,
+        offset: usize,
+        src: &[u8],
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        self.plan_deny("hipMemcpyAsync H2D offset")?;
+        if hip_fault_consume(0, "upload") {
+            return Err(hip_fault_err("upload"));
+        }
+        if stream.is_none() {
+            crate::null_stream::note("hipMemcpyAsync H2D offset", std::panic::Location::caller());
+        }
+        assert!(
+            offset + src.len() <= dst.size,
+            "offset ({}) + source ({}) exceeds device buffer ({})",
+            offset,
+            src.len(),
+            dst.size
+        );
+        let span = sites::begin();
+        // SAFETY: the byte offset was bounds-checked against the DeviceBuffer size;
+        // `u8::add` stays in the same live allocation. Same-device/stream and
+        // host-buffer lifetime across the async copy are the caller's contract.
+        let code = unsafe {
+            (self.fn_memcpy_async)(
+                (dst.ptr as *mut u8).add(offset) as *mut c_void,
+                src.as_ptr() as *const c_void,
+                src.len(),
+                MemcpyKind::HostToDevice as c_uint,
+                stream.map_or(ptr::null_mut(), |s| s.0),
+            )
+        };
+        sites::end(span, SiteApi::MemcpyAsync, SiteDir::HtoD, src.len());
+        memory_effects::htod();
+        self.check(code, "hipMemcpyAsync H2D offset")
+    }
+
     /// Host-asynchronous H→D copy ordered on `stream` (`None` = the legacy
     /// stream, only when the caller has no stream). `src` must stay unchanged
     /// until the stream reaches the copy; a pinned `src` makes this a plain
@@ -3972,6 +4016,49 @@ impl HipRuntime {
         sites::end(span, SiteApi::MemcpyAsync, SiteDir::DtoH, dst.len());
         memory_effects::dtoh();
         self.check(code, "hipMemcpyAsync D2H")
+    }
+
+    /// [`Self::memcpy_dtoh_async`] from `src[src_offset..src_offset + dst.len()]`.
+    /// Ordered on `stream` (`None` = the legacy null stream, for callers with no
+    /// stream installed yet — e.g. KV residency transfers during prefill, before
+    /// decode-graph capture installs one). A pinned `dst` makes this a plain
+    /// stream-ordered DMA. The caller keeps `dst` unchanged until the stream
+    /// reaches the copy.
+    pub fn memcpy_dtoh_async_at(
+        &self,
+        dst: &mut [u8],
+        src: &DeviceBuffer,
+        src_offset: usize,
+        stream: Option<&Stream>,
+    ) -> HipResult<()> {
+        self.plan_deny("hipMemcpyAsync D2H offset")?;
+        if stream.is_none() {
+            crate::null_stream::note("hipMemcpyAsync D2H offset", std::panic::Location::caller());
+        }
+        assert!(
+            src_offset + dst.len() <= src.size,
+            "src_offset ({}) + dst len ({}) exceeds device buffer ({})",
+            src_offset,
+            dst.len(),
+            src.size
+        );
+        let span = sites::begin();
+        // SAFETY: the byte offset was bounds-checked against the DeviceBuffer
+        // size; `u8::add` stays in the same live allocation. Same-device/stream
+        // and host-buffer lifetime across the async copy are the caller's
+        // contract; Rust does not deref device ptrs.
+        let code = unsafe {
+            (self.fn_memcpy_async)(
+                dst.as_mut_ptr() as *mut c_void,
+                (src.ptr as *const u8).add(src_offset) as *const c_void,
+                dst.len(),
+                MemcpyKind::DeviceToHost as c_uint,
+                stream.map_or(ptr::null_mut(), |s| s.0),
+            )
+        };
+        sites::end(span, SiteApi::MemcpyAsync, SiteDir::DtoH, dst.len());
+        memory_effects::dtoh();
+        self.check(code, "hipMemcpyAsync D2H offset")
     }
 
     /// Async D→D copy with optional offsets on both sides. Ordered on
