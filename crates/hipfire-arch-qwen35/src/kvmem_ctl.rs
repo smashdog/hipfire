@@ -44,8 +44,8 @@
 use std::path::PathBuf;
 
 use hipfire_kvmem::{
-    mean_key_retrieval_scores, GqaAggregation, KvStore, KvStoreConfig, RawStore, RawStoreConfig,
-    Storage,
+    mean_key_retrieval_scores, page_softmax_scores, GqaAggregation, KvStore, KvStoreConfig, RawStore,
+    RawStoreConfig, Storage,
 };
 use rdna_compute::page_pool::SPILLED_PAGE;
 use rdna_compute::slot_pool::{SlotId, SlotPool};
@@ -284,6 +284,16 @@ struct SlotState {
     /// follow-up question about a fact in a spilled page answers from
     /// whatever the last turn happened to keep.
     first_decode_done: bool,
+    /// Query-span host ring (only allocated when `query_span > 1`): layer-major
+    /// `[n_fa_layers × query_span × q_width]` F32 post-RMSNorm/pre-RoPE Q rows.
+    /// Each fed step appends the slot's tapped last Q row per layer; the ring
+    /// keeps the most recent `query_span` rows for page-softmax scoring. Empty
+    /// when `query_span == 1` (the mean-K path reads the tap directly).
+    q_ring: Vec<f32>,
+    /// Valid rows in `q_ring` (`<= query_span`); shared across layers.
+    q_ring_len: usize,
+    /// Next write slot in `q_ring` (`0..query_span`); shared across layers.
+    q_ring_cursor: usize,
 }
 
 /// Per-slot residency plan for one step.
@@ -338,6 +348,17 @@ pub struct KvMemCtl {
     /// residency more conservative than the default, never overshoot the pool.
     /// `None` (default) keeps the historical single-threshold budget behaviour.
     watermark: Option<(usize, usize)>,
+    /// Resolved `HIPFIRE_KVMEM_QUERY_SPAN` (default 1, range 1..=512). At 1 the
+    /// retrieval query is the single tapped last Q row scored by
+    /// `mean_key_retrieval_scores` (byte-identical to the historical path). At
+    /// >1 the per-slot host ring accumulates recent Q rows and selection scores
+    /// blocks by `page_softmax_scores` over that span.
+    query_span: usize,
+    /// Page-softmax query staging (only sized when `query_span > 1`):
+    /// layer-major `[n_fa_layers × query_span × q_width]` chronological Q rows.
+    q_span: Vec<f32>,
+    /// Per-layer present row count for the page-softmax view (`query_span > 1`).
+    q_layer_rows: Vec<u32>,
 }
 
 impl KvMemCtl {
@@ -422,6 +443,15 @@ impl KvMemCtl {
             ));
         }
 
+        // Query span: 1 keeps the single-row mean-K retrieval (byte-identical);
+        // >1 accumulates a per-slot host Q ring and scores by page-softmax.
+        let query_span = env_usize("HIPFIRE_KVMEM_QUERY_SPAN").unwrap_or(1);
+        if !(1..=512).contains(&query_span) {
+            return Err(format!(
+                "kvmem: HIPFIRE_KVMEM_QUERY_SPAN={query_span} out of range [1,512]"
+            ));
+        }
+
         let kv_cfg = KvStoreConfig {
             block_tokens: KV_BLOCK_TOKENS as u32,
             select_budget: budget_tokens,
@@ -456,6 +486,11 @@ impl KvMemCtl {
         .map_err(|e| format!("kvmem storage: {e}"))?;
 
         let mut slots = Vec::with_capacity(n_slots);
+        let ring_cap = if query_span > 1 {
+            geom.n_fa_layers * query_span * q_width
+        } else {
+            0
+        };
         for _ in 0..n_slots {
             slots.push(SlotState {
                 raw: RawStore::new(raw_cfg, Some(&storage))
@@ -465,6 +500,9 @@ impl KvMemCtl {
                 fed: 0,
                 turn_start: 0,
                 first_decode_done: false,
+                q_ring: vec![0f32; ring_cap],
+                q_ring_len: 0,
+                q_ring_cursor: 0,
             });
         }
 
@@ -497,12 +535,12 @@ impl KvMemCtl {
         };
 
         if (time_flag() || env_flag("HIPFIRE_KVMEM_TRACE"))
-            && (lrfu || select_method != 0 || watermark_enabled)
+            && (lrfu || select_method != 0 || watermark_enabled || query_span > 1)
         {
             eprintln!(
                 "[kvmem] policy: select_method={select_method} lrfu={lrfu} \
                  lambda={lrfu_lambda} top={lrfu_top} watermark={watermark:?} \
-                 budget_blocks={}",
+                 query_span={query_span} budget_blocks={}",
                 plan.budget_blocks
             );
         }
@@ -532,6 +570,9 @@ impl KvMemCtl {
             batch_xfer: batch_xfer_flag(),
             select_method,
             watermark,
+            query_span,
+            q_span: vec![0f32; ring_cap],
+            q_layer_rows: vec![0u32; if query_span > 1 { geom.n_fa_layers } else { 0 }],
         })
     }
 
@@ -562,6 +603,16 @@ impl KvMemCtl {
             fed: 0,
             turn_start: 0,
             first_decode_done: false,
+            q_ring: vec![
+                0f32;
+                if self.query_span > 1 {
+                    self.n_fa_layers * self.query_span * self.q_width
+                } else {
+                    0
+                }
+            ],
+            q_ring_len: 0,
+            q_ring_cursor: 0,
         };
         Ok(())
     }
@@ -577,6 +628,9 @@ impl KvMemCtl {
             .ok_or_else(|| format!("kvmem: begin_request slot {slot} out of range"))?;
         st.turn_start = st.fed;
         st.first_decode_done = false;
+        // A new turn's question must not inherit the previous turn's Q span.
+        st.q_ring_len = 0;
+        st.q_ring_cursor = 0;
         Ok(st.fed)
     }
 
@@ -636,6 +690,23 @@ impl KvMemCtl {
             .register_append(n_rows as u32)
             .map_err(|e| format!("kvmem register append: {e}"))?;
         st.fed = (pos0 + n_rows) as u32;
+        // Query-span ring: append this step's tapped last Q row per layer so the
+        // next selection round can score blocks against a span of recent query
+        // rows. No-op at query_span == 1 (the mean-K path reads the tap directly
+        // at selection time), keeping the default byte-neutral.
+        if self.query_span > 1 {
+            let span = self.query_span;
+            let qw = self.q_width;
+            let cursor = st.q_ring_cursor;
+            for il in 0..n_fa {
+                taps.read_q_slot(gpu, il, slot, &mut self.q_row)
+                    .map_err(|e| format!("kvmem q tap read (layer {il}): {e:?}"))?;
+                let dst = il * span * qw + cursor * qw;
+                st.q_ring[dst..dst + qw].copy_from_slice(&self.q_row);
+            }
+            st.q_ring_cursor = (cursor + 1) % span;
+            st.q_ring_len = (st.q_ring_len + 1).min(span);
+        }
         if trace {
             eprintln!(
                 "[kvmem] slot {slot} feed rows {pos0}..{} ({n_rows})",
@@ -654,10 +725,11 @@ impl KvMemCtl {
         Ok(())
     }
 
-    /// Refresh the retrieval query for `slot` from the tap and score its
-    /// resident+spilled blocks. Each layer contributes its tapped last Q row
+    /// Refresh the retrieval query for `slot` and score its resident+spilled
+    /// blocks. At `query_span == 1` each layer contributes its tapped last Q row
     /// (post-RMSNorm, pre-RoPE, one token) — the frame
-    /// `mean_key_retrieval_scores` expects.
+    /// `mean_key_retrieval_scores` expects. At `query_span > 1` the per-slot host
+    /// ring supplies a span of recent Q rows scored by `page_softmax_scores`.
     fn refresh_scores(
         &mut self,
         gpu: &Gpu,
@@ -665,6 +737,65 @@ impl KvMemCtl {
         slot: usize,
         pages: usize,
     ) -> Result<Vec<f64>, String> {
+        // Query span > 1: score blocks by page-softmax over the ring's recent Q
+        // rows instead of the single-row mean-K cosine. The span == 1 path below
+        // is untouched, so the default stays byte-identical.
+        if self.query_span > 1 {
+            let span = self.query_span;
+            let qw = self.q_width;
+            let n_fa = self.n_fa_layers;
+            let st = &self.slots[slot];
+            let len = st.q_ring_len;
+            if len == 0 {
+                return Err(format!(
+                    "kvmem slot {slot}: query span empty at selection (no fed Q rows)"
+                ));
+            }
+            let cursor = st.q_ring_cursor;
+            // Extract the ring's valid rows in chronological order, layer-major
+            // ([layer × row × q_width]) — the PageQueryView data layout.
+            for il in 0..n_fa {
+                for t in 0..len {
+                    let src = (cursor + span - len + t) % span;
+                    let s0 = il * span * qw + src * qw;
+                    let d0 = il * len * qw + t * qw;
+                    self.q_span[d0..d0 + qw].copy_from_slice(&st.q_ring[s0..s0 + qw]);
+                }
+                self.q_layer_rows[il] = len as u32;
+            }
+            let accepted = st.fed as u64;
+            let sink = self.kv_cfg.sink_blocks;
+            let recent = self.kv_cfg.recent_blocks;
+            let budget = self.budget_blocks as u32;
+            let scores = page_softmax_scores(
+                &st.raw,
+                pages as u32,
+                accepted,
+                KV_BLOCK_TOKENS as u32,
+                budget,
+                sink,
+                recent,
+                &self.q_span[..n_fa * len * qw],
+                &self.q_layer_rows,
+                n_fa as u32,
+                len as u32,
+                self.n_heads as u32,
+                self.n_kv_heads as u32,
+                self.head_dim as u32,
+                0.0,
+                GqaAggregation::Mean,
+            )
+            .map_err(|e| format!("kvmem page-softmax scores: {e}"))?;
+            if self.trace {
+                let sum: f64 = scores.iter().sum();
+                let top = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                eprintln!(
+                    "[kvmem] slot {slot} query-span: rows={len} pages={pages} \
+                     score_sum={sum:.4} top={top:.4}"
+                );
+            }
+            return Ok(scores);
+        }
         for il in 0..self.n_fa_layers {
             taps.read_q_slot(gpu, il, slot, &mut self.q_row)
                 .map_err(|e| format!("kvmem q tap read (layer {il}): {e:?}"))?;
