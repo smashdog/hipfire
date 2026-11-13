@@ -124,6 +124,9 @@ pub mod norm;
 pub mod npu_trunk;
 mod packed_mq4;
 pub mod page_pool;
+/// Layerwise packed-page composite-slot pool + arena geometry (Phase 3.2 ①地基).
+/// Clean sibling to `page_pool`/`slot_pool`; not wired into live serve in ①.
+pub mod layerwise_pool;
 pub mod plan_sink;
 pub mod pm4_ledger;
 pub mod pm_decode_twins;

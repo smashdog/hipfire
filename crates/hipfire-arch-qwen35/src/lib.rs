@@ -115,6 +115,11 @@ pub mod kvmem_taps;
 /// `HIPFIRE_KVMEM=1`; requires the paged Q8 pool.
 #[cfg(all(feature = "deltanet", feature = "kvmem"))]
 pub mod kvmem_ctl;
+/// Layerwise Q8 packed-page layout adapter (Phase 3.2 ①地基): bridges hipfire Q8
+/// geometry to the core generic `PayloadLayout` manifest + the crate-agnostic
+/// packed arena. Clean sibling to `kvmem_ctl`; not wired into live serve in ①.
+#[cfg(feature = "kvmem")]
+pub mod layerwise_layout;
 #[cfg(feature = "deltanet")]
 pub(crate) mod layer_driver;
 #[cfg(feature = "deltanet")]

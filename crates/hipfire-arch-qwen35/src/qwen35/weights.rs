@@ -4415,6 +4415,8 @@ mod dense_shared_tests {
             w_gate: a.weight(DType::MQ4G256, 16, 8),
             w_up: a.weight(DType::MQ4G256, 16, 8),
             w_down: a.weight(DType::MQ4G256, 8, 16),
+            biases: None,
+            escha: None,
         };
         let mut wq = a.weight(DType::MQ4G256, 8, 8);
         wq.awq_scale = Some(a.tensor(&[8], DType::F16, 16));
@@ -4430,6 +4432,8 @@ mod dense_shared_tests {
             w_gate: a.weight(DType::MQ4G256, 16, 8),
             w_up: a.weight(DType::MQ4G256, 16, 8),
             w_down: a.weight(DType::MQ4G256, 8, 16),
+            biases: None,
+            escha: None,
         };
         Qwen35Weights {
             token_embd,
