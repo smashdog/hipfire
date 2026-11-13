@@ -3548,9 +3548,7 @@ pub fn drive_qwen_vmm_continuous_batch(
         decoding: false,
         vl_prefill: None,
         spec: SpecKind::None,
-        spec_cycles: 0,
-        spec_committed: 0,
-        spec_retire_fails: 0,
+        spec_retire: hipfire_runtime::spec_retire::SpecRetire::default(),
         pos3_delta: 0,
     };
     const IDLE: RequestEpoch = RequestEpoch {

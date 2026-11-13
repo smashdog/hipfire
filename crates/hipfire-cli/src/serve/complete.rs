@@ -2448,11 +2448,12 @@ pub(crate) fn complete_request_attempt(
             // Penalty knobs are forwarded as-is: the slot sampler applies
             // repeat/presence/frequency penalties and min_p exactly like the
             // sequential path (repeat/presence/frequency in-kernel over a
-            // per-slot recent-token window; min_p in the top-p tail). A
-            // penalized request decodes as plain AR on the slot engine —
-            // MTP verify accept is a bare greedy argmax and cannot reproduce
-            // penalize-then-argmax — which is the same trade the sequential
-            // MTP path makes.
+            // per-slot recent-token window; min_p in the top-p tail). The spec
+            // drafters honor them too: MTP and DFlash2 verify run the exact-AR
+            // penalty prepass before acceptance (greedy argmax, or residual /
+            // point-mass sampled acceptance for temp > 0), so a penalized or
+            // sampled request stays on the spec path instead of falling back
+            // to AR.
             // Re-check the fully projected wire request, not only the raw HTTP
             // body: registry/config defaults may have inserted a
             // reasoning control the slot sampler cannot honor.

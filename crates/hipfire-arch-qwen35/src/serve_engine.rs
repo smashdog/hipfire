@@ -498,9 +498,10 @@ struct ModelRig {
     /// Per-slot MTP spec state. None for slots that haven't started MTP yet
     /// or when MTP is off. Allocated lazily on first MTP prefill.
     mtp_states: Vec<Option<crate::mtp_spec::MtpSpecState>>,
-    /// Per-slot MTP request sampling/penalty config, installed at admit and
-    /// applied on the slot's first draft step (see [`MtpReqSampling`]).
-    mtp_req_sampling: Vec<Option<MtpReqSampling>>,
+    /// Per-slot spec request sampling/penalty config (MTP and DFlash alike),
+    /// parked at admit and applied on the slot's first draft step (see
+    /// [`MtpReqSampling`]).
+    spec_req_sampling: Vec<Option<MtpReqSampling>>,
     /// Batched scratch (+ per-row FWHT-rot buffer) for MTP head-KV prefill
     /// from the scheduler's batched prompt chunks. None when MTP is off.
     mtp_prefill_batched: Option<(crate::mtp_head::Qwen35MtpHeadBatchedScratch, GpuTensor)>,
@@ -518,6 +519,11 @@ struct ModelRig {
     /// both exist — the tape stride and graph-shape check use this uniform
     /// width).
     spec_rows: usize,
+    /// Resolved spec → AR retirement break-even line, shared with the
+    /// sequential drafter ([`hipfire_runtime::spec_retire`]). Parsed once at
+    /// load from `HIPFIRE_SPEC_RETIRE` (else the shared default); `None`
+    /// never retires. Installed per request at admit into `PendingWork`.
+    spec_retire_break_even: Option<hipfire_runtime::spec_retire::BreakEven>,
     /// Shared DFlash2 draft state (weights + hidden staging). None when
     /// DFlash is off.
     dflash: Option<crate::dflash_slot::DflashShared>,
@@ -2123,6 +2129,21 @@ impl Rig {
         // therefore not a sound deadline base (spec §5.3 S3).
         let wait_queue = WaitQueue::new(cfg.wait_max_count, cfg.wait_max_bytes, u64::MAX)
             .map_err(|e| format!("wait queue: {e}"))?;
+        // Spec → AR retirement line, shared with the sequential drafter:
+        // `HIPFIRE_SPEC_RETIRE` when set, else the shared default. A malformed
+        // value turns retirement off and says so, rather than guessing a line
+        // (mirrors hipfire-generate's `spec_retire_break_even`). The slot
+        // engine states no drafter-specific measured line of its own.
+        let spec_retire_break_even = {
+            let raw = hipfire_config::developer_var("HIPFIRE_SPEC_RETIRE").ok();
+            match hipfire_runtime::spec_retire::parse_break_even(raw.as_deref()) {
+                Ok(parsed) => hipfire_runtime::spec_retire::resolve_break_even(parsed, None),
+                Err(e) => {
+                    eprintln!("[spec-retire] {e}; retirement off");
+                    None
+                }
+            }
+        };
         Ok(Rig {
             gpu,
             tokenizer,
@@ -2140,12 +2161,13 @@ impl Rig {
                 logits_out,
                 mtp_head,
                 mtp_states: (0..cfg.n_slots).map(|_| None).collect(),
-                mtp_req_sampling: (0..cfg.n_slots).map(|_| None).collect(),
+                spec_req_sampling: (0..cfg.n_slots).map(|_| None).collect(),
                 mtp_prefill_batched,
                 spec_verify_tape,
                 mtp_prefill_hidden,
                 mtp_k,
                 spec_rows,
+                spec_retire_break_even,
                 dflash,
                 dflash_states: (0..cfg.n_slots).map(|_| None).collect(),
                 vision_weights,
@@ -2819,7 +2841,7 @@ impl ModelRig {
         // a cold admit's state only exists from now on). `set_sampling`
         // reseeds the draft RNG, so it runs exactly once per request — the
         // per-window penalty history is rebuilt from `emitted` below instead.
-        let mut req_sampling = self.mtp_req_sampling[slot.0].take();
+        let mut req_sampling = self.spec_req_sampling[slot.0].take();
         if let Some(cfg) = req_sampling.as_mut() {
             if !cfg.applied {
                 state.set_sampling(cfg.sampling, cfg.rng_seed);
@@ -2874,7 +2896,7 @@ impl ModelRig {
         })();
 
         self.mtp_states[slot.0] = Some(state);
-        self.mtp_req_sampling[slot.0] = req_sampling;
+        self.spec_req_sampling[slot.0] = req_sampling;
         outcome
     }
 }
@@ -2987,6 +3009,7 @@ impl ModelRig {
         mut gpu: &mut Gpu,
         slot: SlotId,
         work: &mut PendingWork,
+        emitted: &[u32],
     ) -> Result<crate::dflash_slot::DflashSlotDraft, String> {
         let shared = self
             .dflash
@@ -2995,6 +3018,30 @@ impl ModelRig {
         let mut st = self.dflash_states[slot.0]
             .take()
             .ok_or_else(|| "dflash_draft_step: slot state missing (admit bug)".to_string())?;
+
+        // Install this request's sampling/penalty config (parked by admit),
+        // exactly like the MTP draft step: reseed the accept RNG once per
+        // request, then rebuild the penalty history from `emitted` every
+        // window. DFlash's draft proposals are deterministic, so only the
+        // verify accept consumes the sampling/penalty state.
+        let mut req_sampling = self.spec_req_sampling[slot.0].take();
+        if let Some(cfg) = req_sampling.as_mut() {
+            if !cfg.applied {
+                st.sampling = cfg.sampling;
+                st.rng = crate::mtp_spec::MtpRng::new(cfg.rng_seed);
+                if cfg.sampling.penalized() {
+                    st.penalty = hipfire_runtime::spec_sampling::PenaltyHistory::new(
+                        cfg.sampling.repeat_window,
+                    );
+                    st.penalty.set_prompt(&cfg.prompt_tail);
+                }
+                cfg.applied = true;
+            }
+            if cfg.sampling.penalized() {
+                // Row k of this window scopes `suffix_W(emitted ‖ c[..k])`.
+                st.penalty.begin_window(emitted);
+            }
+        }
 
         let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
         let pos = work.next_pos;
@@ -3018,6 +3065,7 @@ impl ModelRig {
         })();
 
         self.dflash_states[slot.0] = Some(st);
+        self.spec_req_sampling[slot.0] = req_sampling;
         outcome
     }
 }
@@ -3267,13 +3315,13 @@ fn clear_work_slot(work: &mut PendingWork) {
     work.vl_prefill = None;
     work.spec = SpecKind::None;
     work.pos3_delta = 0;
-    // Adaptive-retire counters are per-REQUEST state: a request that ends
-    // mid-window must not leave its failures behind for the slot's next
-    // occupant (one bad window would sit one failure from retirement, and
-    // the next request's window mean would mix both requests' advances).
-    work.spec_cycles = 0;
-    work.spec_committed = 0;
-    work.spec_retire_fails = 0;
+    // The retirement policy is per-REQUEST state: a request that ends
+    // mid-window must not leave its cycles/failures behind for the slot's
+    // next occupant (one bad window would sit one failure from retirement,
+    // and the next request's window mean would mix both requests' advances).
+    // `reset` keeps the resolved break-even line, which is re-installed at
+    // admit anyway.
+    work.spec_retire.reset();
 }
 
 /// Release a request's prefix-cache pin on every terminal path (spec §4.4
@@ -3395,28 +3443,15 @@ fn execute_cow_copies(rig: &Rig, plan: &rdna_compute::page_pool::CowPlan) -> boo
 /// batched forward provisions `set_seq_len(max_pos + 1)` before its KV write
 /// and fails the whole step closed when that exceeds the cap, which rejects
 /// every active slot; MTP must retire before drafting instead.
-/// Rolling adaptive-retire window (cycles) before MTP may retire a slot for
-/// low acceptance, and the minimum mean advance (committed tokens per cycle)
-/// the head must sustain to stay on the spec path. An MTP cycle costs roughly
-/// twice an AR step (draft + verify over k+1 rows), so a mean advance below
-/// ~2.2 loses wall-clock (measured MTP cycle ≈ 2.3x an AR step on
-/// gfx1101/ornith-1.5-9b); code sustains ~2.8 (stays on MTP) while prose
-/// sits at ~1.9 and retires to AR.
-pub const MTP_RETIRE_WINDOW: usize = 32;
-pub const MTP_RETIRE_MIN_ADVANCE: f64 = 2.2;
-/// Consecutive failed windows required before retiring. One bad window is
-/// normal even on high-acceptance workloads (a template-y or low-confidence
-/// opening); two in a row means the head genuinely cannot pay for the cycle.
-pub const MTP_RETIRE_WINDOWS: usize = 2;
-
 fn spec_verify_fits_cap(next_pos: usize, verify_rows: usize, cap_tokens: usize) -> bool {
     verify_rows <= cap_tokens.saturating_sub(next_pos)
 }
 
-/// True when the request carries a non-neutral token penalty. Such requests
-/// decode as plain AR when MTP would otherwise be available: the verify accept
-/// compares draft tokens against a bare greedy argmax over unpenalized logits,
-/// which cannot reproduce penalize-then-argmax.
+/// True when the request carries a non-neutral token penalty. Both spec
+/// drafters (MTP and DFlash2) now honor penalties in their verify accept
+/// (exact-AR penalty prepass before acceptance), so this no longer gates
+/// admission — it is retained for the admit slot-trace and any diagnostic
+/// that needs to know whether a request's logits will be penalized.
 ///
 /// `repeat_window == 0` does NOT neutralize the penalties: OpenAI-style
 /// presence/frequency penalties are defined over the whole context, so a zero
@@ -3446,17 +3481,6 @@ fn effective_repeat_window(
     } else {
         w
     }
-}
-
-/// True when the request asks for real sampling (temperature > 0).
-///
-/// Sampled requests now run MTP through residual acceptance
-/// (`mtp_sampled_accept` with the draft nucleus), which reproduces the AR
-/// distribution. The predicate survives for the routes that still require a
-/// deterministic greedy chain: the DFlash2 slot draft, and the prefix-resume
-/// drafter plan (a resumed request's head KV is zero for the reused span).
-fn request_sampled(req: &SubmitRequest) -> bool {
-    req.temperature > 0.0
 }
 
 /// Install a request's sampling parameters (including token penalties and
@@ -4148,9 +4172,7 @@ fn run_loop(
             decoding: false,
             vl_prefill: None,
             spec: SpecKind::None,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: hipfire_runtime::spec_retire::SpecRetire::default(),
             pos3_delta: 0,
         })
         .collect();
@@ -4510,11 +4532,12 @@ fn run_loop(
                         let seed = work[s].remaining_prompt.last().copied();
                         // Token penalties scope the verify rows against this
                         // request's emitted history (`sess.tokens` past the
-                        // rendered prompt); only penalized MTP requests need
-                        // it, so the others skip the copy.
+                        // rendered prompt); only penalized spec requests need
+                        // it, so the others skip the copy. MTP and DFlash share
+                        // the parked config and the same penalty prepass.
                         let emitted: Vec<u32> = match work[s].spec {
-                            SpecKind::Mtp => {
-                                let pl = rig.model.mtp_req_sampling[s]
+                            SpecKind::Mtp | SpecKind::Dflash => {
+                                let pl = rig.model.spec_req_sampling[s]
                                     .as_ref()
                                     .filter(|c| c.sampling.penalized())
                                     .map(|c| c.prompt_len);
@@ -4538,7 +4561,7 @@ fn run_loop(
                                 .map(SpecDraftRows::Mtp),
                             SpecKind::Dflash => rig
                                 .model
-                                .dflash_draft_step(&mut rig.gpu, SlotId(s), &mut work[s])
+                                .dflash_draft_step(&mut rig.gpu, SlotId(s), &mut work[s], &emitted)
                                 .map(SpecDraftRows::Dflash),
                             SpecKind::None => {
                                 unreachable!("spec.active() gate above")
@@ -5798,46 +5821,38 @@ fn run_loop(
                                     break;
                                 }
                             }
-                            // Adaptive retire: a head that cannot sustain the
-                            // minimum mean advance loses wall-clock on the spec
-                            // cycle (~2x an AR step). Fall back to plain AR for
-                            // the rest of this request. The last committed token
-                            // is already in remaining_prompt; the scheduler picks
-                            // the slot up as a regular decode row next step.
+                            // Adaptive retire (shared `SpecRetire`, the same
+                            // policy the sequential drafter uses): a head that
+                            // cannot sustain the break-even advance loses
+                            // wall-clock on the spec cycle (~2x an AR step).
+                            // Fall back to plain AR for the rest of this
+                            // request. Applies to MTP and DFlash2 alike. The
+                            // last committed token is already in
+                            // remaining_prompt; the scheduler picks the slot up
+                            // as a regular decode row next step.
                             if slots[s].is_some() && work[s].spec.active() {
-                                work[s].spec_cycles += 1;
-                                work[s].spec_committed += tokens.len();
-                                if work[s].spec_cycles >= MTP_RETIRE_WINDOW {
-                                    let mean =
-                                        work[s].spec_committed as f64 / work[s].spec_cycles as f64;
-                                    // Reset the window each time it fills; only a
-                                    // SECOND consecutive failure retires.
-                                    work[s].spec_cycles = 0;
-                                    work[s].spec_committed = 0;
-                                    if mean < MTP_RETIRE_MIN_ADVANCE {
-                                        work[s].spec_retire_fails += 1;
-                                    } else {
-                                        work[s].spec_retire_fails = 0;
-                                    }
-                                    if work[s].spec_retire_fails >= MTP_RETIRE_WINDOWS {
-                                        if rig.gpu.slot_trace() {
-                                            eprintln!(
-                                            "[slot-trace] MTP retired for slot {s}: mean advance {mean:.2} over {} consecutive windows",
-                                            MTP_RETIRE_WINDOWS
+                                let position = work[s].next_pos;
+                                let kind = work[s].spec;
+                                if work[s].spec_retire.observe(
+                                    tokens.len(),
+                                    rig.model.spec_rows,
+                                    position,
+                                ) {
+                                    if rig.gpu.slot_trace() {
+                                        eprintln!(
+                                            "[slot-trace] {kind:?} retired for slot {s} at position {position} (break-even policy)",
                                         );
-                                        }
-                                        work[s].spec = SpecKind::None;
-                                        work[s].spec_retire_fails = 0;
-                                        // Of the committed tokens only the newest
-                                        // lacks a KV row (the rest were written by
-                                        // verify) — keep just it, like the cap
-                                        // retire. The scheduler decodes it as a
-                                        // regular row next step.
-                                        if let Some(last) = work[s].remaining_prompt.last().copied()
-                                        {
-                                            work[s].remaining_prompt.clear();
-                                            work[s].remaining_prompt.push(last);
-                                        }
+                                    }
+                                    work[s].spec = SpecKind::None;
+                                    // Of the committed tokens only the newest
+                                    // lacks a KV row (the rest were written by
+                                    // verify) — keep just it, like the cap
+                                    // retire. The scheduler decodes it as a
+                                    // regular row next step.
+                                    if let Some(last) = work[s].remaining_prompt.last().copied()
+                                    {
+                                        work[s].remaining_prompt.clear();
+                                        work[s].remaining_prompt.push(last);
                                     }
                                 }
                             }
@@ -6876,7 +6891,7 @@ fn admit(
                         // MTP: activate if enabled. Vision continuations stay on
                         // the sequential M-RoPE path (no MTP), matching cold
                         // admits; sampling and penalties ride the MTP path via
-                        // `mtp_req_sampling` (see the cold-admit note). The head
+                        // `spec_req_sampling` (see the cold-admit note). The head
                         // KV reset is only needed
                         // when the head KV was lost (swap-restore) or holds
                         // another session's rows: a session resident on this slot
@@ -6897,7 +6912,10 @@ fn admit(
                             && mtp_head_kv_valid
                             && rig.model.mtp_states[slot.0].is_some();
                         // DFlash2 admit: same request-shape gates as MTP (text
-                        // only, greedy, no grammar). The draft's private state
+                        // only, no grammar). Sampling and token penalties are
+                        // honored by the verify accept (point-mass residual +
+                        // exact-AR prepass), so neither bars admission. The
+                        // draft's private state
                         // survives on this slot across turns, so a continuation
                         // whose reuse point equals the ring's watermark
                         // (`seeded_through`) drafts over a fully-seeded
@@ -6929,8 +6947,6 @@ fn admit(
                         });
                         let dflash_ok = rig.model.dflash.is_some()
                             && req.visual_data.is_none()
-                            && !request_penalized(&req)
-                            && !request_sampled(&req)
                             && req.json_schema.is_none()
                             && dflash_ctx_fits
                             && (plan.reused == 0 || dflash_ring_valid);
@@ -6946,11 +6962,14 @@ fn admit(
                         } else {
                             SpecKind::None
                         };
-                        rig.model.mtp_req_sampling[slot.0] = if work[slot.0].spec == SpecKind::Mtp {
+                        rig.model.spec_req_sampling[slot.0] = if work[slot.0].spec.active() {
                             Some(MtpReqSampling::new(&req, &extended))
                         } else {
                             None
                         };
+                        work[slot.0].spec_retire = hipfire_runtime::spec_retire::SpecRetire::new(
+                            rig.model.spec_retire_break_even,
+                        );
                         if !work[slot.0].spec.active() {
                             if let Some(state) = rig.model.mtp_states[slot.0].as_mut() {
                                 let _ = state.reset(&mut rig.gpu);
@@ -7288,12 +7307,12 @@ fn admit(
             // there is no drafter checkpoint in the pool, so a resumed
             // request that will run MTP brings the head up via the existing
             // reseed path (head KV refills during the suffix prefill);
-            // everything else takes AR.
+            // everything else takes AR. MTP honors sampling and token
+            // penalties (residual acceptance + exact-AR prepass), so neither
+            // bars the prediction — keep it in sync with the admit `mtp_ok`.
             let mtp_will_be_active = rig.model.mtp_head.is_some()
                 && rig.model.mtp_k > 0
                 && req.visual_data.is_none()
-                && !request_penalized(&req)
-                && !request_sampled(&req)
                 && req.json_schema.is_none();
             let drafter = if mtp_will_be_active {
                 DrafterDecision::Reseed
@@ -7647,7 +7666,7 @@ fn admit(
                                      // Activate MTP for text-only requests when the head is loaded.
                                      // Sampling and token penalties ride the MTP path: the
                                      // request's `MtpSamplingConfig` (parked in
-                                     // `mtp_req_sampling`) makes verify use residual acceptance
+                                     // `spec_req_sampling`) makes verify use residual acceptance
                                      // against the penalized target nucleus, reproducing the AR
                                      // distribution. Grammar-constrained requests stay on AR:
                                      // constrained MTP requires joint verification (applying
@@ -7665,12 +7684,14 @@ fn admit(
             && !grammar_constrained
             && reused == 0;
         // DFlash2 admit on the new-session arm: same request-shape gates as
-        // MTP, including the reused==0 rule — a radix hit's reused span was
-        // never forwarded this turn, so its extract-layer hiddens are not
-        // captured and the ring would carry uninitialized rows for
-        // 0..reused (the append_committed gap guard). Continuations are the
-        // exception: their ring survives on the slot and the continuation
-        // arm checks its watermark.
+        // MTP (text only, no grammar), including the reused==0 rule — a radix
+        // hit's reused span was never forwarded this turn, so its
+        // extract-layer hiddens are not captured and the ring would carry
+        // uninitialized rows for 0..reused (the append_committed gap guard).
+        // Continuations are the exception: their ring survives on the slot
+        // and the continuation arm checks its watermark. Sampling and token
+        // penalties are honored by the verify accept (point-mass residual +
+        // exact-AR prepass), so neither bars admission.
         // Legacy-mode ctx fit (sequential `spec_ctx_request_fits` parity):
         // the Legacy scatter writes target_hidden at the ABSOLUTE position
         // into a `ctx_capacity`-row buffer, so a request that can grow past
@@ -7687,8 +7708,6 @@ fn admit(
                     <= d.ctx_capacity
         });
         let dflash_ok = rig.model.dflash.is_some()
-            && !penalized
-            && !request_sampled(&req)
             && !grammar_constrained
             && dflash_ctx_fits
             && reused == 0;
@@ -7699,11 +7718,13 @@ fn admit(
         } else {
             SpecKind::None
         };
-        rig.model.mtp_req_sampling[slot.0] = if work[slot.0].spec == SpecKind::Mtp {
+        rig.model.spec_req_sampling[slot.0] = if work[slot.0].spec.active() {
             Some(MtpReqSampling::new(&req, &req.prompt_tokens))
         } else {
             None
         };
+        work[slot.0].spec_retire =
+            hipfire_runtime::spec_retire::SpecRetire::new(rig.model.spec_retire_break_even);
         if rig.gpu.slot_trace() {
             eprintln!(
                 "[slot-trace] admit(cold) slot {} spec={:?} temp={} top_k={} top_p={} \

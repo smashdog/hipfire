@@ -15,6 +15,7 @@
 // slots) for its whole duration. See `prefill_and_decode_mix_in_one_batch`.
 
 use crate::slot_batch::SlotBatch;
+use crate::spec_retire::SpecRetire;
 use rdna_compute::page_pool::PAGE_TOKENS;
 use rdna_compute::slot_pool::SlotId;
 
@@ -103,15 +104,14 @@ pub struct PendingWork {
     /// the slot is owned by the spec draft/verify cycle and MUST be skipped
     /// by the batched scheduler — its verify rows are injected separately.
     pub spec: SpecKind,
-    /// Rolling adaptive-retire window: decode cycles spent under speculation
-    /// and tokens committed across them. When the window's mean advance stays
-    /// below `MTP_RETIRE_MIN_ADVANCE`, the engine retires the slot to plain
-    /// AR decode (a spec cycle costs ~2x an AR step, so a drafter that cannot
-    /// beat that loses wall-clock — the genre-conditional trap).
-    pub spec_cycles: usize,
-    pub spec_committed: usize,
-    /// Consecutive retire-windows whose mean advance fell below the line.
-    pub spec_retire_fails: usize,
+    /// Per-request speculative-decode retirement policy (shared with the
+    /// sequential drafter, [`crate::spec_retire`]). The engine installs the
+    /// resolved break-even line at admit; every spec cycle is fed to
+    /// [`SpecRetire::observe`], which retires the slot to plain AR decode once
+    /// the drafter cannot pay for the cycle (a spec cycle costs ~2x an AR
+    /// step, so a drafter that cannot beat that loses wall-clock — the
+    /// genre-conditional trap). `Default` never retires (non-spec slots).
+    pub spec_retire: SpecRetire,
     /// M-RoPE phase offset for a TEXT continuation whose conversation
     /// carries image-turn KV (the session's `rope_delta`; 0 = pure text).
     ///
@@ -520,9 +520,7 @@ mod tests {
             decoding: false,
             vl_prefill: None,
             spec: SpecKind::None,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: SpecRetire::default(),
             pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -550,9 +548,7 @@ mod tests {
                 decoding: false,
                 vl_prefill: None,
                 spec: SpecKind::None,
-                spec_cycles: 0,
-                spec_committed: 0,
-                spec_retire_fails: 0,
+                spec_retire: SpecRetire::default(),
                 pos3_delta: 0,
             },
             PendingWork {
@@ -562,9 +558,7 @@ mod tests {
                 decoding: true,
                 vl_prefill: None,
                 spec: SpecKind::None,
-                spec_cycles: 0,
-                spec_committed: 0,
-                spec_retire_fails: 0,
+                spec_retire: SpecRetire::default(),
                 pos3_delta: 0,
             },
         ];
@@ -590,9 +584,7 @@ mod tests {
             decoding: false,
             vl_prefill: None,
             spec: SpecKind::None,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: SpecRetire::default(),
             pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -614,9 +606,7 @@ mod tests {
             decoding: false,
             vl_prefill: None,
             spec: SpecKind::None,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: SpecRetire::default(),
             pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -642,9 +632,7 @@ mod tests {
             decoding: false,
             vl_prefill: None,
             spec: SpecKind::None,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: SpecRetire::default(),
             pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -675,9 +663,7 @@ mod tests {
             decoding: false,
             vl_prefill: None,
             spec: SpecKind::None,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: SpecRetire::default(),
             pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -702,9 +688,7 @@ mod tests {
             decoding: false,
             vl_prefill: None,
             spec: SpecKind::None,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: SpecRetire::default(),
             pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 200);
@@ -764,9 +748,7 @@ mod tests {
                     ..vl_state(1, 10)
                 }),
                 spec: SpecKind::None,
-                spec_cycles: 0,
-                spec_committed: 0,
-                spec_retire_fails: 0,
+                spec_retire: SpecRetire::default(),
                 pos3_delta: 0,
             },
             PendingWork {
@@ -776,9 +758,7 @@ mod tests {
                 decoding: true,
                 vl_prefill: None,
                 spec: SpecKind::None,
-                spec_cycles: 0,
-                spec_committed: 0,
-                spec_retire_fails: 0,
+                spec_retire: SpecRetire::default(),
                 pos3_delta: 0,
             },
         ];
@@ -806,9 +786,7 @@ mod tests {
             decoding: false,
             vl_prefill: Some(vl_state(1, 10)),
             spec: SpecKind::None,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: SpecRetire::default(),
             pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -834,9 +812,7 @@ mod tests {
             decoding: true,
             vl_prefill: Some(vl_state(2, 4)),
             spec: SpecKind::None,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: SpecRetire::default(),
             pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -860,9 +836,7 @@ mod tests {
             decoding: false,
             vl_prefill: Some(vl_state(1, 10)),
             spec: SpecKind::None,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: SpecRetire::default(),
             pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -888,9 +862,7 @@ mod tests {
                 decoding: false,
                 vl_prefill: None,
                 spec: SpecKind::Mtp,
-                spec_cycles: 0,
-                spec_committed: 0,
-                spec_retire_fails: 0,
+                spec_retire: SpecRetire::default(),
                 pos3_delta: 0,
             },
             PendingWork {
@@ -902,9 +874,7 @@ mod tests {
                 decoding: true,
                 vl_prefill: None,
                 spec: SpecKind::Mtp,
-                spec_cycles: 0,
-                spec_committed: 0,
-                spec_retire_fails: 0,
+                spec_retire: SpecRetire::default(),
                 pos3_delta: 0,
             },
         ];
@@ -939,9 +909,7 @@ mod tests {
                 decoding: false,
                 vl_prefill: None,
                 spec: SpecKind::None,
-                spec_cycles: 0,
-                spec_committed: 0,
-                spec_retire_fails: 0,
+                spec_retire: SpecRetire::default(),
                 pos3_delta: -240,
             },
             PendingWork {
@@ -951,9 +919,7 @@ mod tests {
                 decoding: true,
                 vl_prefill: None,
                 spec: SpecKind::None,
-                spec_cycles: 0,
-                spec_committed: 0,
-                spec_retire_fails: 0,
+                spec_retire: SpecRetire::default(),
                 pos3_delta: 0,
             },
         ];
@@ -980,9 +946,7 @@ mod tests {
             decoding: false,
             vl_prefill: None,
             spec: SpecKind::Mtp,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: SpecRetire::default(),
             pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -999,9 +963,7 @@ mod tests {
             decoding: false,
             vl_prefill: None,
             spec: SpecKind::None,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: SpecRetire::default(),
             pos3_delta: 0,
         }
     }
@@ -1014,9 +976,7 @@ mod tests {
             decoding: true,
             vl_prefill: None,
             spec: SpecKind::None,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: SpecRetire::default(),
             pos3_delta: 0,
         }
     }
@@ -1180,9 +1140,7 @@ mod tests {
                 decoding: false,
                 vl_prefill: None,
                 spec: SpecKind::None,
-                spec_cycles: 0,
-                spec_committed: 0,
-                spec_retire_fails: 0,
+                spec_retire: SpecRetire::default(),
                 pos3_delta: 0,
             },
             PendingWork {
@@ -1192,9 +1150,7 @@ mod tests {
                 decoding: false,
                 vl_prefill: None,
                 spec: SpecKind::None,
-                spec_cycles: 0,
-                spec_committed: 0,
-                spec_retire_fails: 0,
+                spec_retire: SpecRetire::default(),
                 pos3_delta: 0,
             },
         ];
