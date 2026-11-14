@@ -554,6 +554,64 @@ impl LayerwisePagePool {
     }
 }
 
+// =========================================================================
+// MTP head bounded-pool geometry (P4.1①)
+// =========================================================================
+
+/// Head bounded-pool token capacity (P4.1①, the hipfire analog of ninfer's
+/// `layerwise_mtp_auxiliary_capacity`): the trunk layerwise working-set window
+/// (`main_capacity` tokens) PLUS ONE native draft-scratch block (`block_tokens`).
+///
+/// Under Layerwise the MTP head is BOUNDED to the trunk window — accepted head
+/// history beyond the window is co-archived to the composite record's aux plane
+/// and restored-before-attend (sub-patch ②), never kept full-resident. The single
+/// scratch block holds the in-flight draft span (≤ 64 rows ninfer / ≤ 15 hipfire
+/// MTP draft). The head ALGORITHM is unchanged (full-history attention preserved
+/// via restore); only its KV residency is bounded.
+///
+/// Fails closed (never panics) on a zero `main_capacity`/`block_tokens`, a
+/// `main_capacity` that is not a whole number of pages (the window must be
+/// page-aligned so the scratch is exactly one extra page), or an overflow.
+pub fn mtp_auxiliary_capacity(main_capacity: usize, block_tokens: usize) -> Result<usize, String> {
+    if main_capacity == 0 {
+        return Err("mtp auxiliary capacity: main_capacity (trunk window) must be positive".to_string());
+    }
+    if block_tokens == 0 {
+        return Err("mtp auxiliary capacity: block_tokens must be positive".to_string());
+    }
+    if main_capacity % block_tokens != 0 {
+        return Err(format!(
+            "mtp auxiliary capacity: main_capacity {main_capacity} is not page-aligned \
+             (block_tokens {block_tokens}); cannot admit one native auxiliary scratch block"
+        ));
+    }
+    main_capacity.checked_add(block_tokens).ok_or_else(|| {
+        "mtp auxiliary capacity: main_capacity + block_tokens overflows usize".to_string()
+    })
+}
+
+/// Build the MTP head's bounded composite-slot pool (P4.1①): ONE fa layer (the
+/// head aux plane), `window_tokens` of accepted history + one draft-scratch
+/// block. Reuses [`PackedArenaLayout`] + [`LayerwisePagePool`] — the head is a
+/// 1-layer composite, so it inherits the same generation handles, per-layer
+/// stripe residency and intrinsic drop-evict as the trunk pool. The slot count is
+/// `window_tokens / block_tokens + 1` (window pages + one scratch page); the head
+/// owns this pool independently of the trunk (ninfer's independent resident map +
+/// `LayerWorkingSetPlan`, quota = window). Pure host geometry — CPU-unit-testable;
+/// sub-patch ② drives it from the head restore/pressure path.
+pub fn mtp_head_pool(
+    window_tokens: usize,
+    block_tokens: usize,
+    k_stride: usize,
+    v_stride: usize,
+) -> Result<LayerwisePagePool, String> {
+    let aux_capacity = mtp_auxiliary_capacity(window_tokens, block_tokens)?;
+    // aux_capacity is page-aligned (window aligned + one block), so this is exact.
+    let n_slots = aux_capacity / block_tokens;
+    let layout = PackedArenaLayout::new(n_slots, 1, block_tokens, k_stride, v_stride)?;
+    LayerwisePagePool::new(layout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,5 +807,70 @@ mod tests {
         let h = pool.alloc_slot().unwrap();
         pool.free_slot(h).unwrap();
         assert!(pool.free_slot(h).is_err(), "double free / stale handle");
+    }
+
+    // ── P4.1① MTP head bounded-pool geometry ──────────────────────────────
+    #[test]
+    fn mtp_auxiliary_capacity_is_window_plus_one_block() {
+        // ninfer layerwise_mtp_auxiliary_capacity: main_capacity + one block.
+        assert_eq!(mtp_auxiliary_capacity(512, 128).unwrap(), 640);
+        assert_eq!(mtp_auxiliary_capacity(128, 128).unwrap(), 256);
+        assert_eq!(mtp_auxiliary_capacity(16, 4).unwrap(), 20); // small fixture page
+    }
+
+    #[test]
+    fn mtp_auxiliary_capacity_fails_closed() {
+        assert!(mtp_auxiliary_capacity(0, 128).is_err()); // zero window
+        assert!(mtp_auxiliary_capacity(512, 0).is_err()); // zero block
+        assert!(mtp_auxiliary_capacity(500, 128).is_err()); // not page-aligned
+        assert!(mtp_auxiliary_capacity(usize::MAX, 128).is_err()); // overflow/misaligned
+        // Page-aligned but overflowing add.
+        let big = usize::MAX - (usize::MAX % 128);
+        assert!(mtp_auxiliary_capacity(big, 128).is_err());
+    }
+
+    #[test]
+    fn mtp_head_pool_geometry_window_plus_scratch() {
+        // Q8 head: 4 KV heads × head_dim 256 → 1088 B/pos; window 512 (4 pages).
+        let stride = 4 * (256 / 32) * 34;
+        let pool = mtp_head_pool(512, LAYERWISE_PAGE_TOKENS, stride, stride).unwrap();
+        // 4 window pages + 1 scratch page = 5 slots, ONE head layer.
+        assert_eq!(pool.n_slots(), 5);
+        assert_eq!(pool.n_layers(), 1);
+        assert_eq!(pool.free_count(), 5);
+        let l = pool.layout();
+        assert_eq!(l.block_tokens(), LAYERWISE_PAGE_TOKENS);
+        assert_eq!(l.k_stride(), 1088);
+        // head slot = 1 layer × 128 × (1088+1088); arena = 5 slots.
+        assert_eq!(l.slot_bytes(), 128 * 2 * 1088);
+        assert_eq!(l.arena_bytes(), 5 * 128 * 2 * 1088);
+        // Bounded: ~1.33 MiB, far below a full-resident 256k head (~544 MiB/slot).
+        assert!(l.arena_bytes() < 2 << 20, "head pool must be bounded, not full-resident");
+    }
+
+    #[test]
+    fn mtp_head_pool_drop_evict_lifecycle() {
+        let mut pool = mtp_head_pool(16, 4, 8, 6).unwrap();
+        // 16/4 + 1 = 5 slots, 1 layer.
+        assert_eq!(pool.n_slots(), 5);
+        assert_eq!(pool.n_layers(), 1);
+        let h = pool.alloc_slot().unwrap();
+        pool.bind_stripe(h, 0, 100).unwrap();
+        assert_eq!(pool.stripe_page(h.phys, 0), Some(100));
+        // Single layer: dropping it reports freeable immediately.
+        assert!(pool.drop_stripe(h, 0).unwrap());
+        pool.free_slot(h).unwrap();
+        assert_eq!(pool.free_count(), 5);
+        // Exhaustion: 5 slots, the 6th fails (bounded — no unbounded growth).
+        let mut hs = Vec::new();
+        for _ in 0..5 { hs.push(pool.alloc_slot().unwrap()); }
+        assert!(pool.alloc_slot().is_err());
+    }
+
+    #[test]
+    fn mtp_head_pool_rejects_bad_window() {
+        assert!(mtp_head_pool(0, 128, 1088, 1088).is_err());
+        assert!(mtp_head_pool(500, 128, 1088, 1088).is_err()); // misaligned
+        assert!(mtp_head_pool(512, 128, 0, 1088).is_err()); // zero stride
     }
 }

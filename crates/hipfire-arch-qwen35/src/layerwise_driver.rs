@@ -32,7 +32,8 @@ use hipfire_kvmem::{
     KvRegions, KvStore, LayerMemorySnapshot, LayerPlan, LayerQueryGeometry, LayerRequestSpec,
     LayerwiseIdentity, LayerwisePhase, LayerwiseRequest, LayerwiseWork, MemoryBudget,
     MemoryCapabilities, MemoryCatalog, MemoryDescriptor, MemorySnapshot, MemoryStamp,
-    NativeCurrentLayerQuery, NativePayload, PayloadLayout, PrefillAcceptance, PrefillMass,
+    NativeCurrentLayerQuery, NativePayload, OutputAcceptance, OutputMass, OutputPressure,
+    PayloadLayout, PrefillAcceptance, PrefillMass,
     PrefillPressure, QueryPlaneBytes, QueryProjectionLayout,
     QueryProjectionPlane, QueryProjectionTape, QueryRange, QueryScoreFrame, RawStore, Reservation,
     SessionIdentity, SpillFile, Storage,
@@ -371,23 +372,33 @@ fn encode_layer_block_table(
 /// shifted V view ([`LayerwiseArena::v_cache_view`]), supplied by the caller at
 /// attention time and shared across layers. `GpuTensor` has no `Drop`; release
 /// exactly once via [`Self::free_gpu`].
+///
+/// `width` is the number of active evaluation rows per step (P4.1①): `1` for the
+/// AR decode path (byte-for-byte the original single-row staging), `n` for an
+/// MTP verify span. The sequence is still ONE (every row maps to slot 0); only
+/// the per-row causal-bound `positions` and the `row_slot` map widen.
 pub struct LayerwiseDescStaging {
     descs: Vec<GpuTensor>,
     block_tables: Vec<GpuTensor>,
-    /// Per-layer compacted causal bound: one i32 `[seq_len - 1]`. The ported
-    /// paged kernels treat `positions[]` (NOT `desc.seq_len`) as authoritative
-    /// for the causal bound, and Layerwise attends the COMPACTED selected
-    /// working set — so this is the compacted visible extent, distinct from the
-    /// real decode position used for RoPE (D4a parity proof: `positions=[SEQ-1]`
-    /// with `SEQ` the compacted extent). Stable address, re-uploaded in place.
+    /// Per-layer compacted causal bounds: `width` i32 `[seq_len - width + i]`
+    /// (row `i` of the active span). The ported paged kernels treat `positions[]`
+    /// (NOT `desc.seq_len`) as authoritative for the causal bound, and Layerwise
+    /// attends the COMPACTED selected working set — so this is the compacted
+    /// visible extent, distinct from the real decode position used for RoPE (D4a
+    /// parity proof: `positions=[SEQ-1]` with `SEQ` the compacted extent). For
+    /// `width == 1` this is the single i32 `[seq_len - 1]`, byte-identical to the
+    /// AR staging. Stable address, re-uploaded in place.
     positions: Vec<GpuTensor>,
-    /// Single-sequence row→slot map: one i32 `[0]`, stable address. The paged
-    /// writer/attention take `row_slot` to resolve each active row's descriptor;
-    /// the layerwise flow has one sequence, so every row maps to slot 0 (mirrors
-    /// the legacy `SlotDescStaging::row_slot_dev`). Uploaded once at construction.
+    /// Single-sequence row→slot map: `width` i32 all `[0]`, stable address. The
+    /// paged writer/attention take `row_slot` to resolve each active row's
+    /// descriptor; the layerwise flow has one sequence, so every row maps to
+    /// slot 0 (mirrors the legacy `SlotDescStaging::row_slot_dev`). For
+    /// `width == 1` this is the single i32 `[0]`. Uploaded once at construction.
     row_slot: GpuTensor,
     n_layers: usize,
     max_pages: usize,
+    /// Active evaluation rows per step (1 = AR, n = MTP verify span).
+    width: usize,
 }
 
 impl LayerwiseDescStaging {
@@ -396,11 +407,27 @@ impl LayerwiseDescStaging {
     /// field count. Fails closed on bad geometry or an allocation error — never
     /// partially constructs (everything allocated so far is freed on failure).
     pub fn new(gpu: &mut Gpu, n_layers: usize, max_pages: usize) -> Result<Self, String> {
+        Self::new_with_width(gpu, n_layers, max_pages, 1)
+    }
+
+    /// Width-param constructor (P4.1①): `width` active evaluation rows per step.
+    /// `width == 1` reproduces the AR single-row staging byte-for-byte (one i32
+    /// `[0]` row_slot, one i32 `[seq_len-1]` positions/layer); `width == n` widens
+    /// both to `n` i32 for an MTP verify span. Fails closed on `width == 0`.
+    pub fn new_with_width(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        max_pages: usize,
+        width: usize,
+    ) -> Result<Self, String> {
         if n_layers == 0 {
             return Err("layerwise desc staging: n_layers == 0".to_string());
         }
         if max_pages == 0 {
             return Err("layerwise desc staging: max_pages == 0".to_string());
+        }
+        if width == 0 {
+            return Err("layerwise desc staging: width == 0".to_string());
         }
         let desc_bytes = std::mem::size_of::<KvSlotDesc>();
         let mut descs: Vec<GpuTensor> = Vec::with_capacity(n_layers);
@@ -423,7 +450,7 @@ impl LayerwiseDescStaging {
                 }
             };
             descs.push(desc);
-            let pos = match gpu.alloc_tensor(&[4], DType::Raw) {
+            let pos = match gpu.alloc_tensor(&[width * 4], DType::Raw) {
                 Ok(t) => t,
                 Err(e) => {
                     Self::free_partial(gpu, &mut descs, &mut block_tables, &mut positions);
@@ -432,19 +459,20 @@ impl LayerwiseDescStaging {
             };
             positions.push(pos);
         }
-        // Single-sequence row→slot map ([0]), allocated after the per-layer
-        // buffers so a loop failure frees only the Vecs (free_partial). A failure
-        // here frees everything allocated so far — never partially constructs.
-        let row_slot = match gpu.alloc_tensor(&[4], DType::Raw) {
+        // Single-sequence row→slot map (width × [0]), allocated after the
+        // per-layer buffers so a loop failure frees only the Vecs (free_partial).
+        // A failure here frees everything allocated so far — never partially
+        // constructs. width == 1 uploads the single i32 [0] (AR byte-identical).
+        let row_slot = match gpu.alloc_tensor(&[width * 4], DType::Raw) {
             Ok(t) => t,
             Err(e) => {
                 Self::free_partial(gpu, &mut descs, &mut block_tables, &mut positions);
                 return Err(format!("layerwise desc staging: row_slot alloc: {e:?}"));
             }
         };
-        let zero = 0i32;
+        let zeros = vec![0i32; width];
         if let Err(e) = gpu.hip.memcpy_htod(&row_slot.buf, unsafe {
-            std::slice::from_raw_parts(&zero as *const i32 as *const u8, 4)
+            std::slice::from_raw_parts(zeros.as_ptr() as *const u8, width * 4)
         }) {
             let _ = gpu.free_tensor(row_slot);
             Self::free_partial(gpu, &mut descs, &mut block_tables, &mut positions);
@@ -457,6 +485,7 @@ impl LayerwiseDescStaging {
             row_slot,
             n_layers,
             max_pages,
+            width,
         })
     }
 
@@ -522,12 +551,16 @@ impl LayerwiseDescStaging {
                 )
             })
             .map_err(|e| format!("layerwise desc staging: desc H2D layer {layer}: {e:?}"))?;
-        // Compacted causal bound for the ported kernels (positions[] is
-        // authoritative). seq_len == 0 → -1 (empty working set → empty partials).
-        let pos = seq_len - 1;
+        // Compacted causal bounds for the ported kernels (positions[] is
+        // authoritative): row i of the active width-span binds seq_len-width+i.
+        // width == 1 → the single i32 [seq_len-1] (AR byte-identical); seq_len==0
+        // → -1 (empty working set → empty partials).
+        let bounds: Vec<i32> = (0..self.width)
+            .map(|i| seq_len - self.width as i32 + i as i32)
+            .collect();
         gpu.hip
             .memcpy_htod(&self.positions[layer].buf, unsafe {
-                std::slice::from_raw_parts(&pos as *const i32 as *const u8, 4)
+                std::slice::from_raw_parts(bounds.as_ptr() as *const u8, self.width * 4)
             })
             .map_err(|e| format!("layerwise desc staging: positions H2D layer {layer}: {e:?}"))?;
         Ok(())
@@ -553,9 +586,10 @@ impl LayerwiseDescStaging {
         })
     }
 
-    /// Layer `layer`'s compacted causal-bound tensor (one i32 `[seq_len - 1]`,
-    /// stable address). Hand to the paged kernel as `positions` — it is the
-    /// COMPACTED visible extent, not the real decode position (which drives RoPE).
+    /// Layer `layer`'s compacted causal-bound tensor (`width` i32
+    /// `[seq_len - width + i]`, stable address). Hand to the paged kernel as
+    /// `positions` — it is the COMPACTED visible extent, not the real decode
+    /// position (which drives RoPE). `width == 1` → the single i32 `[seq_len-1]`.
     pub fn positions(&self, layer: usize) -> Result<&GpuTensor, String> {
         self.positions.get(layer).ok_or_else(|| {
             format!(
@@ -573,8 +607,12 @@ impl LayerwiseDescStaging {
     pub fn max_pages(&self) -> usize {
         self.max_pages
     }
-    /// The single-sequence row→slot map (one i32 `[0]`, stable address). Hand to
-    /// the paged writer/attention as `row_slot`.
+    /// Active evaluation rows per step (1 = AR decode, n = MTP verify span).
+    pub fn width(&self) -> usize {
+        self.width
+    }
+    /// The single-sequence row→slot map (`width` i32 all `[0]`, stable address).
+    /// Hand to the paged writer/attention as `row_slot`.
     pub fn row_slot(&self) -> &GpuTensor {
         &self.row_slot
     }
@@ -726,7 +764,10 @@ pub struct MassCapture {
     /// The compact local begin of the sampled decode row
     /// (`selected_pages * block_tokens + partial_tokens`).
     local_begin: u64,
-    /// The single decode evaluation row count (admission guarantees 1).
+    /// The physical evaluation row count (width): 1 for AR decode, n for an MTP
+    /// verify span (P4.1①). The output-pressure accept publishes the scheduler-
+    /// confirmed accepted PREFIX of these rows (partial acceptance); the prefill
+    /// accept requires the whole span (all-or-nothing).
     eval_rows: u64,
     /// The admitted sample schedule; empty ⇒ no capture/accept this step.
     mass_rows: Vec<u32>,
@@ -1516,6 +1557,74 @@ impl<'a> LayerwiseQuery<'a> {
             .map_err(|e| format!("layerwise pressure accept: {e}"))
     }
 
+    /// Accept the whole-model captured mass into a persistent OUTPUT-scope
+    /// pressure owner with PARTIAL (prefix) acceptance (P4.1①, design §A.6).
+    /// This is the MTP-verify sibling of [`Self::accept_pressure`]: the prefill
+    /// owner requires `accepted == count` (all-or-nothing, core
+    /// layerwise_pressure.cpp:79), so a verify span that rejects a draft suffix
+    /// MUST publish through [`OutputPressure`] instead. `begin` is the native
+    /// consumed-row frontier the owner was `prepare`d at; `accepted` is the
+    /// scheduler-confirmed prefix of the `eval_rows`-wide verifier batch. The
+    /// published `history.frontier == begin + accepted` (core
+    /// layerwise_pressure.cpp:340), `rows` is the captured sample schedule
+    /// (rejected rows ignored), and each FA layer contributes an [`OutputMass`]
+    /// (logical-start `history` + captured `masses`, no renormalization). Returns
+    /// the newly-accepted sampled-row bitmask (`Ok(0)` no-op when no pressure
+    /// owner backs the step or the `rows()` schedule is empty). The caller must
+    /// have `prepare`d the owner for this `request`/`begin` first; call AFTER the
+    /// forward (every layer's mass captured), BEFORE the carrier is freed.
+    pub fn accept_output_pressure(
+        &mut self,
+        pressure: &mut OutputPressure,
+        request: u64,
+        begin: u64,
+        accepted: u32,
+    ) -> Result<u64, String> {
+        let m = match self.mass.as_ref() {
+            Some(m) => m,
+            None => return Ok(0),
+        };
+        if m.mass_rows.is_empty() {
+            return Ok(0);
+        }
+        if accepted as u64 > m.eval_rows {
+            return Err(format!(
+                "layerwise output accept: accepted prefix {accepted} > eval_rows {}",
+                m.eval_rows
+            ));
+        }
+        let fa_layers = self.driver.fa_layers();
+        let mut layers = Vec::with_capacity(fa_layers.len());
+        for ordinal in 0..fa_layers.len() {
+            let pages = m.pages[ordinal]
+                .as_ref()
+                .ok_or_else(|| format!("layerwise output accept: layer {ordinal} not restored"))?;
+            let masses = m.masses[ordinal]
+                .as_ref()
+                .ok_or_else(|| format!("layerwise output accept: layer {ordinal} mass not captured"))?;
+            layers.push(OutputMass {
+                model_layer: fa_layers[ordinal],
+                history: pages.history.clone(),
+                masses: masses.clone(),
+            });
+        }
+        // Native consumed-row frontier: the prepare begin advanced by the
+        // accepted prefix (never the predicted-token +1). The core validates
+        // history.frontier == begin_ + accepted atomically before publishing.
+        let mut stamp = self.driver.canonical()[0].memory.stamp;
+        stamp.frontier = begin + accepted as u64;
+        let acceptance = OutputAcceptance {
+            history: stamp,
+            request,
+            accepted,
+            rows: m.mass_rows.clone(),
+            layers,
+        };
+        pressure
+            .accept(&acceptance)
+            .map_err(|e| format!("layerwise output accept: {e}"))
+    }
+
     /// The per-ordinal restored canonical page ids (the keep-set contribution of
     /// this step). Pressure mode ⇒ the pressure selection (`choice.selected`);
     /// Query mode ⇒ the scorer's restored view blocks. The engine orchestration
@@ -1715,7 +1824,46 @@ pub fn bootstrap_layerwise(
     record_bytes: u64,
     resident: &[Vec<u64>],
 ) -> Result<LayerwiseBootstrap, String> {
+    bootstrap_layerwise_rows(
+        fed, session_id, incarnation, seq, fa_layers, n_heads, n_kv_heads, head_dim,
+        budget_blocks, record_bytes, resident, 1, None,
+    )
+}
+
+/// Width-param bootstrap variant (P4.1①): `width` evaluation rows at the logical
+/// frontier (`evaluation = [frontier, frontier + width]`), and an optional absolute
+/// `query` intersection span (`None` ⇒ the whole evaluation span, the AR default).
+/// `width == 1, query == None` reproduces [`bootstrap_layerwise`] byte-for-byte.
+/// For an MTP verify span the caller passes the draft+bonus width and the true
+/// Query intersection; the core validates `query ⊆ evaluation` and ties
+/// `evaluation.begin == history.frontier`. Fails closed on `width == 0` or a
+/// `query` outside the evaluation span. The canonical history, specs, suffix page
+/// and `native_history_tokens` are width-independent (the verify span rides the
+/// single physical suffix stripe, `width ≤ block_tokens`).
+pub fn bootstrap_layerwise_rows(
+    fed: u32,
+    session_id: u64,
+    incarnation: u64,
+    seq: u64,
+    fa_layers: &[u32],
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    budget_blocks: u32,
+    record_bytes: u64,
+    resident: &[Vec<u64>],
+    width: u64,
+    query: Option<QueryRange>,
+) -> Result<LayerwiseBootstrap, String> {
     let bt = LAYERWISE_BLOCK_TOKENS;
+    if width == 0 {
+        return Err("layerwise bootstrap: width == 0".to_string());
+    }
+    if width > bt as u64 {
+        return Err(format!(
+            "layerwise bootstrap: width {width} exceeds the suffix page ({bt} tokens)"
+        ));
+    }
     if fa_layers.is_empty() {
         return Err("layerwise bootstrap: empty fa_layers".to_string());
     }
@@ -1808,16 +1956,30 @@ pub fn bootstrap_layerwise(
     // (layerwise_selection.cpp:88,90), and the layerwise selection index holds
     // ONLY sealed full pages (`prepare_selection` requires total_tokens % block
     // == 0 and every block full). So the frontier is the full-page boundary
-    // `full_pages * 128` — NOT `fed` — and the single decode row is evaluated at
-    // logical position `frontier`. The partial tail (`fed % 128` already-fed
-    // tokens) is NOT part of the logical canonical frame: it lives only in the
-    // statistics store and is restored as the physical suffix stripe (§3.9g),
-    // extending the compacted causal bound by `partial_tokens + rows`.
+    // `full_pages * 128` — NOT `fed` — and the `width` evaluation rows are
+    // evaluated at logical positions `[frontier, frontier + width)` (width == 1
+    // is the single AR decode row at `frontier`). The partial tail (`fed % 128`
+    // already-fed tokens) is NOT part of the logical canonical frame: it lives
+    // only in the statistics store and is restored as the physical suffix stripe
+    // (§3.9g), extending the compacted causal bound by `partial_tokens + rows`.
+    let evaluation = QueryRange { begin: frontier, end: frontier + width };
+    let query_span = match query {
+        Some(q) => {
+            if q.begin < frontier || q.end > evaluation.end || q.begin > q.end {
+                return Err(format!(
+                    "layerwise bootstrap: query [{}, {}) outside evaluation [{}, {})",
+                    q.begin, q.end, evaluation.begin, evaluation.end
+                ));
+            }
+            q
+        }
+        None => evaluation,
+    };
     let identity = LayerwiseIdentity {
         history: base_stamp,
         request: session_id + 1,
-        evaluation: QueryRange { begin: frontier, end: frontier + 1 },
-        query: QueryRange { begin: frontier, end: frontier + 1 },
+        evaluation,
+        query: query_span,
     };
     Ok(LayerwiseBootstrap {
         canonical,
@@ -3058,6 +3220,80 @@ mod tests {
         // Empty restored on a Pressure step truncates to empty.
         let empty = combine_keep_set(&prev, &[vec![], vec![]], true, 2);
         assert_eq!(empty, vec![Vec::<u64>::new(), Vec::<u64>::new()]);
+    }
+
+    /// P4.1① multi-row seam (pure host, no GPU): `bootstrap_layerwise_rows`
+    /// evaluates `width` rows at the logical frontier with an optional absolute
+    /// query intersection, while the canonical history / specs / suffix /
+    /// native_history_tokens stay WIDTH-INDEPENDENT. `width == 1, query == None`
+    /// reproduces the AR `bootstrap_layerwise` identity byte-for-byte; the
+    /// fail-closed guards mirror the core's `query ⊆ evaluation` contract.
+    #[test]
+    fn bootstrap_rows_multi_row_span_and_width_one_identity() {
+        let fa = [3u32, 7, 11];
+        let resident = vec![vec![0u64, 1], vec![1, 2], vec![2, 3]];
+        let fed = 512u32; // 4 sealed pages → frontier 512, no partial tail
+        let bt = BT as u64;
+        let frontier = (fed / BT) as u64 * bt;
+        let rows = |width: u64, query: Option<QueryRange>| {
+            bootstrap_layerwise_rows(
+                fed, 0, 0, 5, &fa, Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, width, query,
+            )
+        };
+
+        // width=1/None == the AR delegator, identity field-for-field (Copy+Eq).
+        let ar = bootstrap_layerwise(
+            fed, 0, 0, 5, &fa, Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident,
+        )
+        .unwrap();
+        let one = rows(1, None).unwrap();
+        assert_eq!(one.identity, ar.identity, "width=1 must reproduce AR identity");
+        assert_eq!(one.identity.evaluation, QueryRange { begin: frontier, end: frontier + 1 });
+        assert_eq!(one.identity.query, one.identity.evaluation);
+        assert_eq!(one.suffix_page, ar.suffix_page);
+        assert_eq!(one.partial_tokens, ar.partial_tokens);
+        assert_eq!(one.native_history_tokens, ar.native_history_tokens);
+
+        // width=4 MTP verify span: evaluation rides [frontier, frontier+4).
+        let four = rows(4, None).unwrap();
+        assert_eq!(four.identity.evaluation, QueryRange { begin: frontier, end: frontier + 4 });
+        assert_eq!(four.identity.query, four.identity.evaluation);
+        // Canonical history / specs / suffix are WIDTH-INDEPENDENT (byte-neutral):
+        // only the evaluation/query span widens, never the restored history.
+        assert_eq!(four.suffix_page, one.suffix_page);
+        assert_eq!(four.partial_tokens, one.partial_tokens);
+        assert_eq!(four.native_history_tokens, one.native_history_tokens);
+        assert_eq!(four.canonical.len(), one.canonical.len());
+        for (a, b) in four.canonical.iter().zip(one.canonical.iter()) {
+            assert_eq!(a.model_layer, b.model_layer);
+            assert_eq!(a.memory.resident, b.memory.resident);
+            assert_eq!(a.memory.stamp.frontier, b.memory.stamp.frontier);
+        }
+        for (a, b) in four.specs.iter().zip(one.specs.iter()) {
+            assert_eq!(a.budget.selected_tokens, b.budget.selected_tokens);
+            assert_eq!(a.budget.device_tokens, b.budget.device_tokens);
+            assert_eq!(a.budget.host_payload_bytes, b.budget.host_payload_bytes);
+        }
+
+        // Custom absolute query intersection ⊆ evaluation (the true Query rows).
+        let sub = rows(4, Some(QueryRange { begin: frontier, end: frontier + 2 })).unwrap();
+        assert_eq!(sub.identity.evaluation, QueryRange { begin: frontier, end: frontier + 4 });
+        assert_eq!(sub.identity.query, QueryRange { begin: frontier, end: frontier + 2 });
+
+        // Fail-closed guards (core query ⊆ evaluation + width ≤ suffix page).
+        assert!(rows(0, None).is_err()); // width == 0
+        assert!(rows(bt + 1, None).is_err()); // width > suffix page
+        assert!(rows(4, Some(QueryRange { begin: frontier - 1, end: frontier + 2 })).is_err()); // begin < frontier
+        assert!(rows(4, Some(QueryRange { begin: frontier, end: frontier + 5 })).is_err()); // end > evaluation.end
+        assert!(rows(4, Some(QueryRange { begin: frontier + 2, end: frontier + 1 })).is_err()); // begin > end
+        assert!(bootstrap_layerwise_rows(
+            fed, 0, 0, 5, &[], Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, 1, None
+        )
+        .is_err()); // empty fa_layers
+        assert!(bootstrap_layerwise_rows(
+            64, 0, 0, 5, &fa, Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, 1, None
+        )
+        .is_err()); // fed < 128: no sealed history page
     }
 
     /// The bridge gathers Mean-K in enabled order, maps the native Q descriptor,
@@ -4444,6 +4680,59 @@ mod tests {
 
         staging.free_gpu(&mut gpu);
         arena.free(&mut gpu).expect("free arena");
+    }
+
+    /// P4.1① width-param staging geometry (GPU): `new_with_width(n)` widens the
+    /// per-layer compacted causal bounds to `n` i32 `[seq_len-n+i]` and the
+    /// row→slot map to `n` i32 `[0]`; `width == 1` is byte-identical to the AR
+    /// `new` staging. Fails closed on `width == 0`. (D4a proved the kernel reads
+    /// these bytes byte-exact; this isolates the width geometry primitive.)
+    #[test]
+    #[ignore]
+    fn layerwise_desc_staging_width_geometry() {
+        let mut gpu = Gpu::init().expect("gpu");
+        const NL: usize = 2;
+        const MAXP: usize = 4;
+        const W: usize = 4;
+        fn read_i32(gpu: &mut Gpu, t: &GpuTensor, n: usize) -> Vec<i32> {
+            let mut v = vec![0i32; n];
+            let bytes = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, n * 4) };
+            gpu.hip.memcpy_dtoh_at(bytes, &t.buf, 0).expect("i32 d2h");
+            v
+        }
+        let staging =
+            LayerwiseDescStaging::new_with_width(&mut gpu, NL, MAXP, W).expect("staging");
+        assert_eq!(staging.width(), W);
+        assert_eq!(staging.n_layers(), NL);
+        // row→slot map: W i32 all [0] (single sequence), uploaded at construction.
+        assert_eq!(read_i32(&mut gpu, staging.row_slot(), W), vec![0i32; W]);
+        // seq_len = mapped pages × 128 (no suffix): 3 and 2 pages respectively.
+        let compact = [vec![2u32, 0, 3], vec![1u32, 3]];
+        let seq = [3 * 128i32, 2 * 128i32];
+        for layer in 0..NL {
+            staging
+                .update_layer(&mut gpu, layer, &compact[layer], None, seq[layer])
+                .expect("update");
+            // positions = [seq-W .. seq-1] (W compacted causal bounds).
+            let want: Vec<i32> = (0..W as i32).map(|i| seq[layer] - W as i32 + i).collect();
+            assert_eq!(
+                read_i32(&mut gpu, staging.positions(layer).expect("pos"), W),
+                want,
+                "positions layer {layer}"
+            );
+        }
+        staging.free_gpu(&mut gpu);
+
+        // width == 1 reproduces the AR staging byte-for-byte.
+        let ar = LayerwiseDescStaging::new(&mut gpu, NL, MAXP).expect("ar staging");
+        assert_eq!(ar.width(), 1);
+        assert_eq!(read_i32(&mut gpu, ar.row_slot(), 1), vec![0i32]);
+        ar.update_layer(&mut gpu, 0, &[0], None, 128).expect("ar update");
+        assert_eq!(read_i32(&mut gpu, ar.positions(0).expect("pos"), 1), vec![127]);
+        ar.free_gpu(&mut gpu);
+
+        // fail-closed: width == 0 rejects before any allocation.
+        assert!(LayerwiseDescStaging::new_with_width(&mut gpu, NL, MAXP, 0).is_err(), "width 0");
     }
 
     /// Shared GPU fixture for the Layerwise path-parity proofs (D4b-3). Path C
@@ -6398,6 +6687,195 @@ mod tests {
         assert_eq!(combined2, selected2, "pressure truncate to budget");
         carrier2.free(&mut gpu).expect("free carrier2");
 
+        gpu.free_tensor(q_dev).expect("free q");
+    }
+
+    /// P4.1① OutputPressure owner + multi-row PARTIAL acceptance (GPU). The MTP
+    /// verify sibling of `carrier_pressure_mass_accept_select_byte_exact`: a
+    /// width-4 evaluation span (`bootstrap_layerwise_rows`) captures a 4-row mass
+    /// matrix, and `accept_output_pressure` publishes the scheduler-confirmed
+    /// accepted PREFIX (accepted=1 of 4) into a persistent `OutputPressure` owner.
+    /// The core validates `history.frontier == begin + accepted` and only the
+    /// accepted row's mass conservation — exactly the partial-verify contract
+    /// (`PrefillPressure.accept` is all-or-nothing and cannot express this). The
+    /// carrier staging stays width-1 here (the attention causal-bound width is
+    /// proven separately by `layerwise_desc_staging_width_geometry`); mass capture
+    /// and output acceptance are width-independent. NOT wired to live serve in ①
+    /// — ② drives this from the real MTP verify span.
+    #[test]
+    #[ignore]
+    fn carrier_output_pressure_multi_row_partial_accept() {
+        use hipfire_kvmem::{
+            OutputOptions, OutputPressure, OutputScope, OutputScopeRow, OutputScopeState,
+            PrefillOptions,
+        };
+        use path_fixture::*;
+        use rdna_compute::kvmem_page_mass::PageMassScalar;
+
+        let mut gpu = Gpu::init().expect("gpu");
+        if gpu.arch != "gfx1100" {
+            // The ported scorer + mass kernel admit gfx1100 only.
+            return;
+        }
+
+        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
+        let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
+        let full_pages = 3u32;
+        let budget_blocks = 1u32; // one-page resident budget
+        let frontier = full_pages as u64 * BT as u64; // 384
+        let width = 4u64;
+
+        // host store: 3 sealed canonical pages (mean-K sign trick selects one).
+        let policy = KvStore::new(&KvStoreConfig {
+            block_tokens: BT as u32,
+            select_budget: BT as u32,
+            sink_blocks: 0,
+            recent_blocks: 0,
+            ..Default::default()
+        })
+        .expect("policy");
+        policy.register_append(full_pages * BT as u32).expect("append");
+        let keys_storage = Storage::new_ram(16 << 20).expect("keys storage");
+        let keys = RawStore::new(q8.raw_config().clone(), Some(&keys_storage)).expect("keys");
+        keys.ensure_blocks(full_pages + 1).expect("ensure blocks");
+        for b in 0..full_pages {
+            for il in 0..NL {
+                keys.write_layer_k_gpu(b * BT as u32, BT as u32, il as u32, &pack(b, il as u32, false))
+                    .expect("feed K");
+                keys.write_layer_v_gpu(b * BT as u32, BT as u32, il as u32, &pack(b, il as u32, true))
+                    .expect("feed V");
+            }
+        }
+        for il in 0..NL {
+            for b in 0..full_pages {
+                let sign = if b == (2 - il as u32) { 1.0f32 } else { -1.0f32 };
+                let tile = vec![sign; BT * KVDIM];
+                keys.write_layer_mean_k(b * BT as u32, BT as u32, il as u32, &tile).expect("mean-k");
+            }
+        }
+
+        // Persistent OutputPressure owner: NonThinking semantic scope, interval=1
+        // (sample every body row), ninfer defaults otherwise.
+        let prefill_opts = PrefillOptions {
+            block_tokens: BT as u32,
+            select_tokens: budget_blocks as u64 * BT as u64,
+            reserve_tokens: BT as u64,
+            interval: 1024,
+            stride: 32,
+            half_life: 8192.0,
+        };
+        let mut pressure = OutputPressure::new_external(
+            SessionIdentity { id: 1, incarnation: 1 },
+            &[0, 1],
+            &prefill_opts,
+            &OutputOptions {
+                scope: OutputScope::NonThinking as u32,
+                interval: 1,
+                decay: 0.5,
+                commit_max_bytes: 16_777_216,
+            },
+        )
+        .expect("output pressure owner");
+
+        // width-4 verify span bootstrap (engine session 0/0 → core 1/1 == owner).
+        let bootstrap = bootstrap_layerwise_rows(
+            frontier as u32, 0, 0, 0, &[0, 1], NH as u32, KVH as u32, HD as u32,
+            budget_blocks, record_bytes, &[], width, None,
+        )
+        .expect("bootstrap rows");
+        assert_eq!(
+            bootstrap.identity.evaluation,
+            QueryRange { begin: frontier, end: frontier + width }
+        );
+        assert_eq!(bootstrap.native_history_tokens, BT as u64, "one selected page");
+        let local_begin = bootstrap.native_history_tokens; // 128
+
+        // Open the output window at the accepted frontier, then prepare 4 body
+        // rows: NonThinking + interval=1 samples all four (mask = 0b1111).
+        pressure
+            .begin_scope(&bootstrap.identity.history, 1, OutputScopeState::new(false, false))
+            .expect("begin_scope");
+        let scope_rows = vec![OutputScopeRow::new(false, false, true); width as usize];
+        let mask = pressure.prepare_scope(1, frontier, &scope_rows).expect("prepare_scope");
+        assert_eq!(mask, 0b1111, "all four verify rows sampled");
+        let mass_rows: Vec<u32> = (0..width as u32).collect();
+
+        // 4-row all-+1 Q tile (scorer pre-RoPE + mass post-RoPE).
+        let q_dev = upload_f32(&mut gpu, &vec![1.0f32; width as usize * QDIM]);
+        let native_q = NativeCurrentLayerQuery {
+            data: q_dev.buf.as_ptr() as *const std::ffi::c_void,
+            bytes: width as usize * QDIM * 4,
+            layer: 0,
+            rows: width as u32,
+            query_heads: NH as u32,
+            kv_heads: KVH as u32,
+            head_dim: HD as u32,
+            attention_scale: 0.0,
+            scalar: 0,
+            row_stride: QDIM * 4,
+            head_stride: HD * 4,
+            dimension_stride: 4,
+        };
+        let mass_q = PageMassQuery {
+            data: q_dev.buf.as_ptr() as *const std::ffi::c_void,
+            rows: width as u32,
+            query_heads: NH as u32,
+            kv_heads: KVH as u32,
+            head_dim: HD as u32,
+            attention_scale: 0.0,
+            scalar: PageMassScalar::F32,
+        };
+        let mass = MassCapture::new(NL, frontier, local_begin, width, mass_rows);
+        let n_slots = 1 + 2; // selected_pages(1) + suffix + headroom
+        let archive_bytes = (full_pages as u64 + 2) * record_bytes;
+        let mut carrier = LayerwiseQuery::build_with_pressure(
+            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35"),
+            layerwise_capabilities(CTX as u32), bootstrap, n_slots, archive_bytes,
+            None, Some(mass),
+        )
+        .expect("build carrier");
+        let suffix_phys = carrier.suffix_slot.expect("suffix slot");
+
+        for ordinal in 0..NL {
+            let layer_q = NativeCurrentLayerQuery { layer: ordinal as u32, ..native_q };
+            carrier.restore_layer(&mut gpu, ordinal, &layer_q).expect("restore");
+            let pages = carrier.driver.arena().pool_ref().canonical_pages(ordinal).unwrap();
+            assert_eq!(pages.len(), 1, "layer {ordinal}: budget selects one page");
+            assert_eq!(pages[0], 2 - ordinal as u32, "layer {ordinal} mean-K selection");
+            // Write 4 suffix tokens (one per verify row) so every captured row
+            // sees a valid suffix K/V; row 0 is the proven single-row case.
+            let k_off = carrier.driver.arena().layout().layer_k_offset(suffix_phys as usize, ordinal).unwrap();
+            let v_off = carrier.driver.arena().layout().layer_v_offset(suffix_phys as usize, ordinal).unwrap();
+            gpu.hip.memcpy_htod_offset(&carrier.driver.arena().arena().buf, k_off, &pack(full_pages, ordinal as u32, false)[..width as usize * SEG]).expect("suffix K write");
+            gpu.hip.memcpy_htod_offset(&carrier.driver.arena().arena().buf, v_off, &pack(full_pages, ordinal as u32, true)[..width as usize * SEG]).expect("suffix V write");
+            carrier.capture_mass_layer(&mut gpu, ordinal, &mass_q).expect("capture mass");
+            carrier.attend_complete_layer(ordinal).expect("attend complete");
+        }
+
+        // Guard: an accepted prefix beyond the eval span fails closed (the
+        // carrier check, before any core state change).
+        assert!(
+            carrier.accept_output_pressure(&mut pressure, 1, frontier, width as u32 + 1).is_err(),
+            "accepted > eval_rows"
+        );
+
+        // PARTIAL acceptance: 1 of 4 verify rows confirmed. The core validates
+        // history.frontier == begin + accepted (384 + 1) and only row 0's mass
+        // conservation; rows 1-3 are captured but rejected (not yet accepted).
+        let newly = carrier
+            .accept_output_pressure(&mut pressure, 1, frontier, 1)
+            .expect("partial accept");
+        assert_eq!(newly, 0b1, "only the accepted prefix row is newly published");
+        let snap = pressure.snapshot().expect("snapshot").read().expect("read snap");
+        assert_eq!(snap.accepted_end, frontier + 1, "native consumed-row frontier (never predicted +1)");
+        assert_eq!(snap.layers.len(), NL);
+        for l in &snap.layers {
+            assert_eq!(l.samples, 1, "one accepted output row");
+            assert!(!l.pending.is_empty(), "accepted pending mass");
+            let sum: f64 = l.pending.iter().map(|(_, m)| m).sum();
+            assert!((sum - 1.0).abs() <= 0.005, "accepted row mass conserved: {sum}");
+        }
+        carrier.free(&mut gpu).expect("free carrier");
         gpu.free_tensor(q_dev).expect("free q");
     }
 }
