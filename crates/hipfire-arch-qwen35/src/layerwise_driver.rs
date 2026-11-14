@@ -24,17 +24,20 @@
 //! D4 adds the COW stripe-write guards, drop-evict and the three paged forward
 //! path integrations. Single serve thread; the FFI handles are `!Send`/`!Sync`.
 
-use crate::kvmem_ctl::KvMemCtl;
+use crate::kvmem_ctl::{KvMemCtl, LayerwiseQuotas};
 use crate::layerwise_layout::{LayerwiseQ8Layout, LAYERWISE_BLOCK_TOKENS, Q8_PACKED_FORMAT};
-use hip_bridge::PinnedTransferBuffer;
+use hip_bridge::{DeviceBuffer, PinnedTransferBuffer};
 use hipfire_kvmem::{
     BackendIdentity, BlockCopies, BlockDescriptor, ExecutionView, HostRecord, HostSource, KvMemError,
     KvRegions, KvStore, LayerMemorySnapshot, LayerPlan, LayerQueryGeometry, LayerRequestSpec,
     LayerwiseIdentity, LayerwisePhase, LayerwiseRequest, LayerwiseWork, MemoryBudget,
     MemoryCapabilities, MemoryCatalog, MemoryDescriptor, MemorySnapshot, MemoryStamp,
-    NativeCurrentLayerQuery, NativePayload, PayloadLayout, QueryRange, QueryScoreFrame, RawStore,
-    SessionIdentity, Storage,
+    NativeCurrentLayerQuery, NativePayload, PayloadLayout, PrefillAcceptance, PrefillMass,
+    PrefillPressure, QueryPlaneBytes, QueryProjectionLayout,
+    QueryProjectionPlane, QueryProjectionTape, QueryRange, QueryScoreFrame, RawStore, Reservation,
+    SessionIdentity, SpillFile, Storage,
 };
+use rdna_compute::kvmem_page_mass::PageMassQuery;
 use rdna_compute::kvmem_page_score::{PageQueryScalar, PageScoreQuery};
 use rdna_compute::kv_slots::KvSlotDesc;
 use rdna_compute::layerwise_pool::{LayerwisePagePool, PackedArenaLayout};
@@ -642,6 +645,116 @@ pub struct LayerwiseQuery<'a> {
     /// freshly written evaluation rows. 0 at a page boundary (the D4b-3 path
     /// fixtures), where the suffix page starts empty.
     pub partial_tokens: u32,
+    /// Ninfer-faithful activation-quota subsystem (③-E1): the five live quota
+    /// accounts + one projected-Q tape per FA layer. `None` for the certified ②
+    /// fixtures (which build the carrier without quotas); the engine orchestration
+    /// attaches it under Layerwise via [`Self::attach_activation`]. Purely additive
+    /// — capturing Q into host tapes never touches the arena/scorer/view, so the
+    /// forward residual is byte-identical with or without it.
+    pub activation: Option<LayerwiseActivation>,
+    /// Pressure-mode transaction state (design §3.10a, decision A). `Some` ⇒ this
+    /// step restores the persistent pressure owner's resident-only selection
+    /// directly (no scorer, no query state machine) and captures attention mass
+    /// for `PrefillPressure::accept`. `None` ⇒ the certified ② scorer Query path.
+    /// The pressure OWNER lives in the engine orchestration (taken out of
+    /// `KvMemCtl` for the step); the carrier holds only the selection inputs, the
+    /// sample schedule and the per-layer captured masses. Purely additive — the
+    /// Legacy spine never constructs it.
+    pub pressure: Option<PressureStep>,
+    /// Mode-independent attention-mass capture state (design §3.10a, E3). Present
+    /// whenever a persistent pressure owner backs the step — Query OR Pressure.
+    /// Mass is captured on the page-first (new-page) Query steps where the logical
+    /// frontier advances (`PrefillPressure::rows` samples); mid-page Pressure steps
+    /// carry an empty schedule (no-op) and only refine the keep-set. Splitting this
+    /// out of [`PressureStep`] is what lets cold-start Query steps accumulate the
+    /// pressure history that later enables Pressure refinement (otherwise the path
+    /// deadlocks in Query forever). `None` for the certified ② fixtures.
+    pub mass: Option<MassCapture>,
+}
+
+/// One ordinal's restored compact page geometry for the pressure mass packet
+/// (design §3.10a). Filled by [`LayerwiseQuery::restore_layer`] in Pressure mode.
+struct PressurePages {
+    /// Physical composite slots of the selected history pages, compact order
+    /// (the K-gather source stripes; the suffix slot is appended separately).
+    compact_slots: Vec<u32>,
+    /// Original logical block starts per compact page (`view.blocks[i].original_start`),
+    /// with the suffix page's logical start (`suffix_page * block_tokens`) last.
+    history: Vec<u64>,
+    /// Compact segment starts per page (`i * block_tokens`, suffix at index
+    /// `selected_pages`); the core zips these against `history` for exposure.
+    starts: Vec<u64>,
+}
+
+/// Pressure-mode RESTORE selection (design §3.10a, decision A). Present only on
+/// a Pressure step: the carrier restores these resident-only pages directly (no
+/// scorer, no query state machine). The mass-capture state is separate
+/// ([`MassCapture`]) and runs in BOTH modes so cold-start Query steps accumulate
+/// the pressure history that later enables Pressure refinement.
+pub struct PressureStep {
+    /// Per-ordinal pressure-selected canonical page ids (the restore input).
+    selected: Vec<Vec<u64>>,
+    /// Per-ordinal bootstrap spec budget (the `plan_layer` envelope).
+    budgets: Vec<MemoryBudget>,
+}
+
+impl PressureStep {
+    /// Build a Pressure-mode restore selection. `selected`/`budgets` are
+    /// per-ordinal (one entry per FA layer, equal length, nonempty).
+    pub fn new(selected: Vec<Vec<u64>>, budgets: Vec<MemoryBudget>) -> Result<Self, String> {
+        if selected.is_empty() || budgets.len() != selected.len() {
+            return Err(format!(
+                "layerwise pressure step: {} selections != {} budgets",
+                selected.len(),
+                budgets.len()
+            ));
+        }
+        Ok(Self { selected, budgets })
+    }
+}
+
+/// Mode-independent attention-mass capture state (design §3.10a, E3). Present
+/// whenever a persistent pressure owner backs the step (Query OR Pressure). The
+/// engine precomputes the sample schedule (`mass_rows` via `PrefillPressure::rows`);
+/// `pages`/`masses` are filled during the forward and published by
+/// [`LayerwiseQuery::accept_pressure`]. Empty `mass_rows` ⇒ the core `rows()` gate
+/// skipped this step (no capture, no accept).
+pub struct MassCapture {
+    /// The packet's logical frontier (`full_pages * block_tokens`); the accepted
+    /// history stamp frontier the pressure owner advances to.
+    frontier: u64,
+    /// The compact local begin of the sampled decode row
+    /// (`selected_pages * block_tokens + partial_tokens`).
+    local_begin: u64,
+    /// The single decode evaluation row count (admission guarantees 1).
+    eval_rows: u64,
+    /// The admitted sample schedule; empty ⇒ no capture/accept this step.
+    mass_rows: Vec<u32>,
+    /// Per-ordinal restored page geometry (filled during restore_layer).
+    pages: Vec<Option<PressurePages>>,
+    /// Per-ordinal captured masses (`rows × pages`, f64; filled by capture_mass_layer).
+    masses: Vec<Option<Vec<f64>>>,
+}
+
+impl MassCapture {
+    /// Build the mass-capture state for one step boundary. `n_layers` is the FA
+    /// ordinal count; `mass_rows` is the `PrefillPressure::rows` schedule.
+    pub fn new(
+        n_layers: usize,
+        frontier: u64,
+        local_begin: u64,
+        eval_rows: u64,
+        mass_rows: Vec<u32>,
+    ) -> Self {
+        Self {
+            frontier,
+            local_begin,
+            eval_rows,
+            mass_rows,
+            pages: (0..n_layers).map(|_| None).collect(),
+            masses: (0..n_layers).map(|_| None).collect(),
+        }
+    }
 }
 
 /// Owned GPU handles for one layer's paged attention binding, extracted from the
@@ -665,9 +778,525 @@ pub struct LayerwiseLayerViews {
     pub ctx_len: usize,
 }
 
+/// The projected-Q plane id in the hipfire layerwise activation layout. The
+/// tape stores one opaque F32 Q plane per FA layer (post-RMSNorm/pre-RoPE); the
+/// id is an engine-owned tag the E3 output pressure reads back by plane.
+const LAYERWISE_Q_PLANE: u32 = 1;
+/// Engine-owned tape format tag (opaque to the core; consistent across a query).
+const LAYERWISE_Q_FORMAT: &str = "hipfire-qwen35-projected-q";
+/// Conservative engine-side descriptor bounds for the finite metadata-envelope
+/// admission (design §3.11). These mirror ninfer's `sizeof`-based control bound:
+/// they need not match vendor STL internals, only be geometry-derived, finite
+/// and conservative so shrinking a quota genuinely fails admission closed.
+const SOURCE_VERSION_DESC_BYTES: u64 = 64;
+const FROZEN_SNAPSHOT_BASE_BYTES: u64 = 128;
+const FROZEN_BLOCK_DESC_BYTES: u64 = 64;
+const FEEDBACK_DESC_BYTES: u64 = 256;
+
+/// Ninfer-faithful layerwise activation-quota subsystem (design §3.11, ③-E1).
+///
+/// Owns the five LIVE quota accounts and one projected-Q history tape per FA
+/// layer. The tapes persist the current query's post-RMSNorm/pre-RoPE Q (one
+/// decode row per layer) into quota-backed host storage so the E3 output
+/// pressure can recompute per-page attention mass from it (`read_rows`). This is
+/// the substrate that makes the five `HIPFIRE_KVMEM_LAYERWISE_*_MIB` quotas live
+/// rather than dead knobs:
+///
+/// - `activation_ram` → [`Storage`] RAM backing the per-layer Q tapes (less the
+///   pinned staging slice), exactly ninfer's `ram_tapes = host_bytes - pin_bytes`.
+/// - `activation_disk` → [`SpillFile`] disk backing when the tape peak exceeds
+///   the RAM account (ninfer's `use_disk` tier).
+/// - `activation_metadata` → [`Storage`] + a finite control [`Reservation`]; each
+///   tape additionally reserves its `metadata_bound` here before any payload.
+/// - `staging` → the pinned [`PinnedTransferBuffer`] the Q D2H readback lands in
+///   before each `append` (ninfer's `PinnedHostBuffer(pin_bytes)`).
+/// - `metadata` → the retained source-version / frozen-index / feedback envelope,
+///   partitioned ninfer-style 5/8 – 1/8 – 1/8 – 1/8 (source / frozen / feedback /
+///   pressure) with finite-reservation admission. The last eighth is the
+///   SESSION-lifetime pressure owner's partition (③-E4), carved from the source
+///   share so the two lifetimes jointly fit one quota with no double-spend.
+///
+/// Purely ADDITIVE: it never touches the composite arena, the GPU scorer, or the
+/// resident view, so the Legacy path and the certified ② forward stay
+/// byte-neutral. Created only under Layerwise (the carrier's `attach_activation`);
+/// every account is a per-query resource released when the carrier is freed.
+pub struct LayerwiseActivation {
+    /// activation_ram: RAM backing for the Q tapes (`None` on the disk tier).
+    ram: Option<Storage>,
+    /// activation_disk: disk backing when the tape peak exceeds the RAM account.
+    disk: Option<SpillFile>,
+    /// activation_metadata: finite tape descriptor/chunk-table account.
+    metadata: Storage,
+    /// control_bytes reserved from `metadata` before any tape payload (ninfer
+    /// `metadata_controls`); held for the query lifetime.
+    controls: Reservation,
+    /// metadata envelope partitions (5th quota): source-version / frozen-index /
+    /// feedback finite reservations, ninfer-style 5/8 – 1/8 – 1/8 (the remaining
+    /// 1/8 is the SESSION-lifetime pressure partition, ③-E4).
+    source_versions: Reservation,
+    frozen_index: Reservation,
+    feedback: Reservation,
+    /// The metadata envelope account backing the three partitions above; retained
+    /// for the query so the reservations stay charged against a live account.
+    envelope: Storage,
+    /// staging: pinned Q D2H readback buffer (`pin_bytes`).
+    staging: PinnedTransferBuffer,
+    /// One projected-Q tape per FA ordinal (model_layer == ordinal).
+    tapes: Vec<QueryProjectionTape>,
+    layout: QueryProjectionLayout,
+    identity: LayerwiseIdentity,
+    q_row_bytes: usize,
+    use_disk: bool,
+}
+
+/// The admitted activation plan: every quota bound and the RAM/disk tier
+/// decision computed by [`LayerwiseActivation::admit`] BEFORE any resource is
+/// acquired. Pure data (no accounts, no GPU), so admission is host-testable and
+/// fail-closed — a quota too small for the model geometry yields `Err` with
+/// nothing allocated. [`LayerwiseActivation::new`] allocates strictly against it.
+struct ActivationPlan {
+    layout: QueryProjectionLayout,
+    max_chunks: u64,
+    control_bytes: u64,
+    pin_bytes: u64,
+    ram_tapes: u64,
+    use_disk: bool,
+    source_bound: u64,
+    frozen_bound: u64,
+    feedback_bound: u64,
+}
+
+impl LayerwiseActivation {
+    /// Pure admission (ninfer-faithful): compute every quota bound and the
+    /// RAM/disk tier decision from the model geometry, validating ALL five
+    /// quotas before the first allocation. No `Gpu`, no accounts — a too-small
+    /// quota returns `Err` with nothing acquired, so the fail-closed contract is
+    /// host-testable. [`Self::new`] allocates strictly against this plan.
+    fn admit(
+        identity: &LayerwiseIdentity,
+        n_layers: usize,
+        full_pages: u64,
+        q_row_bytes: usize,
+        quotas: &LayerwiseQuotas,
+    ) -> Result<ActivationPlan, String> {
+        if n_layers == 0 || q_row_bytes == 0 {
+            return Err("layerwise activation: zero-sized geometry".to_string());
+        }
+        let eval_rows = identity
+            .evaluation
+            .end
+            .checked_sub(identity.evaluation.begin)
+            .filter(|r| *r > 0)
+            .ok_or_else(|| "layerwise activation: empty evaluation span".to_string())?;
+        let layout = QueryProjectionLayout {
+            format: LAYERWISE_Q_FORMAT.to_string(),
+            version: 1,
+            planes: vec![QueryProjectionPlane {
+                id: LAYERWISE_Q_PLANE,
+                row_stride: q_row_bytes as u64,
+            }],
+        };
+        // One decode tile covers the whole evaluation span in a single chunk.
+        let max_chunks: u64 = 1;
+        let q_row_bytes_u64 = q_row_bytes as u64;
+        let per_tape_bytes = eval_rows
+            .checked_mul(q_row_bytes_u64)
+            .ok_or_else(|| "layerwise activation: tape row bytes overflow".to_string())?;
+        let tape_peak = per_tape_bytes
+            .checked_mul(n_layers as u64)
+            .ok_or_else(|| "layerwise activation: tape peak overflow".to_string())?;
+        let per_tape_meta = QueryProjectionTape::metadata_bound(&layout, max_chunks)
+            .map_err(|e| format!("layerwise activation: metadata bound: {e}"))?;
+
+        // ── activation_metadata: finite control reservation + per-tape bounds ──
+        let control_bytes = (std::mem::size_of::<Self>() as u64)
+            .saturating_add((n_layers as u64).saturating_mul(
+                (std::mem::size_of::<QueryProjectionTape>() as u64).saturating_add(64),
+            ))
+            .saturating_add((layout.format.len() as u64).saturating_mul(2))
+            .saturating_add(256);
+        let metadata_peak = control_bytes
+            .checked_add(per_tape_meta.saturating_mul(n_layers as u64))
+            .ok_or_else(|| "layerwise activation: metadata peak overflow".to_string())?;
+        if quotas.activation_metadata == 0 || metadata_peak > quotas.activation_metadata {
+            return Err(format!(
+                "layerwise activation: complete activation metadata {metadata_peak}B exceeds \
+                 activation_metadata quota {}B; raise HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB",
+                quotas.activation_metadata
+            ));
+        }
+
+        // ── metadata envelope (5th quota): explicit 5/8 – 1/8 – 1/8 – 1/8 partition ──
+        // source / frozen / feedback / pressure. The pressure partition (the
+        // last transient eighth) is reserved by the SESSION-lifetime pressure
+        // owner's finite admission (③-E4, `resolve_pressure_admission`), not by
+        // this per-query activation; carving it out of the source share here
+        // keeps the envelope finitely reserved with no double-spend across the
+        // two lifetimes (per-query source/frozen/feedback + per-session pressure
+        // jointly ≤ the metadata quota).
+        let transient = quotas.metadata / 8;
+        if transient == 0 {
+            return Err(
+                "layerwise activation: metadata quota is too small (HIPFIRE_KVMEM_LAYERWISE_METADATA_MIB)"
+                    .to_string(),
+            );
+        }
+        let source_cap = quotas.metadata - 3 * transient;
+        let source_bound = full_pages.saturating_mul(SOURCE_VERSION_DESC_BYTES);
+        let frozen_bound = (n_layers as u64).saturating_mul(
+            FROZEN_SNAPSHOT_BASE_BYTES.saturating_add(full_pages.saturating_mul(FROZEN_BLOCK_DESC_BYTES)),
+        );
+        let feedback_bound = (n_layers as u64).saturating_mul(FEEDBACK_DESC_BYTES);
+        if source_bound > source_cap || frozen_bound > transient || feedback_bound > transient {
+            return Err(format!(
+                "layerwise activation: retained metadata envelope (source {source_bound}B / \
+                 frozen {frozen_bound}B / feedback {feedback_bound}B) exceeds the partitioned \
+                 metadata quota {}B; raise HIPFIRE_KVMEM_LAYERWISE_METADATA_MIB",
+                quotas.metadata
+            ));
+        }
+
+        // ── staging: pinned Q readback (ninfer pin_bytes = chunk * row_bytes) ──
+        let pin_bytes = per_tape_bytes;
+        if pin_bytes > quotas.staging || pin_bytes > quotas.activation_ram {
+            return Err(format!(
+                "layerwise activation: Q staging {pin_bytes}B exceeds staging quota {}B or \
+                 activation_ram {}B; raise HIPFIRE_KVMEM_LAYERWISE_STAGING_MIB / ACTIVATION_RAM_MIB",
+                quotas.staging, quotas.activation_ram
+            ));
+        }
+
+        // ── activation tier: RAM unless the tape peak exceeds ram_tapes ──
+        let ram_tapes = quotas.activation_ram - pin_bytes;
+        let use_disk = if tape_peak <= ram_tapes {
+            false
+        } else {
+            if tape_peak > quotas.activation_disk {
+                return Err(format!(
+                    "layerwise activation: tape peak {tape_peak}B exceeds activation_disk quota \
+                     {}B; raise HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_DISK_MIB",
+                    quotas.activation_disk
+                ));
+            }
+            if quotas.disk_directory.is_none() {
+                return Err(
+                    "layerwise activation: tape peak exceeds RAM but no disk directory \
+                     (set HIPFIRE_KVMEM_SPILL_DIR)"
+                        .to_string(),
+                );
+            }
+            true
+        };
+
+        Ok(ActivationPlan {
+            layout,
+            max_chunks,
+            control_bytes,
+            pin_bytes,
+            ram_tapes,
+            use_disk,
+            source_bound,
+            frozen_bound,
+            feedback_bound,
+        })
+    }
+
+    /// Construct the activation subsystem for one query against the admitted
+    /// plan. `n_layers` is the FA ordinal count, `full_pages` the sealed
+    /// canonical page count (the source-version envelope geometry), `q_row_bytes`
+    /// the F32 Q plane row width (`n_heads * head_dim * 4`). ALL quota arithmetic
+    /// and tier admission precede the first allocation (ninfer-faithful
+    /// fail-closed, [`Self::admit`]): a quota too small for the model geometry
+    /// returns `Err` rather than partially constructing.
+    pub fn new(
+        gpu: &mut Gpu,
+        identity: LayerwiseIdentity,
+        n_layers: usize,
+        full_pages: u64,
+        q_row_bytes: usize,
+        quotas: &LayerwiseQuotas,
+    ) -> Result<Self, String> {
+        let plan = Self::admit(&identity, n_layers, full_pages, q_row_bytes, quotas)?;
+
+        // ── activation_metadata account + finite control reservation ──
+        let metadata = Storage::new_ram(quotas.activation_metadata)
+            .map_err(|e| format!("layerwise activation: metadata account: {e}"))?;
+        let controls = metadata
+            .reserve(plan.control_bytes)
+            .map_err(|e| format!("layerwise activation: control reservation: {e}"))?;
+
+        // ── metadata envelope (5th quota): three finite partitions ──
+        let envelope = Storage::new_ram(quotas.metadata)
+            .map_err(|e| format!("layerwise activation: metadata envelope: {e}"))?;
+        let source_versions = envelope
+            .reserve(plan.source_bound)
+            .map_err(|e| format!("layerwise activation: source-version reservation: {e}"))?;
+        let frozen_index = envelope
+            .reserve(plan.frozen_bound)
+            .map_err(|e| format!("layerwise activation: frozen-index reservation: {e}"))?;
+        let feedback = envelope
+            .reserve(plan.feedback_bound)
+            .map_err(|e| format!("layerwise activation: feedback reservation: {e}"))?;
+
+        // ── staging: pinned Q readback ──
+        let staging = gpu
+            .hip
+            .transfer_buffer(plan.pin_bytes as usize)
+            .map_err(|e| format!("layerwise activation: pinned staging {}B: {e:?}", plan.pin_bytes))?;
+
+        // ── activation tier account (RAM, or disk when the peak exceeds it) ──
+        let (ram, disk) = if plan.use_disk {
+            let dir = quotas
+                .disk_directory
+                .as_ref()
+                .expect("admitted disk tier has a directory");
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("layerwise activation: disk dir {}: {e}", dir.display()))?;
+            let disk = SpillFile::new(dir, quotas.activation_disk)
+                .map_err(|e| format!("layerwise activation: disk account: {e}"))?;
+            (None, Some(disk))
+        } else {
+            let ram = Storage::new_ram(plan.ram_tapes)
+                .map_err(|e| format!("layerwise activation: RAM account {}B: {e}", plan.ram_tapes))?;
+            (Some(ram), None)
+        };
+
+        // ── one projected-Q tape per FA ordinal (admits against the accounts) ──
+        let mut tapes = Vec::with_capacity(n_layers);
+        for ordinal in 0..n_layers {
+            let model_layer = ordinal as u32;
+            let tape = if plan.use_disk {
+                QueryProjectionTape::new_disk(
+                    disk.as_ref().expect("disk tier has a spill account"),
+                    &metadata,
+                    plan.max_chunks,
+                    &identity,
+                    model_layer,
+                    &plan.layout,
+                )
+            } else {
+                QueryProjectionTape::new_ram(
+                    ram.as_ref().expect("RAM tier has a storage account"),
+                    &metadata,
+                    plan.max_chunks,
+                    &identity,
+                    model_layer,
+                    &plan.layout,
+                )
+            }
+            .map_err(|e| format!("layerwise activation: tape {ordinal}: {e}"))?;
+            tapes.push(tape);
+        }
+
+        Ok(Self {
+            ram,
+            disk,
+            metadata,
+            controls,
+            source_versions,
+            frozen_index,
+            feedback,
+            envelope,
+            staging,
+            tapes,
+            layout: plan.layout,
+            identity,
+            q_row_bytes,
+            use_disk: plan.use_disk,
+        })
+    }
+
+    /// Persist ordinal `ordinal`'s projected Q into its tape. `q` is the same
+    /// post-RMSNorm/pre-RoPE native Q tile the scorer reads (a live GPU pointer);
+    /// it is D2H-read back into the pinned staging slice (blocking, race-free)
+    /// and appended as the layer's single evaluation chunk, then finished to
+    /// assert exact coverage. Additive: the arena/scorer/view are untouched.
+    pub fn capture_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        ordinal: usize,
+        q: &NativeCurrentLayerQuery,
+    ) -> Result<(), String> {
+        let Self {
+            tapes,
+            staging,
+            identity,
+            q_row_bytes,
+            ..
+        } = self;
+        let tape = tapes
+            .get_mut(ordinal)
+            .ok_or_else(|| format!("layerwise activation: ordinal {ordinal} out of range"))?;
+        let model_layer = tape.model_layer();
+        let begin = identity.evaluation.begin;
+        let count = identity.evaluation.end - begin;
+        let bytes = (count as usize)
+            .checked_mul(*q_row_bytes)
+            .ok_or_else(|| "layerwise activation: capture bytes overflow".to_string())?;
+        if bytes > staging.size() || bytes > q.bytes {
+            return Err(format!(
+                "layerwise activation: Q readback {bytes}B exceeds staging {}B or query {}B",
+                staging.size(),
+                q.bytes
+            ));
+        }
+        // Non-owning view of the live Q GPU tile (the scorer reads the same ptr).
+        // SAFETY: `q.data` is valid GPU memory for `q.bytes` for this call (the
+        // native query contract); the view is borrowed and never freed.
+        let q_buf = unsafe { DeviceBuffer::from_raw(q.data as *mut std::ffi::c_void, q.bytes) };
+        let host = staging.as_bytes_mut();
+        gpu.hip
+            .memcpy_dtoh(&mut host[..bytes], &q_buf)
+            .map_err(|e| format!("layerwise activation: Q D2H {ordinal}: {e:?}"))?;
+        let plane = QueryPlaneBytes {
+            id: LAYERWISE_Q_PLANE,
+            data: &host[..bytes],
+        };
+        let chunk = tape
+            .append(identity, model_layer, begin, count, &[plane])
+            .map_err(|e| format!("layerwise activation: append {ordinal}: {e}"))?;
+        // The tape retains coverage; the exported chunk handle is not needed here
+        // (E3 reads back through the tape). Drop it to release the short lease.
+        drop(chunk);
+        tape.finish(identity, model_layer)
+            .map_err(|e| format!("layerwise activation: finish {ordinal}: {e}"))?;
+        Ok(())
+    }
+
+    /// Read back ordinal `ordinal`'s persisted Q plane (E3 output pressure). The
+    /// destination must hold `count * q_row_bytes` bytes; `begin`/`count` are
+    /// token rows within the evaluation span. Fails closed on a foreign range.
+    pub fn read_layer(
+        &self,
+        ordinal: usize,
+        begin: u64,
+        count: u64,
+        dest: &mut [u8],
+    ) -> Result<(), String> {
+        let tape = self
+            .tapes
+            .get(ordinal)
+            .ok_or_else(|| format!("layerwise activation: ordinal {ordinal} out of range"))?;
+        tape.read_rows(
+            &self.identity,
+            tape.model_layer(),
+            LAYERWISE_Q_PLANE,
+            begin,
+            count,
+            dest,
+        )
+        .map_err(|e| format!("layerwise activation: read {ordinal}: {e}"))
+    }
+
+    /// The Q plane row width in bytes (`n_heads * head_dim * 4`).
+    pub fn q_row_bytes(&self) -> usize {
+        self.q_row_bytes
+    }
+    /// Number of per-layer tapes (FA ordinal count).
+    pub fn n_layers(&self) -> usize {
+        self.tapes.len()
+    }
+    /// Whether the tape peak forced the disk tier.
+    pub fn use_disk(&self) -> bool {
+        self.use_disk
+    }
+    /// The query identity the tapes were admitted under.
+    pub fn identity(&self) -> LayerwiseIdentity {
+        self.identity
+    }
+    /// The engine-owned projected-Q layout.
+    pub fn layout(&self) -> &QueryProjectionLayout {
+        &self.layout
+    }
+
+    // ── account introspection (the five quotas are live, charged accounts) ──
+    // These read the RAII owner fields so the finite charges are observable for
+    // admission tests and E3 diagnostics; the accounts are held for the query so
+    // the tape reservations stay backed.
+
+    /// activation_ram charge (0 on the disk tier).
+    pub fn ram_charged_bytes(&self) -> u64 {
+        self.ram.as_ref().map(|s| s.charged_bytes()).unwrap_or(0)
+    }
+    /// activation_disk charge (0 on the RAM tier).
+    pub fn disk_charged_bytes(&self) -> u64 {
+        self.disk.as_ref().map(|s| s.charged_bytes()).unwrap_or(0)
+    }
+    /// activation_metadata charge (control reservation + per-tape metadata bounds).
+    pub fn metadata_charged_bytes(&self) -> u64 {
+        self.metadata.charged_bytes()
+    }
+    /// metadata envelope charge (source-version + frozen-index + feedback).
+    pub fn envelope_charged_bytes(&self) -> u64 {
+        self.envelope.charged_bytes()
+    }
+    /// Unused control reservation (activation_metadata).
+    pub fn control_remaining(&self) -> u64 {
+        self.controls.remaining()
+    }
+    /// Unused source-version partition (metadata envelope).
+    pub fn source_versions_remaining(&self) -> u64 {
+        self.source_versions.remaining()
+    }
+    /// Unused frozen-index partition (metadata envelope).
+    pub fn frozen_index_remaining(&self) -> u64 {
+        self.frozen_index.remaining()
+    }
+    /// Unused feedback partition (metadata envelope).
+    pub fn feedback_remaining(&self) -> u64 {
+        self.feedback.remaining()
+    }
+}
+
 impl<'a> LayerwiseQuery<'a> {
     pub fn new(driver: LayerwiseDriver<'a>, staging: LayerwiseDescStaging) -> Self {
-        Self { driver, staging, suffix_slot: None, suffix_page: 0, partial_tokens: 0 }
+        Self {
+            driver,
+            staging,
+            suffix_slot: None,
+            suffix_page: 0,
+            partial_tokens: 0,
+            activation: None,
+            pressure: None,
+            mass: None,
+        }
+    }
+
+    /// Attach the activation-quota subsystem (③-E1) after [`Self::build`]. Derives
+    /// the tape geometry from the admitted query (FA ordinal count, sealed
+    /// canonical page count, evaluation identity) and the caller-supplied F32 Q
+    /// row width (`n_heads * head_dim * 4`). The engine orchestration calls this
+    /// under Layerwise; the certified ② fixtures skip it (carrier stays `None`).
+    /// Fails closed if a quota cannot admit the model geometry.
+    pub fn attach_activation(
+        &mut self,
+        gpu: &mut Gpu,
+        quotas: &LayerwiseQuotas,
+        q_row_bytes: usize,
+    ) -> Result<(), String> {
+        let identity = self
+            .driver
+            .query_identity()
+            .ok_or_else(|| "layerwise attach_activation: no active query".to_string())?;
+        let n_layers = self.driver.canonical().len();
+        let full_pages = self
+            .driver
+            .canonical()
+            .first()
+            .map(|s| s.memory.blocks.len() as u64)
+            .unwrap_or(0);
+        self.activation = Some(LayerwiseActivation::new(
+            gpu, identity, n_layers, full_pages, q_row_bytes, quotas,
+        )?);
+        Ok(())
+    }
+
+    /// The attached activation subsystem (E3 output pressure reads its tapes).
+    pub fn activation(&self) -> Option<&LayerwiseActivation> {
+        self.activation.as_ref()
+    }
+    pub fn activation_mut(&mut self) -> Option<&mut LayerwiseActivation> {
+        self.activation.as_mut()
     }
 
     /// Restore ordinal `ordinal`'s selected pages into the composite arena and
@@ -686,17 +1315,61 @@ impl<'a> LayerwiseQuery<'a> {
         ordinal: usize,
         q: &NativeCurrentLayerQuery,
     ) -> Result<u64, String> {
-        let view = self.driver.project_restore(gpu, ordinal, q)?;
+        // Pressure mode (design §3.10a): restore the persistent owner's
+        // resident-only selection directly (no scorer, no query state machine);
+        // Query mode: the certified ② scorer projection. Extract the pressure
+        // inputs first so the driver borrow never overlaps the carrier borrow.
+        let pressure_input = self
+            .pressure
+            .as_ref()
+            .map(|p| (p.selected[ordinal].clone(), p.budgets[ordinal]));
+        let view = if let Some((selected, budget)) = pressure_input {
+            self.driver.restore_layer_selected(gpu, ordinal, &selected, budget)?
+        } else {
+            self.driver.project_restore(gpu, ordinal, q)?
+        };
+        // ③-E1: persist this layer's projected Q into its quota-backed tape (the
+        // E3 output-pressure recompute base). Additive — a separate host copy of
+        // the same Q tile the scorer just read; the arena/view are untouched, so
+        // the compacted extent and residual below are byte-identical. Pressure
+        // mode attaches no activation (it reads the live post-RoPE Q for mass).
+        if let Some(act) = self.activation.as_mut() {
+            act.capture_layer(gpu, ordinal, q)?;
+        }
         let compact = self
             .driver
             .arena()
             .pool_ref()
             .compact_slots(ordinal)?
             .to_vec();
-        let (_begin, rows) = self
-            .driver
-            .evaluation_span()
-            .ok_or("layerwise query: restore_layer without an active query")?;
+        // Pressure mode runs no query state machine, so the evaluation row count
+        // comes from the mass-capture identity; Query mode reads it from the
+        // active query (the certified ② path, byte-identical with/without mass).
+        let rows = if self.pressure.is_some() {
+            self.mass
+                .as_ref()
+                .ok_or("layerwise pressure restore without mass capture")?
+                .eval_rows
+        } else {
+            self.driver
+                .evaluation_span()
+                .ok_or("layerwise query: restore_layer without an active query")?
+                .1
+        };
+        // Record the restored compact page geometry for the pressure mass packet
+        // (history = original logical starts, suffix last; starts = compact
+        // segment offsets). The K-gather sources are the compact physical slots.
+        // Runs in BOTH modes whenever a pressure owner backs the step (Query
+        // new-page steps capture mass; Pressure mid-page steps carry an empty
+        // schedule but still record geometry for the keep-set).
+        if let Some(m) = self.mass.as_mut() {
+            let bt = self.driver.block_tokens() as u64;
+            let mut history: Vec<u64> =
+                view.blocks.iter().map(|b| b.block.original_start).collect();
+            history.push(self.suffix_page as u64 * bt);
+            let starts: Vec<u64> = (0..history.len() as u64).map(|i| i * bt).collect();
+            m.pages[ordinal] = Some(PressurePages { compact_slots: compact.clone(), history, starts });
+        }
         // The paged decode arm always writes a current token, so the wired path
         // sets suffix_slot; `None` (no suffix page) attends history only. The
         // suffix stripe holds the partial page's already-fed tokens (restored
@@ -730,13 +1403,155 @@ impl<'a> LayerwiseQuery<'a> {
     /// and close its attending phase. Reads the span from the active query's
     /// identity (the same `rows` [`Self::restore_layer`] added to the compacted
     /// causal bound), so the engine need not re-derive it. Call AFTER the paged
-    /// attention has consumed the restored working set.
+    /// attention has consumed the restored working set. Pressure mode runs no
+    /// query state machine, so this is a no-op there (the mass hook captures the
+    /// attended boundary separately).
     pub fn attend_complete_layer(&mut self, ordinal: usize) -> Result<(), String> {
+        if self.pressure.is_some() {
+            return Ok(());
+        }
         let (begin, rows) = self
             .driver
             .evaluation_span()
             .ok_or("layerwise query: attend_complete without an active query")?;
         self.driver.attend_complete(ordinal, begin, rows)
+    }
+
+    /// Whether this carrier runs the Pressure-mode restore (design §3.10a).
+    pub fn is_pressure(&self) -> bool {
+        self.pressure.is_some()
+    }
+
+    /// Capture ordinal `ordinal`'s per-page attention mass (design §3.10a, E3).
+    /// Call at the post-attention boundary (post-RoPE `q`, restored arena K).
+    /// No-op when no pressure owner backs the step or the `rows()` schedule is
+    /// empty (most decode steps). Gathers the selected K stripes + suffix and
+    /// runs the E2 mass kernel, storing `rows × pages` f64 masses for
+    /// [`Self::accept_pressure`].
+    pub fn capture_mass_layer(
+        &mut self,
+        gpu: &mut Gpu,
+        ordinal: usize,
+        q: &PageMassQuery,
+    ) -> Result<(), String> {
+        let (mass_rows, local_begin, compact_slots, suffix_slot) = {
+            let m = match self.mass.as_ref() {
+                Some(m) => m,
+                None => return Ok(()),
+            };
+            if m.mass_rows.is_empty() {
+                return Ok(());
+            }
+            let pages = m.pages[ordinal]
+                .as_ref()
+                .ok_or_else(|| format!("layerwise mass: layer {ordinal} not restored"))?;
+            (m.mass_rows.clone(), m.local_begin, pages.compact_slots.clone(), self.suffix_slot)
+        };
+        let rows: Vec<i32> = mass_rows.iter().map(|&r| r as i32).collect();
+        let positions: Vec<i32> = mass_rows
+            .iter()
+            .map(|&r| (local_begin + r as u64) as i32)
+            .collect();
+        let masses = self.driver.page_mass(
+            gpu,
+            ordinal,
+            q,
+            &compact_slots,
+            suffix_slot,
+            &rows,
+            &positions,
+        )?;
+        let masses64: Vec<f64> = masses.iter().map(|&m| m as f64).collect();
+        if let Some(m) = self.mass.as_mut() {
+            m.masses[ordinal] = Some(masses64);
+        }
+        Ok(())
+    }
+
+    /// Accept the whole-model captured mass into the persistent pressure owner
+    /// (design §3.10a). Builds one [`PrefillAcceptance`] from every FA layer's
+    /// captured packet and publishes it at the complete native boundary. Returns
+    /// `Ok(false)` (no-op) when no pressure owner backs the step or the `rows()`
+    /// schedule is empty (mid-page Pressure steps); `Ok(true)` when the owner
+    /// accepted; `Err` on a validation throw. Call AFTER the forward (every
+    /// layer's mass captured), BEFORE the carrier is freed.
+    pub fn accept_pressure(&mut self, pressure: &mut PrefillPressure) -> Result<bool, String> {
+        let m = match self.mass.as_ref() {
+            Some(m) => m,
+            None => return Ok(false),
+        };
+        if m.mass_rows.is_empty() {
+            return Ok(false);
+        }
+        let fa_layers = self.driver.fa_layers();
+        let mut layers = Vec::with_capacity(fa_layers.len());
+        for ordinal in 0..fa_layers.len() {
+            let pages = m.pages[ordinal]
+                .as_ref()
+                .ok_or_else(|| format!("layerwise pressure accept: layer {ordinal} not restored"))?;
+            let masses = m.masses[ordinal]
+                .as_ref()
+                .ok_or_else(|| format!("layerwise pressure accept: layer {ordinal} mass not captured"))?;
+            layers.push(PrefillMass {
+                model_layer: fa_layers[ordinal],
+                starts: pages.starts.clone(),
+                history: pages.history.clone(),
+                masses: masses.clone(),
+            });
+        }
+        // The accepted history stamp: the frozen canonical identity with frontier
+        // at this step's complete native boundary (== bootstrap full_pages*block).
+        let mut stamp = self.driver.canonical()[0].memory.stamp;
+        stamp.frontier = m.frontier;
+        let acceptance = PrefillAcceptance {
+            history: stamp,
+            count: m.eval_rows,
+            accepted: m.eval_rows,
+            local_begin: m.local_begin,
+            rows: m.mass_rows.clone(),
+            layers,
+        };
+        pressure
+            .accept(&acceptance)
+            .map_err(|e| format!("layerwise pressure accept: {e}"))
+    }
+
+    /// The per-ordinal restored canonical page ids (the keep-set contribution of
+    /// this step). Pressure mode ⇒ the pressure selection (`choice.selected`);
+    /// Query mode ⇒ the scorer's restored view blocks. The engine orchestration
+    /// unions these with the previous keep-set on a Query step (pool growth) or
+    /// replaces the keep-set on a Pressure step (truncate to budget). The suffix
+    /// page is excluded (it is not a canonical block).
+    pub fn restored_keep_set(&self) -> Result<Vec<Vec<u64>>, String> {
+        let n = self.driver.fa_layers().len();
+        let bt = self.driver.block_tokens() as u64;
+        let mut out = Vec::with_capacity(n);
+        if self.pressure.is_some() {
+            let m = self
+                .mass
+                .as_ref()
+                .ok_or("layerwise keep-set: pressure step without mass capture")?;
+            for ordinal in 0..n {
+                let pages = m.pages[ordinal]
+                    .as_ref()
+                    .ok_or_else(|| format!("layerwise keep-set: layer {ordinal} not restored"))?;
+                // history last entry is the suffix; the rest are original starts.
+                let ids: Vec<u64> = pages.history[..pages.history.len() - 1]
+                    .iter()
+                    .map(|&s| s / bt)
+                    .collect();
+                out.push(ids);
+            }
+        } else {
+            for ordinal in 0..n {
+                let view = self
+                    .driver
+                    .view(ordinal)
+                    .ok_or_else(|| format!("layerwise keep-set: layer {ordinal} not restored"))?;
+                out.push(view.blocks.iter().map(|b| b.block.id).collect());
+            }
+        }
+        Ok(out)
     }
 
     /// Extract ordinal `ordinal`'s owned paged-binding handles (see
@@ -773,6 +1588,35 @@ impl<'a> LayerwiseQuery<'a> {
         n_slots: usize,
         archive_bytes: u64,
     ) -> Result<Self, String> {
+        Self::build_with_pressure(
+            gpu, keys, policy, q8, backend, capabilities, bootstrap, n_slots, archive_bytes, None, None,
+        )
+    }
+
+    /// [`Self::build`] with an explicit Pressure-mode transaction (design §3.10a).
+    /// `pressure == None` admits the ② scorer Query (begin_query); `Some(step)`
+    /// skips the query state machine entirely — the carrier restores the
+    /// pressure-selected pages directly via [`LayerwiseDriver::restore_layer_selected`]
+    /// and captures mass for the persistent owner. `mass` is the mode-independent
+    /// attention-mass capture state (present in BOTH modes when a pressure owner
+    /// backs the step; `None` for the certified ② fixtures). The activation-quota
+    /// subsystem is attached separately by the engine ONLY in Query mode (it
+    /// admits under the query identity); Pressure mode reads the live post-RoPE Q
+    /// for mass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_with_pressure(
+        gpu: &mut Gpu,
+        keys: &'a RawStore,
+        policy: &'a KvStore,
+        q8: &LayerwiseQ8Layout,
+        backend: BackendIdentity,
+        capabilities: MemoryCapabilities,
+        bootstrap: LayerwiseBootstrap,
+        n_slots: usize,
+        archive_bytes: u64,
+        pressure: Option<PressureStep>,
+        mass: Option<MassCapture>,
+    ) -> Result<Self, String> {
         let n_layers = bootstrap.canonical.len();
         let mut driver = LayerwiseDriver::new(
             gpu,
@@ -785,11 +1629,13 @@ impl<'a> LayerwiseQuery<'a> {
             n_slots,
             archive_bytes,
         )?;
-        driver.begin_query(
-            bootstrap.identity,
-            bootstrap.specs,
-            bootstrap.native_history_tokens,
-        )?;
+        if pressure.is_none() {
+            driver.begin_query(
+                bootstrap.identity,
+                bootstrap.specs,
+                bootstrap.native_history_tokens,
+            )?;
+        }
         // The per-layer block table maps the compacted history (selected_pages)
         // plus the one suffix page; `n_slots` may carry extra arena headroom, so
         // derive the tight table bound from the selected extent rather than the
@@ -808,6 +1654,8 @@ impl<'a> LayerwiseQuery<'a> {
         carrier.suffix_slot = Some(suffix_phys);
         carrier.suffix_page = bootstrap.suffix_page;
         carrier.partial_tokens = bootstrap.partial_tokens;
+        carrier.pressure = pressure;
+        carrier.mass = mass;
         Ok(carrier)
     }
 
@@ -839,12 +1687,20 @@ pub struct LayerwiseBootstrap {
 /// Synthesize a fresh layerwise query bootstrap for one decode step (design
 /// §3.9g). `fed` is the host-store length BEFORE this step's token (the current
 /// token position `p`). `full_pages = fed / 128` sealed pages form the canonical
-/// history (`resident = []` — the scoped driver starts from an empty arena, so
-/// every selected page is freshly restored); the current partial page is the
-/// suffix. Fails closed when there is no sealed history page (`fed < 128`): the
-/// caller falls back to Legacy. `seq` / `incarnation` come from the slot's
-/// layerwise counters; `record_bytes` is the sealed canonical record size (all
-/// fa layers × one page K+V) for the host-payload budget.
+/// history; the current partial page is the suffix. Fails closed when there is
+/// no sealed history page (`fed < 128`): the caller falls back to Legacy. `seq` /
+/// `incarnation` come from the slot's layerwise counters; `record_bytes` is the
+/// sealed canonical record size (all fa layers × one page K+V) for the host-payload
+/// budget.
+///
+/// `resident` is the slot's persistent PER-LAYER keep-set (decision A, §3.10a):
+/// `resident[ordinal]` holds the canonical block ids selected for FA ordinal
+/// `ordinal` by the previous step (pressure.select on a Pressure step, the ②
+/// scorer on a Query step). It drives each layer's `MemorySnapshot.resident`
+/// (replacing the pure re-bootstrap `[]`); ids beyond the current sealed history
+/// are filtered defensively, and an absent ordinal entry reads as `[]`. An empty
+/// slice reproduces the ② re-bootstrap behaviour (every selected page freshly
+/// restored).
 #[allow(clippy::too_many_arguments)]
 pub fn bootstrap_layerwise(
     fed: u32,
@@ -857,6 +1713,7 @@ pub fn bootstrap_layerwise(
     head_dim: u32,
     budget_blocks: u32,
     record_bytes: u64,
+    resident: &[Vec<u64>],
 ) -> Result<LayerwiseBootstrap, String> {
     let bt = LAYERWISE_BLOCK_TOKENS;
     if fa_layers.is_empty() {
@@ -911,13 +1768,22 @@ pub fn bootstrap_layerwise(
     let mut canonical = Vec::with_capacity(fa_layers.len());
     let mut specs = Vec::with_capacity(fa_layers.len());
     for (ordinal, &model_layer) in fa_layers.iter().enumerate() {
+        // Decision A (§3.10a): the persistent PER-LAYER keep-set drives each
+        // layer's canonical resident list. Keep only ids within the current
+        // sealed history (the keep-set is a subset of a previous step's history,
+        // which only grows within a session, so this filter is defensive). An
+        // absent ordinal entry reads as `[]` (cold start / re-bootstrap).
+        let resident_ids: Vec<u64> = resident
+            .get(ordinal)
+            .map(|ids| ids.iter().copied().filter(|&id| id < full_pages as u64).collect())
+            .unwrap_or_default();
         let mut stamp = base_stamp;
         // Per-layer view_version diverges (the catalog's shared-history
         // admission allows this, mirroring the core fixture).
         stamp.view_version = revision + ordinal as u64;
         canonical.push(LayerMemorySnapshot {
             model_layer,
-            memory: MemorySnapshot { stamp, blocks: blocks.clone(), resident: Vec::new() },
+            memory: MemorySnapshot { stamp, blocks: blocks.clone(), resident: resident_ids.clone() },
         });
         specs.push(LayerRequestSpec {
             model_layer,
@@ -1014,6 +1880,15 @@ pub fn layerwise_capabilities(max_position: u32) -> MemoryCapabilities {
 /// ordinal — not the sparse model layer id. `max_position` is the engine KV
 /// capacity (an upper bound on any decode position); `model` tags the backend
 /// identity (opaque admission key, consistent across the transaction).
+///
+/// `pressure` is the slot's detached persistent pressure owner (design §3.10a,
+/// decision A), borrowed for the trigger / `select` / `rows` schedule (all
+/// `&self`). `None` ⇒ the certified ② scorer Query path with no mass capture
+/// (the Legacy spine and the ② fixtures). `Some` ⇒ the engine decides Query
+/// (scorer cold-start / new-page admission) vs Pressure (resident-only mass
+/// refinement) per the Q2/Q3 trigger, and attaches the mode-independent mass
+/// capture. The orchestration owns the owner for the post-forward `accept`
+/// (scoped take/restore — the carrier borrows `ctl`, so the owner is detached).
 #[allow(clippy::too_many_arguments)]
 pub fn engine_carrier<'a>(
     gpu: &mut Gpu,
@@ -1027,6 +1902,7 @@ pub fn engine_carrier<'a>(
     head_dim: usize,
     max_position: u32,
     model: &str,
+    pressure: Option<&PrefillPressure>,
 ) -> Result<Option<LayerwiseQuery<'a>>, String> {
     if !ctl.strategy().is_layerwise() {
         return Ok(None);
@@ -1065,6 +1941,10 @@ pub fn engine_carrier<'a>(
         head_dim as u32,
         ctl.budget_blocks() as u32,
         record_bytes,
+        // Decision A (§3.10a): the slot's persistent PER-LAYER keep-set drives
+        // each layer's canonical resident list (empty before the first selection
+        // ⇒ ② re-bootstrap).
+        ctl.layerwise_keep_set(slot).unwrap_or(&[]),
     )?;
     let selected_pages =
         (bootstrap.native_history_tokens / LAYERWISE_BLOCK_TOKENS as u64) as usize;
@@ -1085,7 +1965,86 @@ pub fn engine_carrier<'a>(
     // (+1 headroom); the GPU arena above stays compact regardless.
     let full_pages = (fed / LAYERWISE_BLOCK_TOKENS) as u64;
     let archive_bytes = (full_pages + 2) * record_bytes;
-    let carrier = LayerwiseQuery::build(
+    // ── Pressure trigger (design §3.10a, Q2/Q3) ──────────────────────────────
+    // A new canonical page is sealed exactly when `fed` lands on a page boundary
+    // (`fed % 128 == 0`): the scorer Query admits it (pressure has no cold recall).
+    // Mid-page steps refine the resident keep-set by accumulated attention mass
+    // ONLY when the history overflows the budget AND every FA layer has a positive
+    // accepted pressure state. `pressure.select` Pending (any layer without a
+    // positive-mass selection) falls back to Query. The owner is borrowed (`&self`
+    // select/rows/snapshot); the orchestration owns it for the post-forward accept.
+    let budget_blocks = ctl.budget_blocks() as u32;
+    let new_page = fed % LAYERWISE_BLOCK_TOKENS == 0;
+    let keep_empty = ctl
+        .layerwise_keep_set(slot)
+        .map(|k| k.iter().all(|ids| ids.is_empty()))
+        .unwrap_or(true);
+    let pressure_positive = match pressure {
+        Some(p) => p
+            .snapshot()
+            .ok()
+            .and_then(|s| s.read().ok())
+            .map(|snap| !snap.layers.is_empty() && snap.layers.iter().all(|l| l.samples > 0))
+            .unwrap_or(false),
+        None => false,
+    };
+    let pressure_step: Option<PressureStep> = match pressure {
+        Some(p) if !new_page && !keep_empty && pressure_positive && full_pages > budget_blocks as u64 => {
+            let layout = q8
+                .payload_layout()
+                .map_err(|e| format!("layerwise engine: manifest: {e}"))?;
+            let descriptor = MemoryDescriptor::new(
+                &layerwise_backend(model),
+                &layout,
+                &layerwise_capabilities(max_position),
+            )
+            .map_err(|e| format!("layerwise engine: descriptor: {e}"))?;
+            let catalog = MemoryCatalog::new(&descriptor, &bootstrap.canonical)
+                .map_err(|e| format!("layerwise engine: catalog: {e}"))?;
+            let budget_tokens = budget_blocks as u64 * LAYERWISE_BLOCK_TOKENS as u64;
+            let choices = p
+                .select(&catalog, &[], budget_tokens, 0)
+                .map_err(|e| format!("layerwise engine: pressure select: {e}"))?;
+            let all = choices
+                .read_all()
+                .map_err(|e| format!("layerwise engine: pressure choices: {e}"))?;
+            if all.len() != n_fa_layers || all.iter().any(|c| c.selected.is_empty()) {
+                None // Pending ⇒ scorer Query fallback
+            } else {
+                let mut selected = Vec::with_capacity(n_fa_layers);
+                for ordinal in 0..n_fa_layers {
+                    let choice = all
+                        .iter()
+                        .find(|c| c.model_layer == fa_layers[ordinal])
+                        .ok_or_else(|| {
+                            format!("layerwise engine: pressure choice missing layer {ordinal}")
+                        })?;
+                    selected.push(choice.selected.clone());
+                }
+                let budgets: Vec<MemoryBudget> = bootstrap.specs.iter().map(|s| s.budget).collect();
+                Some(PressureStep::new(selected, budgets)?)
+            }
+        }
+        _ => None,
+    };
+    // Mode-independent mass-capture state (design §3.10a): present whenever a
+    // pressure owner backs the step. The sample schedule is gated by the core
+    // `rows()` (frontier advance + interval/near); empty ⇒ no capture/accept this
+    // step. `local_begin` is the compact causal tail of the single decode row
+    // (selected_pages*128 + partial_tokens), identical in both modes because the
+    // picker reproduces `native_history_tokens` (Σ selected page tokens).
+    let mass = match pressure {
+        Some(p) => {
+            let frontier = bootstrap.identity.history.frontier;
+            let local_begin = bootstrap.native_history_tokens + bootstrap.partial_tokens as u64;
+            let mass_rows = p
+                .rows(frontier - 1, 1, local_begin, false)
+                .map_err(|e| format!("layerwise engine: pressure rows: {e}"))?;
+            Some(MassCapture::new(n_fa_layers, frontier, local_begin, 1, mass_rows))
+        }
+        None => None,
+    };
+    let mut carrier = LayerwiseQuery::build_with_pressure(
         gpu,
         keys,
         policy,
@@ -1095,8 +2054,51 @@ pub fn engine_carrier<'a>(
         bootstrap,
         n_slots,
         archive_bytes,
+        pressure_step,
+        mass,
     )?;
+    // ③-E1: attach the activation-quota subsystem (five live accounts + per-FA-layer
+    // projected-Q tapes) ONLY in Query mode — it admits under the query identity.
+    // Pressure mode runs no query state machine and reads the live post-RoPE Q for
+    // mass instead. On a quota admission failure the just-built carrier owns GPU
+    // buffers with no Drop, so free it before propagating the error.
+    if !carrier.is_pressure() {
+        if let Err(e) = carrier.attach_activation(gpu, ctl.layerwise_quotas(), n_heads * head_dim * 4) {
+            let _ = carrier.free(gpu);
+            return Err(e);
+        }
+    }
     Ok(Some(carrier))
+}
+
+/// Combine the previous per-layer keep-set with this step's restored canonical
+/// page ids (design §3.10a keep-set lifecycle, ninfer window-faithful). A Query
+/// step UNIONS (`prev ∪ restored`, sorted/deduped) so the resident pool grows to
+/// admit scorer selections and newly sealed pages; a Pressure step TRUNCATES to
+/// the refined `restored` selection (the mass/exposure reorder prunes the pool
+/// back to budget). `n_layers` is the FA ordinal count; an absent ordinal entry
+/// reads as `[]`. Pure host logic — the arena is still freshly restored every
+/// step (device-truth); the keep-set persists only the SELECTION state.
+pub fn combine_keep_set(
+    prev: &[Vec<u64>],
+    restored: &[Vec<u64>],
+    pressure: bool,
+    n_layers: usize,
+) -> Vec<Vec<u64>> {
+    (0..n_layers)
+        .map(|ordinal| {
+            let mut ids = if pressure {
+                restored.get(ordinal).cloned().unwrap_or_default()
+            } else {
+                let mut u = prev.get(ordinal).cloned().unwrap_or_default();
+                u.extend(restored.get(ordinal).into_iter().flatten().copied());
+                u
+            };
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        })
+        .collect()
 }
 
 /// Lazily seal one canonical block's packed record from the statistics store
@@ -1559,6 +2561,140 @@ impl<'a> LayerwiseDriver<'a> {
         Ok(view)
     }
 
+    /// Build a fresh catalog over the frozen canonical history (design §3.10a).
+    /// The per-layer `resident` lists are the persistent keep-set baked in by
+    /// [`bootstrap_layerwise`]; the pressure owner's `select` reads them as the
+    /// resident-only candidate pool. Pure host data — no GPU, no state machine.
+    pub fn pressure_catalog(&self) -> Result<MemoryCatalog, String> {
+        MemoryCatalog::new(&self.descriptor, &self.canonical)
+            .map_err(|e| format!("layerwise pressure: catalog: {e}"))
+    }
+
+    /// Pressure-driven restore (design §3.10a, decision A): restore ordinal
+    /// `ordinal`'s pressure-`selected` pages WITHOUT the scorer or the query
+    /// state machine. Builds the selection plan directly from
+    /// `catalog.plan_layer` (the core `plan_working_set` accepts any
+    /// catalog-subset selection; `expected` must equal the layer's frozen
+    /// stamp) and executes it through the SAME certified [`restore_layer_pages`]
+    /// the ② scorer path uses (evict/bind/restore/fence). Returns the post-fence
+    /// [`ExecutionView`]. The caller (the carrier's Pressure mode) owns the
+    /// transaction lifecycle — this method never touches `self.active`, so it
+    /// runs with no admitted query. `budget` is the layer's bootstrap spec
+    /// budget (selected/reserve/device/host envelope).
+    pub fn restore_layer_selected(
+        &mut self,
+        gpu: &mut Gpu,
+        ordinal: usize,
+        selected: &[u64],
+        budget: MemoryBudget,
+    ) -> Result<ExecutionView, String> {
+        if ordinal >= self.fa_layers.len() {
+            return Err(format!("layerwise pressure: ordinal {ordinal} out of range"));
+        }
+        let model_layer = self.fa_layers[ordinal];
+        let expected = self.canonical[ordinal].memory.stamp;
+        let catalog = self.pressure_catalog()?;
+        let selection = hipfire_kvmem::LayerSelection {
+            model_layer,
+            expected,
+            selected: selected.to_vec(),
+            mandatory: Vec::new(),
+            budget,
+        };
+        let plan = catalog
+            .plan_layer(&selection)
+            .map_err(|e| format!("layerwise pressure: plan_layer {model_layer}: {e}"))?;
+        restore_layer_pages(
+            gpu,
+            &mut self.arena,
+            &self.archive,
+            self.keys,
+            &self.backend,
+            &self.layout,
+            &mut self.records,
+            &mut self.slab,
+            &plan,
+            ordinal,
+            self.block_tokens,
+        )
+    }
+
+    /// Recompute ordinal `ordinal`'s per-page attention mass for the sampled Q
+    /// rows (design §3.10a, E2/E3): D2D-gather the selected history K stripes
+    /// (`compact_slots`, compact order) PLUS the suffix stripe into ONE
+    /// contiguous page-major Q8_0 buffer — the composite arena interleaves K/V
+    /// planes per `(slot, layer)` stripe, but [`Gpu::kvmem_page_mass`] reads a
+    /// uniform `PAGE_TOKENS × kv_heads × 272` page stride (`== k_plane_bytes`).
+    /// The identity table `[0..pages]` then maps each logical page to its
+    /// gathered physical page. `positions[s]` is the inclusive compact causal
+    /// end of sample `s` in the gathered frame; `rows[s]` indexes the Q tile.
+    /// Returns `samples × pages` f32 masses (sample-major), each row summing to
+    /// 1 over the visible cache. The gather buffer is freed before returning;
+    /// the arena and the attention kernels are untouched (additive recompute).
+    #[allow(clippy::too_many_arguments)]
+    pub fn page_mass(
+        &mut self,
+        gpu: &mut Gpu,
+        ordinal: usize,
+        q: &PageMassQuery,
+        compact_slots: &[u32],
+        suffix_slot: Option<u32>,
+        rows: &[i32],
+        positions: &[i32],
+    ) -> Result<Vec<f32>, String> {
+        if ordinal >= self.fa_layers.len() {
+            return Err(format!("layerwise mass: ordinal {ordinal} out of range"));
+        }
+        let layout = self.arena.layout();
+        let k_plane = layout.k_plane_bytes();
+        let pages = compact_slots.len() + usize::from(suffix_slot.is_some());
+        if pages == 0 {
+            return Err("layerwise mass: empty page domain".to_string());
+        }
+        let gather_bytes = pages
+            .checked_mul(k_plane)
+            .ok_or_else(|| format!("layerwise mass: gather {pages} * {k_plane} overflow"))?;
+        let gather = gpu
+            .alloc_tensor(&[gather_bytes], DType::Raw)
+            .map_err(|e| format!("layerwise mass: gather alloc {gather_bytes}B: {e:?}"))?;
+        let result = (|| -> Result<Vec<f32>, String> {
+            // Gather each selected history page's K plane, then the suffix K
+            // plane, into consecutive page-major slots of the scratch buffer.
+            for (i, &slot) in compact_slots.iter().enumerate() {
+                let src = layout
+                    .layer_k_offset(slot as usize, ordinal)
+                    .map_err(|e| format!("layerwise mass: k offset slot {slot}: {e}"))?;
+                gpu.hip
+                    .memcpy_dtod_at(&gather.buf, i * k_plane, &self.arena.arena().buf, src, k_plane)
+                    .map_err(|e| format!("layerwise mass: gather K page {i}: {e:?}"))?;
+            }
+            if let Some(slot) = suffix_slot {
+                let src = layout
+                    .layer_k_offset(slot as usize, ordinal)
+                    .map_err(|e| format!("layerwise mass: suffix k offset slot {slot}: {e}"))?;
+                let dst = compact_slots.len() * k_plane;
+                gpu.hip
+                    .memcpy_dtod_at(&gather.buf, dst, &self.arena.arena().buf, src, k_plane)
+                    .map_err(|e| format!("layerwise mass: gather suffix K: {e:?}"))?;
+            }
+            let table: Vec<i32> = (0..pages as i32).collect();
+            let mut out = vec![0f32; rows.len() * pages];
+            gpu.kvmem_page_mass(
+                q,
+                rows,
+                positions,
+                &table,
+                gather.buf.as_ptr() as *const std::ffi::c_void,
+                pages,
+                &mut out,
+            )
+            .map_err(|e| format!("layerwise mass: kernel: {e:?}"))?;
+            Ok(out)
+        })();
+        let _ = gpu.free_tensor(gather);
+        result
+    }
+
     /// Restore the suffix page's already-fed tokens into `suffix_slot`'s ordinal
     /// stripe (design §3.9g, mid-page decode). The current partial page
     /// (`suffix_page`) holds `partial_tokens` fed tokens in the statistics store;
@@ -1667,6 +2803,13 @@ impl<'a> LayerwiseDriver<'a> {
         Some((ev.begin, ev.end - ev.begin))
     }
 
+    /// The active transaction's full identity, or `None` between queries. The
+    /// activation subsystem (③-E1) admits its projected-Q tapes under this same
+    /// identity so the E3 pressure readback proves index provenance.
+    pub fn query_identity(&self) -> Option<LayerwiseIdentity> {
+        self.active.as_ref().map(|a| a.identity)
+    }
+
     /// Publish the accepted per-layer snapshots and advance the canonical history.
     /// Mirrors the core `layerwise_request_test.cpp` `accepted()` recipe EXACTLY:
     /// each layer's stamp is its restored view's stamp with history_revision,
@@ -1761,6 +2904,14 @@ impl<'a> LayerwiseDriver<'a> {
     pub fn stamp(&self) -> MemoryStamp {
         self.stamp
     }
+    /// ordinal → model layer (the dense FA ordinals `0..n_fa_layers`).
+    pub fn fa_layers(&self) -> &[u32] {
+        &self.fa_layers
+    }
+    /// The canonical page size in tokens (pinned to the catalog layout).
+    pub fn block_tokens(&self) -> u32 {
+        self.block_tokens
+    }
     /// The composite arena (residency queries / stripe views).
     pub fn arena(&self) -> &LayerwiseArena {
         &self.arena
@@ -1783,6 +2934,11 @@ impl<'a> LayerwiseDriver<'a> {
     /// The reduced plan retained for ordinal `ordinal` (after project_restore).
     pub fn plan(&self, ordinal: usize) -> Option<&LayerPlan> {
         self.active.as_ref()?.plans.get(ordinal)?.as_ref()
+    }
+    /// The post-fence restored view retained for ordinal `ordinal` (after
+    /// project_restore). `None` between queries or before the layer restores.
+    pub fn view(&self, ordinal: usize) -> Option<&ExecutionView> {
+        self.active.as_ref()?.views.get(ordinal)?.as_ref()
     }
     /// The number of canonical blocks sealed into the write-through archive.
     pub fn sealed_records(&self) -> usize {
@@ -1878,6 +3034,30 @@ mod tests {
         let starts: Vec<u64> = (0..n).map(|i| (i as u64) * BT as u64).collect();
         let counts: Vec<u32> = vec![BT; n];
         (starts, counts, mask.to_vec(), vec![0u8; n])
+    }
+
+    /// Keep-set lifecycle (design §3.10a): a Query step UNIONS the resident pool
+    /// (sorted/deduped, admitting scorer selections + newly sealed pages); a
+    /// Pressure step TRUNCATES to the refined selection. Pure host logic — no GPU.
+    #[test]
+    fn combine_keep_set_query_union_pressure_truncate() {
+        let prev = vec![vec![0u64, 2, 3], vec![1, 2]];
+        let restored = vec![vec![3u64, 4, 0], vec![2, 5]];
+        // Query: union per ordinal, sorted + deduped.
+        let q = combine_keep_set(&prev, &restored, false, 2);
+        assert_eq!(q, vec![vec![0, 2, 3, 4], vec![1, 2, 5]]);
+        // Pressure: truncate to the restored selection (sorted + deduped).
+        let p = combine_keep_set(&prev, &restored, true, 2);
+        assert_eq!(p, vec![vec![0, 3, 4], vec![2, 5]]);
+        // Absent ordinal entries read as []; n_layers governs the output length.
+        let short = combine_keep_set(&[], &restored, false, 3);
+        assert_eq!(short, vec![vec![0, 3, 4], vec![2, 5], Vec::<u64>::new()]);
+        // Empty restored on a Query step keeps the previous pool.
+        let keep = combine_keep_set(&prev, &[vec![], vec![]], false, 2);
+        assert_eq!(keep, vec![vec![0, 2, 3], vec![1, 2]]);
+        // Empty restored on a Pressure step truncates to empty.
+        let empty = combine_keep_set(&prev, &[vec![], vec![]], true, 2);
+        assert_eq!(empty, vec![Vec::<u64>::new(), Vec::<u64>::new()]);
     }
 
     /// The bridge gathers Mean-K in enabled order, maps the native Q descriptor,
@@ -2492,6 +3672,413 @@ mod tests {
         assert_eq!(driver.phase(), None);
         gpu.free_tensor(qt).expect("free q");
         driver.free(&mut gpu).expect("free driver");
+    }
+
+    /// Host-only: activation admission is fail-closed BEFORE any allocation
+    /// (ninfer-faithful, design §3.11/§5.1 E1). A too-small quota for the model
+    /// geometry yields `Err` with nothing acquired; the RAM/disk tier decision
+    /// flips on the tape peak. No GPU — `admit` is pure arithmetic plus the
+    /// shim's `metadata_bound`, so the whole admission contract is host-testable.
+    #[test]
+    fn layerwise_activation_admission_fail_closed() {
+        let id = LayerwiseIdentity {
+            history: fx_stamp(),
+            request: 91,
+            evaluation: QueryRange { begin: FX_FRONTIER, end: FX_FRONTIER + 1 },
+            query: QueryRange { begin: FX_FRONTIER, end: FX_FRONTIER + 1 },
+        };
+        let n_layers = 2usize;
+        let full_pages = 2u64;
+        let q_row_bytes = QW * 4; // 1024
+        let base = LayerwiseQuotas::default();
+
+        // The seeds admit the tiny geometry on the RAM tier; the plan carries the
+        // exact geometry-derived bounds the constructor will reserve.
+        let plan = LayerwiseActivation::admit(&id, n_layers, full_pages, q_row_bytes, &base)
+            .expect("admit default");
+        assert!(!plan.use_disk);
+        assert_eq!(plan.pin_bytes, q_row_bytes as u64); // one decode row
+        assert_eq!(plan.ram_tapes, base.activation_ram - plan.pin_bytes);
+        assert!(plan.control_bytes > 0);
+        assert_eq!(plan.source_bound, full_pages * SOURCE_VERSION_DESC_BYTES);
+        assert_eq!(
+            plan.frozen_bound,
+            n_layers as u64 * (FROZEN_SNAPSHOT_BASE_BYTES + full_pages * FROZEN_BLOCK_DESC_BYTES)
+        );
+        assert_eq!(plan.feedback_bound, n_layers as u64 * FEEDBACK_DESC_BYTES);
+
+        // Zero-sized geometry / empty evaluation span fail closed.
+        assert!(LayerwiseActivation::admit(&id, 0, full_pages, q_row_bytes, &base).is_err());
+        assert!(LayerwiseActivation::admit(&id, n_layers, full_pages, 0, &base).is_err());
+        let empty = LayerwiseIdentity {
+            evaluation: QueryRange { begin: FX_FRONTIER, end: FX_FRONTIER },
+            ..id
+        };
+        assert!(LayerwiseActivation::admit(&empty, n_layers, full_pages, q_row_bytes, &base).is_err());
+
+        // activation_metadata too small (control + per-tape bounds cannot fit).
+        let mut q = base.clone();
+        q.activation_metadata = 1;
+        assert!(LayerwiseActivation::admit(&id, n_layers, full_pages, q_row_bytes, &q).is_err());
+        q.activation_metadata = 0;
+        assert!(LayerwiseActivation::admit(&id, n_layers, full_pages, q_row_bytes, &q).is_err());
+
+        // metadata envelope too small: transient partition == 0, then bounds exceed.
+        let mut q = base.clone();
+        q.metadata = 7; // 7/8 == 0 → transient zero
+        assert!(LayerwiseActivation::admit(&id, n_layers, full_pages, q_row_bytes, &q).is_err());
+        let mut q = base.clone();
+        q.metadata = 8; // transient 1; frozen_bound 512 > 1
+        assert!(LayerwiseActivation::admit(&id, n_layers, full_pages, q_row_bytes, &q).is_err());
+
+        // staging too small for the pinned Q readback.
+        let mut q = base.clone();
+        q.staging = (q_row_bytes as u64) - 1;
+        assert!(LayerwiseActivation::admit(&id, n_layers, full_pages, q_row_bytes, &q).is_err());
+
+        // activation_ram too small for even the staging slice.
+        let mut q = base.clone();
+        q.activation_ram = (q_row_bytes as u64) - 1;
+        assert!(LayerwiseActivation::admit(&id, n_layers, full_pages, q_row_bytes, &q).is_err());
+
+        // Disk tier: tape_peak = 2*1024 = 2048; pin = 1024; activation_ram = 2048
+        // → ram_tapes = 1024 < 2048 → disk. Without a directory it fails closed.
+        let mut q = base.clone();
+        q.activation_ram = 2048;
+        q.staging = 1024;
+        q.activation_disk = 4096;
+        q.disk_directory = None;
+        assert!(LayerwiseActivation::admit(&id, n_layers, full_pages, q_row_bytes, &q).is_err());
+        // With a directory the disk tier is admitted.
+        q.disk_directory = Some(std::path::PathBuf::from("/tmp/hipfire-activation-admit"));
+        let plan = LayerwiseActivation::admit(&id, n_layers, full_pages, q_row_bytes, &q)
+            .expect("admit disk tier");
+        assert!(plan.use_disk);
+        // activation_disk too small for the tape peak → fail closed.
+        q.activation_disk = 2047;
+        assert!(LayerwiseActivation::admit(&id, n_layers, full_pages, q_row_bytes, &q).is_err());
+    }
+
+    /// GPU: the activation subsystem captures each FA layer's projected Q via a
+    /// pinned D2H readback into its quota-backed tape and reads it back byte-exact
+    /// (design §5.1 E1, RAM tier). Also proves the readback is NON-DESTRUCTIVE —
+    /// the scorer's GPU Q tile is byte-unchanged after capture, the additive
+    /// guarantee — and that all five quotas are live, charged accounts.
+    #[test]
+    #[ignore]
+    fn layerwise_activation_q_readback_byte_exact() {
+        let mut gpu = Gpu::init().expect("gpu");
+        let id = LayerwiseIdentity {
+            history: fx_stamp(),
+            request: 92,
+            evaluation: QueryRange { begin: FX_FRONTIER, end: FX_FRONTIER + 1 },
+            query: QueryRange { begin: FX_FRONTIER, end: FX_FRONTIER + 1 },
+        };
+        let n_layers = 2usize;
+        let full_pages = 2u64;
+        let q_row_bytes = QW * 4; // 1024 (4 query heads × 64 dim × 4)
+        let quotas = LayerwiseQuotas::default();
+        let mut act =
+            LayerwiseActivation::new(&mut gpu, id, n_layers, full_pages, q_row_bytes, &quotas)
+                .expect("activation");
+        assert!(!act.use_disk());
+        assert_eq!(act.n_layers(), n_layers);
+        assert_eq!(act.q_row_bytes(), q_row_bytes);
+
+        // Per-layer distinct F32 Q oracle (one decode row), uploaded to the GPU.
+        let mut tiles = Vec::new();
+        for ordinal in 0..n_layers {
+            let host: Vec<f32> = (0..QW)
+                .map(|i| (((i * 13 + ordinal * 101) % 29) as f32) * 0.05 - 0.7)
+                .collect();
+            let bytes = unsafe {
+                std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4)
+            }
+            .to_vec();
+            let t = gpu.alloc_tensor(&[host.len() * 4], DType::Raw).expect("q alloc");
+            gpu.hip.memcpy_htod(&t.buf, &bytes).expect("q h2d");
+            let q = NativeCurrentLayerQuery {
+                data: t.buf.as_ptr() as *const std::ffi::c_void,
+                bytes: host.len() * 4,
+                layer: ordinal as u32,
+                rows: 1,
+                query_heads: Q_HEADS,
+                kv_heads: KV_HEADS,
+                head_dim: HEAD_DIM,
+                attention_scale: 0.0,
+                scalar: 0,
+                row_stride: QW * 4,
+                head_stride: HEAD_DIM as usize * 4,
+                dimension_stride: 4,
+            };
+            act.capture_layer(&mut gpu, ordinal, &q).expect("capture");
+
+            // Byte-exact tape readback (absolute token begin == evaluation.begin).
+            let mut got = vec![0u8; q_row_bytes];
+            act.read_layer(ordinal, FX_FRONTIER, 1, &mut got).expect("read");
+            assert_eq!(got, bytes, "layer {ordinal} Q tape byte-exact");
+
+            // Non-destructive: the GPU Q tile is unchanged after the D2H capture.
+            let mut after = vec![0u8; q_row_bytes];
+            gpu.hip.memcpy_dtoh_at(&mut after, &t.buf, 0).expect("q d2h");
+            assert_eq!(after, bytes, "layer {ordinal} GPU Q tile untouched (additive)");
+            tiles.push(t);
+        }
+
+        // All five quotas are live, charged accounts (RAM tier).
+        let tape_peak = (n_layers * q_row_bytes) as u64;
+        assert_eq!(act.ram_charged_bytes(), tape_peak, "activation_ram charged the tape peak");
+        assert_eq!(act.disk_charged_bytes(), 0, "RAM tier: no disk charge");
+        // activation_metadata == the unused control reservation + each tape's bound.
+        let lay = act.layout().clone();
+        let per_tape_meta = QueryProjectionTape::metadata_bound(&lay, 1).expect("bound");
+        assert_eq!(
+            act.metadata_charged_bytes(),
+            act.control_remaining() + per_tape_meta * n_layers as u64
+        );
+        assert!(act.metadata_charged_bytes() <= quotas.activation_metadata);
+        assert!(act.control_remaining() > 0);
+        // The envelope partitions are reserved exactly (unused → remaining == bound).
+        let source_bound = full_pages * SOURCE_VERSION_DESC_BYTES;
+        let frozen_bound =
+            n_layers as u64 * (FROZEN_SNAPSHOT_BASE_BYTES + full_pages * FROZEN_BLOCK_DESC_BYTES);
+        let feedback_bound = n_layers as u64 * FEEDBACK_DESC_BYTES;
+        assert_eq!(act.source_versions_remaining(), source_bound);
+        assert_eq!(act.frozen_index_remaining(), frozen_bound);
+        assert_eq!(act.feedback_remaining(), feedback_bound);
+        assert_eq!(
+            act.envelope_charged_bytes(),
+            source_bound + frozen_bound + feedback_bound
+        );
+        assert!(act.envelope_charged_bytes() <= quotas.metadata);
+
+        // A foreign ordinal / range fails closed.
+        assert!(act.read_layer(n_layers, FX_FRONTIER, 1, &mut vec![0u8; q_row_bytes]).is_err());
+        assert!(act.read_layer(0, FX_FRONTIER + 1, 1, &mut vec![0u8; q_row_bytes]).is_err());
+
+        for t in tiles {
+            gpu.free_tensor(t).expect("free q");
+        }
+        drop(act);
+    }
+
+    /// GPU: when the tape peak exceeds the RAM account the activation admits the
+    /// DISK tier ([`SpillFile`]) and the Q readback is still byte-exact from disk
+    /// (design §5.1 E1). Forces the tier with a small activation_ram + a temp
+    /// spill directory; asserts the disk account is charged and RAM is not.
+    #[test]
+    #[ignore]
+    fn layerwise_activation_disk_tier_readback_byte_exact() {
+        let mut gpu = Gpu::init().expect("gpu");
+        let id = LayerwiseIdentity {
+            history: fx_stamp(),
+            request: 93,
+            evaluation: QueryRange { begin: FX_FRONTIER, end: FX_FRONTIER + 1 },
+            query: QueryRange { begin: FX_FRONTIER, end: FX_FRONTIER + 1 },
+        };
+        let n_layers = 2usize;
+        let full_pages = 2u64;
+        let q_row_bytes = QW * 4; // 1024
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-activation-disk-{}", std::process::id()));
+        // tape_peak = 2048; pin = 1024; activation_ram = 2048 → ram_tapes 1024 < 2048.
+        let quotas = LayerwiseQuotas {
+            activation_ram: 2048,
+            activation_disk: 8192,
+            staging: 1024,
+            disk_directory: Some(dir.clone()),
+            ..LayerwiseQuotas::default()
+        };
+        let mut act =
+            LayerwiseActivation::new(&mut gpu, id, n_layers, full_pages, q_row_bytes, &quotas)
+                .expect("disk activation");
+        assert!(act.use_disk(), "tape peak forces the disk tier");
+        assert_eq!(act.ram_charged_bytes(), 0, "disk tier: no RAM tape charge");
+
+        let mut tiles = Vec::new();
+        for ordinal in 0..n_layers {
+            let host: Vec<f32> = (0..QW)
+                .map(|i| (((i * 7 + ordinal * 53) % 23) as f32) * 0.1 - 0.5)
+                .collect();
+            let bytes = unsafe {
+                std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4)
+            }
+            .to_vec();
+            let t = gpu.alloc_tensor(&[host.len() * 4], DType::Raw).expect("q alloc");
+            gpu.hip.memcpy_htod(&t.buf, &bytes).expect("q h2d");
+            let q = NativeCurrentLayerQuery {
+                data: t.buf.as_ptr() as *const std::ffi::c_void,
+                bytes: host.len() * 4,
+                layer: ordinal as u32,
+                rows: 1,
+                query_heads: Q_HEADS,
+                kv_heads: KV_HEADS,
+                head_dim: HEAD_DIM,
+                attention_scale: 0.0,
+                scalar: 0,
+                row_stride: QW * 4,
+                head_stride: HEAD_DIM as usize * 4,
+                dimension_stride: 4,
+            };
+            act.capture_layer(&mut gpu, ordinal, &q).expect("capture disk");
+            let mut got = vec![0u8; q_row_bytes];
+            act.read_layer(ordinal, FX_FRONTIER, 1, &mut got).expect("read disk");
+            assert_eq!(got, bytes, "layer {ordinal} disk Q tape byte-exact");
+            tiles.push(t);
+        }
+        let tape_peak = (n_layers * q_row_bytes) as u64;
+        assert_eq!(act.disk_charged_bytes(), tape_peak, "activation_disk charged the tape peak");
+        assert!(act.metadata_charged_bytes() > 0);
+        assert!(act.envelope_charged_bytes() > 0);
+        for t in tiles {
+            gpu.free_tensor(t).expect("free q");
+        }
+        drop(act);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// GPU carrier-level additive proof (design §5.1 E1): attaching the activation
+    /// subsystem to a real [`LayerwiseQuery`] carrier and restoring each layer
+    /// captures the projected Q into the tapes WITHOUT perturbing the certified ②
+    /// restore — the selected resident page and compacted extent are identical to
+    /// the no-activation driver transaction (`driver_end_to_end_layerwise_transaction`),
+    /// the tape holds the Q byte-exact, and the scorer's GPU Q tile is byte-unchanged
+    /// after capture. The activation is a pure host side-copy on the Layerwise path.
+    #[test]
+    #[ignore]
+    fn layerwise_carrier_activation_additive() {
+        let mut gpu = Gpu::init().expect("gpu");
+        let q8 = fx_layout();
+        let kw = FX_KV_HEADS * FX_HEAD_DIM; // 32 (query_heads == kv_heads == 1)
+        let q_row_bytes = kw * 4; // 128
+        let rows = 1u32; // single decode row
+
+        // Policy + packed store: both canonical pages, both layers (the fx fixture).
+        let policy = KvStore::new(&KvStoreConfig {
+            block_tokens: FX_BT,
+            select_budget: FX_BT,
+            sink_blocks: 0,
+            recent_blocks: 0,
+            ..Default::default()
+        })
+        .expect("policy");
+        policy.register_append(FX_FRONTIER as u32).expect("append");
+        let keys_storage = Storage::new_ram(16 << 20).expect("keys storage");
+        let keys = RawStore::new(q8.raw_config().clone(), Some(&keys_storage)).expect("keys");
+        keys.ensure_blocks(2).expect("ensure blocks");
+        for b in 0..2u32 {
+            for il in 0..FX_LAYERS {
+                keys.write_layer_k_gpu(b * FX_BT, FX_BT, il, &fx_pack(b, il, false)).expect("K");
+                keys.write_layer_v_gpu(b * FX_BT, FX_BT, il, &fx_pack(b, il, true)).expect("V");
+            }
+        }
+        // Mean-K sign trick: layer 0 favors page 200, layer 1 page 100 (as certified).
+        for il in 0..FX_LAYERS {
+            for b in 0..2u32 {
+                let sign = if (b == 1) == (il == 0) { 1.0f32 } else { -1.0f32 };
+                let tile = vec![sign; FX_BT as usize * kw];
+                keys.write_layer_mean_k(b * FX_BT, FX_BT, il, &tile).expect("mean-k");
+            }
+        }
+
+        // Shared all-+1 native Q tile (one row) — the certified selection input.
+        let host = vec![1.0f32; rows as usize * kw];
+        let q_bytes = unsafe {
+            std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4)
+        }
+        .to_vec();
+        let qt = gpu.alloc_tensor(&[host.len() * 4], DType::Raw).expect("q alloc");
+        gpu.hip.memcpy_htod(&qt.buf, &q_bytes).expect("q h2d");
+        let q_base = NativeCurrentLayerQuery {
+            data: qt.buf.as_ptr() as *const std::ffi::c_void,
+            bytes: host.len() * 4,
+            layer: 0,
+            rows,
+            query_heads: 1,
+            kv_heads: FX_KV_HEADS as u32,
+            head_dim: FX_HEAD_DIM as u32,
+            attention_scale: 0.0,
+            scalar: 0,
+            row_stride: kw * 4,
+            head_stride: FX_HEAD_DIM * 4,
+            dimension_stride: 4,
+        };
+
+        let driver = LayerwiseDriver::new(
+            &mut gpu,
+            &keys,
+            &policy,
+            &q8,
+            fx_backend(),
+            fx_capabilities(),
+            fx_snapshots(),
+            3,
+            16 << 20,
+        )
+        .expect("driver");
+        let staging = LayerwiseDescStaging::new(&mut gpu, FX_LAYERS as usize, 3).expect("staging");
+        let mut carrier = LayerwiseQuery::new(driver, staging);
+        // History-only restore (no suffix write) isolates the capture seam.
+        carrier.suffix_slot = None;
+
+        let identity = LayerwiseIdentity {
+            history: fx_stamp(),
+            request: 94,
+            evaluation: QueryRange { begin: FX_FRONTIER, end: FX_FRONTIER + rows as u64 },
+            query: QueryRange { begin: FX_FRONTIER, end: FX_FRONTIER + rows as u64 },
+        };
+        let geom = |ordinal: u32| LayerQueryGeometry {
+            layer: ordinal,
+            query_heads: 1,
+            kv_heads: FX_KV_HEADS as u32,
+            head_dim: FX_HEAD_DIM as u32,
+            attention_scale: 0.0,
+        };
+        let specs = vec![
+            LayerRequestSpec { model_layer: 0, query: geom(0), budget: fx_budget(), mandatory: vec![] },
+            LayerRequestSpec { model_layer: 1, query: geom(1), budget: fx_budget(), mandatory: vec![] },
+        ];
+        carrier.driver.begin_query(identity, specs, FX_BT as u64).expect("begin_query");
+
+        // Attach the activation subsystem (the engine_carrier wiring under test).
+        carrier
+            .attach_activation(&mut gpu, &LayerwiseQuotas::default(), q_row_bytes)
+            .expect("attach_activation");
+        assert!(carrier.activation().is_some());
+        assert_eq!(carrier.activation().unwrap().n_layers(), FX_LAYERS as usize);
+
+        for ordinal in 0..FX_LAYERS as usize {
+            let mut q = q_base;
+            q.layer = ordinal as u32;
+            let extent = carrier.restore_layer(&mut gpu, ordinal, &q).expect("restore_layer");
+            // Identical to the certified no-activation transaction: one selected
+            // page (FX_BT tokens), layer 0 → canonical page 1, layer 1 → page 0.
+            assert_eq!(extent, FX_BT as u64, "compacted extent unperturbed by capture");
+            let page = if ordinal == 0 { 1u32 } else { 0u32 };
+            assert_eq!(
+                carrier.driver.arena().pool_ref().canonical_pages(ordinal).unwrap(),
+                vec![page],
+                "selection unperturbed by capture"
+            );
+            // The tape captured this layer's Q byte-exact.
+            let mut got = vec![0u8; q_row_bytes];
+            carrier
+                .activation()
+                .unwrap()
+                .read_layer(ordinal, FX_FRONTIER, rows as u64, &mut got)
+                .expect("read tape");
+            assert_eq!(got, q_bytes, "layer {ordinal} carrier tape byte-exact");
+            // Non-destructive: the scorer's GPU Q tile is unchanged after restore.
+            let mut after = vec![0u8; q_row_bytes];
+            gpu.hip.memcpy_dtoh_at(&mut after, &qt.buf, 0).expect("q d2h");
+            assert_eq!(after, q_bytes, "layer {ordinal} GPU Q tile untouched (additive)");
+            carrier.attend_complete_layer(ordinal).expect("attend_complete");
+        }
+        assert_eq!(carrier.driver.phase(), Some(LayerwisePhase::AwaitingAcceptance));
+
+        carrier.driver.end_query();
+        gpu.free_tensor(qt).expect("free q");
+        carrier.free(&mut gpu).expect("free carrier");
     }
 
     /// D4a addressing proof (design §3.8/§3.9): the composite [`LayerwiseArena`]
@@ -4312,6 +5899,7 @@ mod tests {
                 HD as u32,
                 budget_blocks,
                 record_bytes,
+                /*resident=*/ &[],
             )
             .expect("bootstrap");
             assert_eq!(bootstrap.suffix_page, full_pages, "suffix page = fed/128");
@@ -4505,5 +6093,311 @@ mod tests {
 
         weights.free_gpu(&mut gpu);
         s.free_gpu(&mut gpu).expect("free scratch");
+    }
+
+    /// Carrier-level pressure transaction (design §3.10a, decision A, ③-E3.5):
+    /// the FULL ninfer-faithful mass → accept → select → Pressure-restore chain
+    /// over a directly-fed `RawStore`, driven through the production
+    /// [`bootstrap_layerwise`] + [`LayerwiseQuery::build_with_pressure`] seam (no
+    /// `run_layers_slots`; the carrier is exercised directly so the mass hook and
+    /// the resident-only selection are isolated from the projection ladder).
+    ///
+    /// Geometry: `path_fixture` (head_dim 256 / 6 Q heads / 1 KV head — the mass
+    /// kernel hard-gates head_dim==256), 3 sealed canonical pages, a ONE-page
+    /// resident budget (so the history overflows the budget and Pressure
+    /// refinement is admitted). Two phases mirror the engine's Q2/Q3 trigger:
+    ///
+    ///   * Phase 1 — a NEW-PAGE Query step (fed 384, a page boundary): the ②
+    ///     scorer selects one page per layer (mean-K sign trick: layer 0 → page
+    ///     2, layer 1 → page 1), the carrier restores it byte-exact, captures
+    ///     attention mass against a controlled post-RoPE Q tile (the current
+    ///     token is written into the suffix stripe first, exactly as the paged
+    ///     writer does), and `accept_pressure` publishes the whole-model packet
+    ///     into a fresh persistent owner. The Query keep-set UNION is verified.
+    ///   * Phase 2 — a MID-PAGE Pressure step (fed 424, partial 40): the owner's
+    ///     `select` refines a RESIDENT-ONLY keep-set (candidates come exclusively
+    ///     from the accepted resident map — NO cold recall), the carrier restores
+    ///     the pressure-selected pages byte-exact into a FRESH arena (the
+    ///     device-truth invariant: a freshly bound stripe is always restored even
+    ///     when the plan marks it resident), the mid-page suffix fed prefix is
+    ///     restored byte-exact, the empty `rows()` schedule makes mass/accept a
+    ///     no-op, and the Pressure keep-set TRUNCATE is verified.
+    ///
+    /// Byte-exact references are the independent `pack(page, layer, K/V)` pattern
+    /// (non-circular). The mass leg is proven by `accept` returning `Ok(true)`
+    /// (the core enforces per-row |Σmass−1|≤.005) plus a positive-mass snapshot;
+    /// the E2 kernel test already qualifies the mass math against an FP64 oracle.
+    #[test]
+    #[ignore]
+    fn carrier_pressure_mass_accept_select_byte_exact() {
+        use hipfire_kvmem::{PrefillOptions, PressureSource};
+        use path_fixture::*;
+        use rdna_compute::kvmem_page_mass::PageMassScalar;
+
+        let mut gpu = Gpu::init().expect("gpu");
+        if gpu.arch != "gfx1100" {
+            // The ported scorer + mass kernel admit gfx1100 only.
+            return;
+        }
+
+        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
+        let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
+        let full_pages = 3u32;
+        let budget_blocks = 1u32; // one-page resident budget ⇒ history overflows
+        let frontier = full_pages as u64 * BT as u64; // 384
+
+        // ── host store: 3 sealed canonical pages + a 40-token partial suffix ──
+        let policy = KvStore::new(&KvStoreConfig {
+            block_tokens: BT as u32,
+            select_budget: BT as u32,
+            sink_blocks: 0,
+            recent_blocks: 0,
+            ..Default::default()
+        })
+        .expect("policy");
+        policy.register_append(full_pages * BT as u32).expect("append");
+        let keys_storage = Storage::new_ram(16 << 20).expect("keys storage");
+        let keys = RawStore::new(q8.raw_config().clone(), Some(&keys_storage)).expect("keys");
+        keys.ensure_blocks(full_pages + 1).expect("ensure blocks");
+        for b in 0..full_pages {
+            for il in 0..NL {
+                keys.write_layer_k_gpu(b * BT as u32, BT as u32, il as u32, &pack(b, il as u32, false))
+                    .expect("feed K");
+                keys.write_layer_v_gpu(b * BT as u32, BT as u32, il as u32, &pack(b, il as u32, true))
+                    .expect("feed V");
+            }
+        }
+        // The partial suffix page (logical page 3): 40 already-fed tokens for the
+        // mid-page Pressure step's `restore_suffix_page`.
+        let partial = 40u32;
+        for il in 0..NL {
+            let kb = pack(full_pages, il as u32, false);
+            let vb = pack(full_pages, il as u32, true);
+            keys.write_layer_k_gpu(full_pages * BT as u32, partial, il as u32, &kb[..partial as usize * SEG])
+                .expect("feed suffix K");
+            keys.write_layer_v_gpu(full_pages * BT as u32, partial, il as u32, &vb[..partial as usize * SEG])
+                .expect("feed suffix V");
+        }
+        // Mean-K sign trick: layer 0 favors page 2, layer 1 favors page 1.
+        for il in 0..NL {
+            for b in 0..full_pages {
+                let sign = if b == (2 - il as u32) { 1.0f32 } else { -1.0f32 };
+                let tile = vec![sign; BT * KVDIM];
+                keys.write_layer_mean_k(b * BT as u32, BT as u32, il as u32, &tile).expect("mean-k");
+            }
+        }
+
+        // The persistent session-lifetime pressure owner (mirrors
+        // `KvMemCtl::ensure_layerwise_pressure`: 1-based session, ninfer defaults).
+        let mut pressure = PrefillPressure::new(
+            SessionIdentity { id: 1, incarnation: 1 },
+            &[0, 1],
+            &PrefillOptions {
+                block_tokens: BT as u32,
+                select_tokens: budget_blocks as u64 * BT as u64,
+                reserve_tokens: BT as u64,
+                interval: 1024,
+                stride: 32,
+                half_life: 8192.0,
+            },
+        )
+        .expect("pressure owner");
+
+        // Shared all-+1 native Q tile (scorer pre-RoPE + mass post-RoPE; the test
+        // feeds arbitrary packed K, so the same tile serves both — the E2 kernel
+        // test qualifies the mass math, here we prove the integration).
+        let q_dev = upload_f32(&mut gpu, &vec![1.0f32; QDIM]);
+        let native_q = NativeCurrentLayerQuery {
+            data: q_dev.buf.as_ptr() as *const std::ffi::c_void,
+            bytes: QDIM * 4,
+            layer: 0,
+            rows: 1,
+            query_heads: NH as u32,
+            kv_heads: KVH as u32,
+            head_dim: HD as u32,
+            attention_scale: 0.0,
+            scalar: 0, // F32
+            row_stride: QDIM * 4,
+            head_stride: HD * 4,
+            dimension_stride: 4,
+        };
+        let mass_q = PageMassQuery {
+            data: q_dev.buf.as_ptr() as *const std::ffi::c_void,
+            rows: 1,
+            query_heads: NH as u32,
+            kv_heads: KVH as u32,
+            head_dim: HD as u32,
+            attention_scale: 0.0,
+            scalar: PageMassScalar::F32,
+        };
+        let n_slots = 1 + 2; // selected_pages(1) + suffix + headroom
+        let archive_bytes = (full_pages as u64 + 2) * record_bytes;
+
+        // ── Phase 1: NEW-PAGE Query step (fed 384) with mass capture ──────────
+        let bootstrap1 = bootstrap_layerwise(
+            frontier as u32, 0, 0, 0, &[0, 1], NH as u32, KVH as u32, HD as u32,
+            budget_blocks, record_bytes, &[],
+        )
+        .expect("bootstrap1");
+        assert_eq!(bootstrap1.identity.history.frontier, frontier);
+        assert_eq!(bootstrap1.native_history_tokens, BT as u64, "one selected page");
+        assert_eq!(bootstrap1.partial_tokens, 0, "page boundary");
+        let local_begin1 = bootstrap1.native_history_tokens; // 128
+        let mass_rows1 = pressure.rows(frontier - 1, 1, local_begin1, false).expect("rows1");
+        assert_eq!(mass_rows1, vec![0u32], "first sample admits the single decode row");
+        let mass1 = MassCapture::new(NL, frontier, local_begin1, 1, mass_rows1);
+        let mut carrier1 = LayerwiseQuery::build_with_pressure(
+            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35"),
+            layerwise_capabilities(CTX as u32), bootstrap1, n_slots, archive_bytes,
+            None, Some(mass1),
+        )
+        .expect("build query carrier");
+        assert!(!carrier1.is_pressure(), "phase 1 is a scorer Query step");
+        let suffix_phys1 = carrier1.suffix_slot.expect("suffix slot");
+
+        let mut keep1: Vec<Vec<u64>> = Vec::with_capacity(NL);
+        for ordinal in 0..NL {
+            // The scorer validates q.layer == the admitted spec geometry layer
+            // (the dense ordinal), so tag the shared Q tile per layer.
+            let layer_q = NativeCurrentLayerQuery { layer: ordinal as u32, ..native_q };
+            carrier1.restore_layer(&mut gpu, ordinal, &layer_q).expect("query restore");
+            let pages = carrier1.driver.arena().pool_ref().canonical_pages(ordinal).unwrap();
+            assert_eq!(pages.len(), 1, "layer {ordinal}: budget selects one page");
+            let sel = pages[0];
+            // The mean-K trick: layer 0 → page 2, layer 1 → page 1.
+            assert_eq!(sel, 2 - ordinal as u32, "layer {ordinal} scorer selection");
+            let hist_phys = carrier1.driver.arena().pool_ref().compact_slots(ordinal).unwrap()[0];
+            let (hk, hv) = carrier1.driver.arena().stripe_views(hist_phys as usize, ordinal).expect("hist stripe");
+            assert_eq!(read_bytes(&mut gpu, &hk, PLANE), pack(sel, ordinal as u32, false), "layer {ordinal} query K byte-exact");
+            assert_eq!(read_bytes(&mut gpu, &hv, PLANE), pack(sel, ordinal as u32, true), "layer {ordinal} query V byte-exact");
+            // Write the current token into the suffix stripe (as the paged writer
+            // does) so the mass gather sees a deterministic suffix K/V row.
+            let k_off = carrier1.driver.arena().layout().layer_k_offset(suffix_phys1 as usize, ordinal).unwrap();
+            let v_off = carrier1.driver.arena().layout().layer_v_offset(suffix_phys1 as usize, ordinal).unwrap();
+            gpu.hip.memcpy_htod_offset(&carrier1.driver.arena().arena().buf, k_off, &pack(full_pages, ordinal as u32, false)[..SEG]).expect("suffix K write");
+            gpu.hip.memcpy_htod_offset(&carrier1.driver.arena().arena().buf, v_off, &pack(full_pages, ordinal as u32, true)[..SEG]).expect("suffix V write");
+            carrier1.capture_mass_layer(&mut gpu, ordinal, &mass_q).expect("capture mass");
+            // Close this layer's attending phase so the state machine admits the
+            // next ordinal's begin_layer (the production forward calls this after
+            // the paged attention; mass capture precedes it, post-attention).
+            carrier1.attend_complete_layer(ordinal).expect("attend complete");
+            keep1.push(vec![sel as u64]);
+        }
+        // Whole-model acceptance: the core enforces per-row mass conservation
+        // (|Σmass−1|≤.005), so Ok(true) proves it. The selected canonical page
+        // must carry positive mass (it drives the resident-only selection); the
+        // suffix page may legitimately underflow to 0 mass with this arbitrary
+        // packed-K / all-+1-Q fixture and is never a selection candidate.
+        assert!(carrier1.accept_pressure(&mut pressure).expect("accept"), "phase 1 must accept");
+        let snap1 = pressure.snapshot().expect("snapshot1").read().expect("read snap1");
+        assert_eq!(snap1.layers.len(), NL);
+        for l in &snap1.layers {
+            assert_eq!(l.samples, 1, "one accepted sample");
+            assert_eq!(l.end, frontier, "accepted frontier");
+            assert!(!l.values.is_empty(), "accepted mass values");
+            assert!(l.values.iter().all(|v| v.mass.is_finite() && v.mass >= 0.0), "non-negative finite mass");
+            let sum: f64 = l.values.iter().map(|v| v.mass).sum();
+            assert!((sum - 1.0).abs() <= 0.005, "mass conserved across pages: {sum}");
+            let sel_start = keep1[l.model_layer as usize][0] * BT as u64;
+            let sel_val = l.values.iter().find(|v| v.original_start == sel_start).expect("selected page accepted");
+            assert!(sel_val.mass > 0.0, "selected page carries positive mass");
+        }
+        // Query keep-set == the scorer's restored selection; UNION with empty prev.
+        let restored1 = carrier1.restored_keep_set().expect("keep1");
+        assert_eq!(restored1, keep1, "query keep-set == scorer selection");
+        let combined1 = combine_keep_set(&[], &restored1, false, NL);
+        assert_eq!(combined1, keep1, "query union with empty prev");
+        carrier1.free(&mut gpu).expect("free carrier1");
+
+        // ── Phase 2: MID-PAGE Pressure step (fed 424, partial 40) ─────────────
+        let fed2 = frontier as u32 + partial; // 424
+        let bootstrap2 = bootstrap_layerwise(
+            fed2, 0, 0, /*seq=*/ 1, &[0, 1], NH as u32, KVH as u32, HD as u32,
+            budget_blocks, record_bytes, &combined1,
+        )
+        .expect("bootstrap2");
+        assert_eq!(bootstrap2.partial_tokens, partial);
+        assert_eq!(bootstrap2.identity.history.frontier, frontier, "frontier unchanged mid-page");
+        // The resident list now carries the keep-set (decision A).
+        assert_eq!(bootstrap2.canonical[0].memory.resident, vec![2u64]);
+        assert_eq!(bootstrap2.canonical[1].memory.resident, vec![1u64]);
+        let local_begin2 = bootstrap2.native_history_tokens + partial as u64; // 168
+        // The frontier did not advance ⇒ rows() admits no sample (no capture/accept).
+        let mass_rows2 = pressure.rows(frontier - 1, 1, local_begin2, false).expect("rows2");
+        assert!(mass_rows2.is_empty(), "mid-page Pressure step samples nothing");
+
+        // Resident-only selection over a catalog whose resident == the keep-set.
+        let descriptor2 = MemoryDescriptor::new(
+            &layerwise_backend("qwen35"), &q8.payload_layout().expect("manifest2"),
+            &layerwise_capabilities(CTX as u32),
+        )
+        .expect("descriptor2");
+        let catalog2 = MemoryCatalog::new(&descriptor2, &bootstrap2.canonical).expect("catalog2");
+        let choices = pressure
+            .select(&catalog2, &[], budget_blocks as u64 * BT as u64, 0)
+            .expect("select")
+            .read_all()
+            .expect("read choices");
+        assert_eq!(choices.len(), NL);
+        let mut selected2: Vec<Vec<u64>> = Vec::with_capacity(NL);
+        for ordinal in 0..NL {
+            let c = &choices[ordinal];
+            assert_eq!(c.model_layer, ordinal as u32);
+            assert_eq!(c.source, PressureSource::Prefill);
+            assert!(c.samples > 0, "positive accepted state");
+            assert!(!c.selected.is_empty(), "layer {ordinal}: not Pending");
+            // NO cold recall: every selected id is resident (a subset of the
+            // keep-set). With one resident page and a one-page budget the choice
+            // is exactly that page — a cold page (0) must never appear.
+            let resident = &bootstrap2.canonical[ordinal].memory.resident;
+            assert!(c.selected.iter().all(|id| resident.contains(id)), "layer {ordinal}: resident-only, no cold recall");
+            assert_eq!(c.selected, resident.clone(), "layer {ordinal}: selects the resident page");
+            selected2.push(c.selected.clone());
+        }
+
+        let mass2 = MassCapture::new(NL, frontier, local_begin2, 1, mass_rows2);
+        let budgets2: Vec<MemoryBudget> = bootstrap2.specs.iter().map(|s| s.budget).collect();
+        let step2 = PressureStep::new(selected2.clone(), budgets2).expect("pressure step");
+        let mut carrier2 = LayerwiseQuery::build_with_pressure(
+            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35"),
+            layerwise_capabilities(CTX as u32), bootstrap2, n_slots, archive_bytes,
+            Some(step2), Some(mass2),
+        )
+        .expect("build pressure carrier");
+        assert!(carrier2.is_pressure(), "phase 2 is a Pressure step");
+        let suffix_phys2 = carrier2.suffix_slot.expect("suffix slot2");
+
+        for ordinal in 0..NL {
+            carrier2.restore_layer(&mut gpu, ordinal, &native_q).expect("pressure restore");
+            let pages = carrier2.driver.arena().pool_ref().canonical_pages(ordinal).unwrap();
+            assert_eq!(pages.len(), 1);
+            let sel = selected2[ordinal][0] as u32;
+            assert_eq!(pages[0], sel, "layer {ordinal}: pressure-selected page bound");
+            // Byte-exact: the resident page is restored into the FRESH arena even
+            // though the plan marks it resident (device-truth invariant).
+            let hist_phys = carrier2.driver.arena().pool_ref().compact_slots(ordinal).unwrap()[0];
+            let (hk, hv) = carrier2.driver.arena().stripe_views(hist_phys as usize, ordinal).expect("hist stripe2");
+            assert_eq!(read_bytes(&mut gpu, &hk, PLANE), pack(sel, ordinal as u32, false), "layer {ordinal} pressure K byte-exact");
+            assert_eq!(read_bytes(&mut gpu, &hv, PLANE), pack(sel, ordinal as u32, true), "layer {ordinal} pressure V byte-exact");
+            // The mid-page suffix fed prefix is restored byte-exact.
+            let (sk, sv) = carrier2.driver.arena().stripe_views(suffix_phys2 as usize, ordinal).expect("suffix stripe2");
+            let fed_bytes = partial as usize * SEG;
+            assert_eq!(read_bytes(&mut gpu, &sk, PLANE)[..fed_bytes], pack(full_pages, ordinal as u32, false)[..fed_bytes], "layer {ordinal} suffix K fed prefix");
+            assert_eq!(read_bytes(&mut gpu, &sv, PLANE)[..fed_bytes], pack(full_pages, ordinal as u32, true)[..fed_bytes], "layer {ordinal} suffix V fed prefix");
+            // Empty schedule ⇒ mass capture is a no-op (no kernel launch).
+            carrier2.capture_mass_layer(&mut gpu, ordinal, &mass_q).expect("pressure mass no-op");
+        }
+        // No frontier advance ⇒ accept is a no-op; the owner state is unchanged.
+        assert!(!carrier2.accept_pressure(&mut pressure).expect("pressure accept no-op"), "mid-page must not accept");
+        let snap2 = pressure.snapshot().expect("snapshot2").read().expect("read snap2");
+        assert_eq!(snap2, snap1, "Pressure step leaves the accepted state unchanged");
+        // Pressure keep-set == the refined selection; TRUNCATE replaces the pool.
+        let restored2 = carrier2.restored_keep_set().expect("keep2");
+        assert_eq!(restored2, selected2, "pressure keep-set == selection");
+        let combined2 = combine_keep_set(&combined1, &restored2, true, NL);
+        assert_eq!(combined2, selected2, "pressure truncate to budget");
+        carrier2.free(&mut gpu).expect("free carrier2");
+
+        gpu.free_tensor(q_dev).expect("free q");
     }
 }
