@@ -126,6 +126,15 @@ pub mod layerwise_layout;
 /// gated on `RecallStrategy::Layerwise` so the default Legacy serve is untouched.
 #[cfg(all(feature = "deltanet", feature = "kvmem"))]
 pub mod layerwise_driver;
+/// Layerwise MTP history policy + auxiliary-selection binding primitives
+/// (Phase 4.1 ① mtp-foundation). Pure-host mirror of the core
+/// `layerwise_mtp.hpp` policy enum/parse/validate and ninfer's
+/// `bind_auxiliary_selection` guard + FirstLayer source rule. Additive sibling
+/// to `layerwise_layout`/`layerwise_driver`; NOT wired into live serve in ①
+/// (② binds the head plan, ③ adds the UpstreamGlobal private probe), so the
+/// default Legacy serve never constructs it and stays byte-neutral.
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+pub mod layerwise_mtp;
 /// Threaded Layerwise forward handle (Phase 3.2 ②-D4b). With `kvmem` it carries
 /// the per-query driver+staging bundle through the shared forward spine exactly
 /// like `SpecVerifyCapture`; without it, a zero-sized placeholder so the
