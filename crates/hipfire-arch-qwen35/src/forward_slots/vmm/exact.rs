@@ -1026,6 +1026,7 @@ pub(super) fn decode(
                         kvmem_taps: None,
                         row_slot: None,
                         fa_layer_idx: 0,
+                        layerwise: None,
                     };
                     run_layer_program(gpu, &ctx, &program, &mut bind)
                         .map_err(|e| HipError::new(0, &e.to_string()))
@@ -1375,6 +1376,7 @@ pub(super) fn decode(
                         kvmem_taps: None,
                         row_slot: None,
                         fa_layer_idx: 0,
+                        layerwise: None,
                     };
                     if let (true, Some(l)) = (split_dn_prep, &dn_view) {
                         gpu.conv1d_silu_split_qknorm(

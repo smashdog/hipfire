@@ -83,6 +83,7 @@ pub mod kernel_pack;
 pub mod kernel_registry;
 pub mod kernels;
 pub mod kv_slots;
+pub mod kvmem_page_score;
 pub mod kvmem_tap;
 pub mod lane_fa;
 pub mod lane_gdn;

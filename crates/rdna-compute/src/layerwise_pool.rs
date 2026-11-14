@@ -439,6 +439,27 @@ impl LayerwisePagePool {
         self.slots.get(phys as usize).map(|m| !m.free).unwrap_or(false)
     }
 
+    /// The current generation-checked handle for reserved slot `phys`, or `None`
+    /// when it is free / out of range. Lets a caller that located a slot by index
+    /// (e.g. via [`Self::find_page_slot`]) drop/free it without re-tracking handles.
+    pub fn handle(&self, phys: u32) -> Option<SlotHandle> {
+        let meta = self.slots.get(phys as usize)?;
+        if meta.free {
+            return None;
+        }
+        Some(SlotHandle { phys, generation: meta.generation })
+    }
+
+    /// The reserved slot whose layer-`layer` stripe holds canonical page `page`,
+    /// or `None` when no slot holds it there. Scans the (small) slot table; the
+    /// per-layer stripe is the single source of truth for residency.
+    pub fn find_page_slot(&self, layer: usize, page: u32) -> Option<u32> {
+        if layer >= self.n_layers() {
+            return None;
+        }
+        (0..self.slots.len() as u32).find(|&phys| self.stripe_page(phys, layer) == Some(page))
+    }
+
     /// True when ANY layer's stripe in ANY slot references canonical page `page`
     /// (the page is resident in the composite arena).
     pub fn is_page_resident(&self, page: u32) -> bool {

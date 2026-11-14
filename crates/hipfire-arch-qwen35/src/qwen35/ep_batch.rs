@@ -2898,6 +2898,7 @@ pub fn forward_ep(
                 kvmem_taps: None,
                 row_slot: None,
                 fa_layer_idx: 0,
+                layerwise: None,
             });
         }
         hipfire_runtime::ep::run_layer_program_ep(
