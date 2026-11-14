@@ -562,7 +562,10 @@ impl ModelRig {
     /// field drawn from `self`; the capture is built internally from
     /// `any_verify`/`any_dflash_rows` so the engine loop never names model
     /// buffers. `gpu`/`pool`/`graph`/`batch`/`lm_head_skip` are the
-    /// family-neutral engine pieces passed in by the caller.
+    /// family-neutral engine pieces passed in by the caller. `layerwise` is the
+    /// scoped per-query Layerwise carrier (design §3.9g): the caller builds it
+    /// from a taken-out `KvMemCtl` for an admissible single-slot decode step and
+    /// threads it here; Legacy / inadmissible steps pass `None` (byte-neutral).
     fn forward_step(
         &mut self,
         gpu: &mut Gpu,
@@ -572,6 +575,7 @@ impl ModelRig {
         lm_head_skip: &[bool],
         any_verify: bool,
         any_dflash_rows: bool,
+        layerwise: crate::LayerwiseFwd<'_, '_>,
     ) -> rdna_compute::HipResult<()> {
         let mut capture = (any_verify || any_dflash_rows).then(|| {
             let tape = self
@@ -609,8 +613,59 @@ impl ModelRig {
             self.spec_rows,
             lm_head_skip,
             capture.as_mut(),
+            layerwise,
         )
     }
+}
+
+/// Decide whether this step is an admissible single-slot Layerwise decode and,
+/// if so, return `(slot, session_id)` (design §3.9g). Layerwise recalls the
+/// compacted selected working set per layer; it admits ONLY a single text-only
+/// q8 paged autoregressive decode row with no speculative-verify / DFlash rows.
+/// Every other step — prefill, multi-slot, VL (image sessions carry M-RoPE
+/// phases the compacted view does not reproduce), spec, non-q8, non-paged, or
+/// Legacy strategy — returns `None` and runs the byte-neutral Legacy path. The
+/// host-store length gate (`fed >= 128`) lives in `engine_carrier`.
+#[cfg(feature = "kvmem")]
+fn layerwise_admissible(
+    rig: &Rig,
+    batch: &SlotBatch,
+    slots: &[Option<InFlight>],
+    work: &[PendingWork],
+    any_verify: bool,
+    any_dflash_rows: bool,
+) -> Option<(usize, u64)> {
+    let ctl = rig.model.kvmem.as_ref()?;
+    if !ctl.strategy().is_layerwise() {
+        return None;
+    }
+    if any_verify || any_dflash_rows || !rig.pool.is_paged() || !rig.model.kv_tier.is_q8() {
+        return None;
+    }
+    // The paged GQA decode tile must engage (the throat's `paged_decode` gate);
+    // an operator who disabled it falls back to Legacy rather than failing closed.
+    if !hipfire_config::developer_bool("HIPFIRE_KVMEM_GQA_DECODE", true) {
+        return None;
+    }
+    // Exactly one decode row total ⇒ a single-slot autoregressive decode step.
+    if batch.total_rows() != 1 {
+        return None;
+    }
+    let slot = batch.m_per_slot.iter().position(|&m| m == 1)?;
+    if !work[slot].decoding {
+        return None;
+    }
+    // Text-only this step: no external (vision-tower) embedding rows and no
+    // M-RoPE phases (the throat requires `!use_ext && !use_mrope`).
+    if !batch.ext_emb.iter().all(|&e| e < 0) || !batch.pos3.is_empty() {
+        return None;
+    }
+    let frame = slots[slot].as_ref()?;
+    let sess = rig.sessions.get(frame.session)?;
+    if sess.has_image {
+        return None;
+    }
+    Some((slot, frame.session.0))
 }
 
 struct Rig {
@@ -2987,7 +3042,10 @@ impl ModelRig {
                     .kvmem_taps
                     .as_ref()
                     .expect("kvmem controller without statistics taps");
-                ctl.feed_rows(gpu, taps, slot.0, pos, result.advance, hidden_row_offset)
+                ctl.feed_rows(
+                    gpu, taps, slot.0, pos, result.advance, hidden_row_offset,
+                    pool, &self.k_arenas, &self.v_arenas,
+                )
                     .map_err(|e| format!("kvmem statistics feed: {e}"))?;
             }
 
@@ -3149,6 +3207,9 @@ impl ModelRig {
                     pos,
                     committed.len(),
                     hidden_row_offset,
+                    pool,
+                    &self.k_arenas,
+                    &self.v_arenas,
                 )
                 .map_err(|e| format!("kvmem statistics feed: {e}"))?;
             }
@@ -5223,6 +5284,127 @@ fn run_loop(
             // already runs; no new sync, no order change.
             let t_step = std::time::Instant::now();
             let t_forward = std::time::Instant::now();
+            // ── Layerwise orchestration (design §3.9g, kvmem-gated) ──────────
+            // Scoped take of the controller so the per-query carrier can borrow
+            // its slot stores while the rest of the model is borrowed by the
+            // forward (the driver must NOT live in a ModelRig field — it borrows
+            // kvmem, which is also in ModelRig ⇒ self-reference). Only an
+            // admissible single-slot text-only q8 paged decode admits Layerwise;
+            // everything else threads None (Legacy byte-neutral). The carrier is
+            // confined to the `Ok(Some)` arm: `free` consumes it, ending its
+            // borrow of the taken-out controller strictly before the counter bump
+            // and restore — mirroring the scoped `ctl.prepare_step` borrow above.
+            // The post-forward statistics feed runs after the restore, so the
+            // host store still advances this step's row.
+            #[cfg(feature = "kvmem")]
+            let fwd = {
+                match layerwise_admissible(&rig, &batch, &slots, &work, any_verify, any_dflash_rows)
+                {
+                    Some((slot, session_id)) => {
+                        let mut kvmem = rig.model.kvmem.take();
+                        let n_fa = rig
+                            .model
+                            .config
+                            .layer_types
+                            .iter()
+                            .filter(|t| **t == LayerType::FullAttention)
+                            .count();
+                        let ctl = kvmem
+                            .as_ref()
+                            .expect("admissible layerwise step has a controller");
+                        // Fresh page-aligned selection policy over the sealed
+                        // full pages only (the core picker rejects a partial
+                        // tail). The slot's shared `kv` store keeps tracking all
+                        // fed tokens for Legacy and is never borrowed/mutated by
+                        // Layerwise; this policy is scoped to the query and
+                        // dropped after the carrier is freed.
+                        let lw_policy =
+                            match ctl.layerwise_policy(ctl.fed_tokens(slot).unwrap_or(0)) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    rig.model.kvmem = kvmem;
+                                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                                    poison = Some(e);
+                                    break 'serve;
+                                }
+                            };
+                        let built = crate::layerwise_driver::engine_carrier(
+                            &mut rig.gpu,
+                            ctl,
+                            &lw_policy,
+                            slot,
+                            session_id,
+                            n_fa,
+                            rig.model.config.n_heads,
+                            rig.model.config.n_kv_heads,
+                            rig.model.config.head_dim,
+                            rig.cap_tokens as u32,
+                            "qwen35",
+                        );
+                        match built {
+                            Ok(Some(mut carrier)) => {
+                                let fwd = rig.model.forward_step(
+                                    &mut rig.gpu,
+                                    &batch,
+                                    &mut rig.pool,
+                                    &mut graph,
+                                    &lm_head_skip,
+                                    any_verify,
+                                    any_dflash_rows,
+                                    Some(&mut carrier),
+                                );
+                                // Release the carrier exactly once (its GPU
+                                // buffers have no Drop). `free` consumes it,
+                                // ending its borrow of `kvmem` before the mutable
+                                // counter bump / restore.
+                                if let Err(e) = carrier.free(&mut rig.gpu) {
+                                    rig.model.kvmem = kvmem;
+                                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                                    poison = Some(e);
+                                    break 'serve;
+                                }
+                                if let Some(k) = kvmem.as_mut() {
+                                    k.advance_layerwise_seq(slot);
+                                }
+                                rig.model.kvmem = kvmem;
+                                fwd
+                            }
+                            // No sealed history page yet (fed < 128): restore the
+                            // controller and run Legacy; no transaction admitted.
+                            Ok(None) => {
+                                rig.model.kvmem = kvmem;
+                                rig.model.forward_step(
+                                    &mut rig.gpu,
+                                    &batch,
+                                    &mut rig.pool,
+                                    &mut graph,
+                                    &lm_head_skip,
+                                    any_verify,
+                                    any_dflash_rows,
+                                    None,
+                                )
+                            }
+                            Err(e) => {
+                                rig.model.kvmem = kvmem;
+                                fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                                poison = Some(e);
+                                break 'serve;
+                            }
+                        }
+                    }
+                    None => rig.model.forward_step(
+                        &mut rig.gpu,
+                        &batch,
+                        &mut rig.pool,
+                        &mut graph,
+                        &lm_head_skip,
+                        any_verify,
+                        any_dflash_rows,
+                        None,
+                    ),
+                }
+            };
+            #[cfg(not(feature = "kvmem"))]
             let fwd = rig.model.forward_step(
                 &mut rig.gpu,
                 &batch,
@@ -5231,6 +5413,7 @@ fn run_loop(
                 &lm_head_skip,
                 any_verify,
                 any_dflash_rows,
+                None,
             );
             let forward_ns = t_forward.elapsed().as_nanos() as u64;
             // ── Publication (spec §4.6 C6) ──────────────────────────────────
@@ -5470,7 +5653,10 @@ fn run_loop(
                             .kvmem_taps
                             .as_ref()
                             .expect("kvmem controller without statistics taps");
-                        ctl.feed_rows(&rig.gpu, taps, s, pos0, m, row_start)
+                        ctl.feed_rows(
+                            &rig.gpu, taps, s, pos0, m, row_start,
+                            &rig.pool, &rig.model.k_arenas, &rig.model.v_arenas,
+                        )
                     };
                     if let Err(e) = fed {
                         feed_err = Some(e);

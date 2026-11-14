@@ -1840,6 +1840,9 @@ fn run_pass(
             false,
             config.n_layers,
             None,
+            // VMM is a per-request storage route; Layerwise recall (composite
+            // arena) never applies here.
+            None,
         )?;
     }
     drop(dn);

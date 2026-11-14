@@ -120,6 +120,36 @@ pub mod kvmem_ctl;
 /// packed arena. Clean sibling to `kvmem_ctl`; not wired into live serve in ①.
 #[cfg(feature = "kvmem")]
 pub mod layerwise_layout;
+/// Per-layer layerwise recall driver (Phase 3.2 ②-D3): the GPU scorer bridge
+/// (Rust→HIP), packed composite arena and core `LayerwiseQueryRequest`
+/// orchestration. Clean sibling to the legacy copy-only `AttentionTap` path;
+/// gated on `RecallStrategy::Layerwise` so the default Legacy serve is untouched.
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+pub mod layerwise_driver;
+/// Threaded Layerwise forward handle (Phase 3.2 ②-D4b). With `kvmem` it carries
+/// the per-query driver+staging bundle through the shared forward spine exactly
+/// like `SpecVerifyCapture`; without it, a zero-sized placeholder so the
+/// default (deltanet-only) build compiles unchanged and stays byte-neutral.
+/// The legacy spine only threads this opaque handle and branches on it — all
+/// Layerwise logic lives in `layerwise_driver`.
+///
+/// Two independent lifetimes mirror `Option<&mut SpecVerifyCapture<'_>>`: `'a`
+/// is the borrow of the handle, `'b` the query's own store borrow. Keeping them
+/// separate lets the spine reborrow (`as_deref_mut`) for a warm-up call and then
+/// move the handle into the capture call — a single shared lifetime would make
+/// `&'a mut LayerwiseQuery<'a>` invariant and pin the reborrow for all of `'a`.
+///
+/// The no-kvmem placeholder is `&'a mut PhantomData<&'b ()>` rather than
+/// `&'a mut ()` so that `'b` stays *used* in both modes: downstream carriers
+/// (`Qwen35Bindings<'a, 'b>`) name both lifetimes unconditionally, and a bare
+/// `()` pointee would leave `'b` unconstrained → E0392 in the default build.
+/// `PhantomData` is zero-sized, covariant in `'b`, and `DerefMut`-transparent,
+/// so `None` / `is_some()` / `as_deref_mut()` behave identically to the kvmem
+/// alias while carrying no runtime data.
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+pub(crate) type LayerwiseFwd<'a, 'b> = Option<&'a mut layerwise_driver::LayerwiseQuery<'b>>;
+#[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+pub(crate) type LayerwiseFwd<'a, 'b> = Option<&'a mut core::marker::PhantomData<&'b ()>>;
 #[cfg(feature = "deltanet")]
 pub(crate) mod layer_driver;
 #[cfg(feature = "deltanet")]

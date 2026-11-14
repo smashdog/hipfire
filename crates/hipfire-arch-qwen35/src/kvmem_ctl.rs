@@ -161,6 +161,53 @@ fn parse_select_method(v: &str) -> Option<u32> {
     }
 }
 
+/// KVMem recall execution model (`HIPFIRE_KVMEM_RECALL_STRATEGY`). Mirrors the
+/// core `kvmem::RecallStrategy` ordinals (`layerwise_options.hpp:11`):
+/// `Legacy = 0` is the historical whole-working-set residency + `pick_topk`
+/// selection (the byte-neutral default); `Layerwise = 1` enables the per-layer
+/// composite-slot recall subsystem driven by the core `LayerwiseQueryRequest`
+/// state machine. The strategy is resolved once at controller construction and
+/// every Layerwise-only path is gated on it, so the default Legacy serve stays
+/// bit-identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RecallStrategy {
+    Legacy = 0,
+    Layerwise = 1,
+}
+
+impl RecallStrategy {
+    /// True when the per-layer recall subsystem is enabled.
+    pub fn is_layerwise(self) -> bool {
+        matches!(self, RecallStrategy::Layerwise)
+    }
+}
+
+/// `HIPFIRE_KVMEM_RECALL_STRATEGY`: `legacy` (default) | `layerwise`, or the
+/// core ordinals 0/1. An unknown value is rejected loudly at construction
+/// rather than silently falling back to Legacy.
+fn parse_recall_strategy(v: &str) -> Option<RecallStrategy> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "legacy" | "0" => Some(RecallStrategy::Legacy),
+        "layerwise" | "1" => Some(RecallStrategy::Layerwise),
+        _ => None,
+    }
+}
+
+/// Resolve the recall strategy from the raw `HIPFIRE_KVMEM_RECALL_STRATEGY`
+/// value (already trimmed by [`env_raw`]). Absent → Legacy (the byte-neutral
+/// default); an unrecognised spelling is rejected loudly rather than silently
+/// degenerating. Pure so the resolution contract is testable without touching
+/// the process-start config snapshot.
+fn resolve_recall_strategy(raw: Option<String>) -> Result<RecallStrategy, String> {
+    match raw {
+        Some(v) => parse_recall_strategy(&v).ok_or_else(|| {
+            format!("kvmem: HIPFIRE_KVMEM_RECALL_STRATEGY={v} invalid (legacy|layerwise)")
+        }),
+        None => Ok(RecallStrategy::Legacy),
+    }
+}
+
 /// True when `HIPFIRE_KVMEM` names an enabling value. Callers must also check
 /// that the crate was built with the `kvmem` feature — the engine refuses the
 /// knob loudly when it was not.
@@ -294,6 +341,16 @@ struct SlotState {
     q_ring_len: usize,
     /// Next write slot in `q_ring` (`0..query_span`); shared across layers.
     q_ring_cursor: usize,
+    /// Layerwise session incarnation (design §3.9g). Bumped every time the slot
+    /// is reset to a fresh session, so a re-bootstrapped canonical history never
+    /// aliases a previous session's `MemoryStamp`. Legacy ignores it.
+    lw_incarnation: u64,
+    /// Layerwise transaction counter (design §3.9g). Bumped once per admitted
+    /// layerwise query; drives the synthesized `MemoryStamp` revisions
+    /// (history_revision / view_version / execution_history). The re-bootstrap
+    /// model persists NO snapshots — the host store is the source of truth — so
+    /// this monotonic counter is the only cross-step layerwise bookkeeping.
+    lw_seq: u64,
 }
 
 /// Per-slot residency plan for one step.
@@ -325,6 +382,12 @@ pub struct KvMemCtl {
     /// Packed page staging (one page per arena).
     page_k: Vec<u8>,
     page_v: Vec<u8>,
+    /// Layerwise write-through staging (design §3.7). Only sized when
+    /// `strategy == Layerwise`: contiguous packed Q8 K/V rows for one feed call
+    /// (`max_rows * per_pos_bytes`), gathered from the GPU arenas before the
+    /// sealed-archive write. Empty under Legacy (no allocation, byte-neutral).
+    wt_k: Vec<u8>,
+    wt_v: Vec<u8>,
     /// Tap readback staging (`read_k_rows_at`).
     staging: Vec<f32>,
     /// Retrieval query staging: layer-major raw Q rows.
@@ -338,6 +401,10 @@ pub struct KvMemCtl {
     /// Resolved `HIPFIRE_KVMEM_BATCH_XFER` (default on). When false, or when no
     /// steady-copy stream is active, spill/restore use the per-page path.
     batch_xfer: bool,
+    /// Resolved `HIPFIRE_KVMEM_RECALL_STRATEGY` (default Legacy). Gates every
+    /// Layerwise-only path (write-through archive, per-layer driver, packed
+    /// residency); Legacy keeps the historical serve bit-identical.
+    strategy: RecallStrategy,
     /// Resolved `HIPFIRE_KVMEM_SELECT_METHOD` ordinal (0 Retrieval, 2 Recency).
     /// H2O (1) is rejected at construction until the attention-heat tap lands.
     select_method: u32,
@@ -366,6 +433,23 @@ impl KvMemCtl {
         n_slots: usize,
         plan: &KvMemPlan,
         geom: &KvMemGeometry,
+    ) -> Result<Self, String> {
+        let strategy = resolve_recall_strategy(env_raw("HIPFIRE_KVMEM_RECALL_STRATEGY"))?;
+        Self::new_with_strategy(n_slots, plan, geom, strategy)
+    }
+
+    /// Construct with the recall strategy injected instead of read from the
+    /// process config. The config is a START-TIME SNAPSHOT
+    /// (`hipfire_config::active_or_local_process_config` is a `OnceLock`), so a
+    /// test that `set_var`s `HIPFIRE_KVMEM_RECALL_STRATEGY` after the first
+    /// config read is an order-dependent coin flip — inject here instead
+    /// (mirrors `HfqFile::open_with_reap_plan`). [`Self::new`] resolves the env
+    /// once and delegates, so the production path is unchanged.
+    fn new_with_strategy(
+        n_slots: usize,
+        plan: &KvMemPlan,
+        geom: &KvMemGeometry,
+        strategy: RecallStrategy,
     ) -> Result<Self, String> {
         if n_slots == 0 || geom.n_fa_layers == 0 || geom.head_dim == 0 {
             return Err("kvmem: zero-sized controller request".to_string());
@@ -452,6 +536,13 @@ impl KvMemCtl {
             ));
         }
 
+        // Recall execution model. Legacy (the default) keeps the historical
+        // whole-working-set path byte-identical. Layerwise enables the per-layer
+        // composite-slot subsystem: D2 adds the write-through sealed host
+        // archive; the driver + packed GPU residency land in D3/D4. The strategy
+        // is injected by `new` (env) or `new_with_strategy` (tests) so every
+        // downstream Layerwise-only path shares one switch.
+
         let kv_cfg = KvStoreConfig {
             block_tokens: KV_BLOCK_TOKENS as u32,
             select_budget: budget_tokens,
@@ -503,6 +594,8 @@ impl KvMemCtl {
                 q_ring: vec![0f32; ring_cap],
                 q_ring_len: 0,
                 q_ring_cursor: 0,
+                lw_incarnation: 0,
+                lw_seq: 0,
             });
         }
 
@@ -535,10 +628,10 @@ impl KvMemCtl {
         };
 
         if (time_flag() || env_flag("HIPFIRE_KVMEM_TRACE"))
-            && (lrfu || select_method != 0 || watermark_enabled || query_span > 1)
+            && (lrfu || select_method != 0 || watermark_enabled || query_span > 1 || strategy.is_layerwise())
         {
             eprintln!(
-                "[kvmem] policy: select_method={select_method} lrfu={lrfu} \
+                "[kvmem] policy: strategy={strategy:?} select_method={select_method} lrfu={lrfu} \
                  lambda={lrfu_lambda} top={lrfu_top} watermark={watermark:?} \
                  query_span={query_span} budget_blocks={}",
                 plan.budget_blocks
@@ -562,18 +655,61 @@ impl KvMemCtl {
             v_page_bytes: KV_BLOCK_TOKENS * geom.per_pos_v_bytes,
             page_k: vec![0u8; KV_BLOCK_TOKENS * geom.per_pos_bytes],
             page_v: vec![0u8; KV_BLOCK_TOKENS * geom.per_pos_v_bytes],
+            wt_k: vec![0u8; if strategy.is_layerwise() { geom.max_rows * geom.per_pos_bytes } else { 0 }],
+            wt_v: vec![0u8; if strategy.is_layerwise() { geom.max_rows * geom.per_pos_v_bytes } else { 0 }],
             staging: vec![0f32; geom.max_rows * k_width],
             sums: vec![0f32; geom.n_fa_layers * q_width],
             q_row: vec![0f32; q_width],
             counts: vec![1u32; geom.n_fa_layers],
             xfer_slab: None,
             batch_xfer: batch_xfer_flag(),
+            strategy,
             select_method,
             watermark,
             query_span,
             q_span: vec![0f32; ring_cap],
             q_layer_rows: vec![0u32; if query_span > 1 { geom.n_fa_layers } else { 0 }],
         })
+    }
+
+    /// Resolved recall execution model (`HIPFIRE_KVMEM_RECALL_STRATEGY`).
+    /// The engine gates the Layerwise subsystem (write-through archive,
+    /// per-layer driver, packed residency) on this; Legacy is the default.
+    pub fn strategy(&self) -> RecallStrategy {
+        self.strategy
+    }
+
+    /// Borrow slot `slot`'s statistics store (`RawStore`) and policy (`KvStore`)
+    /// for the Layerwise driver (design §3.9a/§3.9b). `LayerwiseDriver<'a>`
+    /// borrows these for the query's lifetime; the caller must NOT [`Self::reset_slot`]
+    /// while the borrow is live — reset replaces the `SlotState` wholesale (a new
+    /// `RawStore`/`KvStore`), invalidating it, so the driver is rebuilt per query.
+    /// `None` when the slot is out of range. The stores stay owned by this
+    /// controller: the driver only reads statistics and sets the runtime select
+    /// budget through them (both `&self` operations on the C++ handles).
+    pub fn layerwise_stores(&self, slot: usize) -> Option<(&RawStore, &KvStore)> {
+        self.slots.get(slot).map(|st| (&st.raw, &st.kv))
+    }
+
+    /// Synthesize a fresh, page-aligned selection policy for one layerwise
+    /// query (design §3.9g refinement). The core layerwise picker
+    /// (`prepare_selection`) admits ONLY a canonical index of sealed full pages
+    /// (`total_tokens % block == 0`, every block full), but the shared per-slot
+    /// `kv` store tracks ALL fed tokens — including the partial tail — for the
+    /// Legacy path. So the layerwise carrier owns this fresh policy indexing the
+    /// `fed / 128` sealed canonical pages; the partial tail lives only in the
+    /// statistics store (`raw`) and is restored as the suffix stripe. Scoped to
+    /// the query and never shared, so the Legacy `kv` store is untouched
+    /// (byte-neutral). The driver's `begin_query` sets the runtime select budget,
+    /// so the config's initial budget is only a placeholder here.
+    pub fn layerwise_policy(&self, fed: u32) -> Result<KvStore, String> {
+        let full_pages = fed / KV_BLOCK_TOKENS as u32;
+        let policy =
+            KvStore::new(&self.kv_cfg).map_err(|e| format!("kvmem layerwise policy: {e}"))?;
+        policy
+            .register_append(full_pages * KV_BLOCK_TOKENS as u32)
+            .map_err(|e| format!("kvmem layerwise policy append: {e}"))?;
+        Ok(policy)
     }
 
     /// Per-slot resident page budget (full pages + partial tail).
@@ -596,6 +732,9 @@ impl KvMemCtl {
             kv.set_runtime_select_budget((keep * KV_BLOCK_TOKENS) as u32)
                 .map_err(|e| format!("kvmem watermark select budget: {e}"))?;
         }
+        // A fresh session bumps the layerwise incarnation so re-bootstrapped
+        // canonical stamps never alias the previous session's (design §3.9g).
+        let lw_incarnation = self.slots[slot].lw_incarnation + 1;
         self.slots[slot] = SlotState {
             raw,
             kv,
@@ -613,6 +752,8 @@ impl KvMemCtl {
             ],
             q_ring_len: 0,
             q_ring_cursor: 0,
+            lw_incarnation,
+            lw_seq: 0,
         };
         Ok(())
     }
@@ -639,6 +780,21 @@ impl KvMemCtl {
         self.slots.get(slot).map(|s| s.fed)
     }
 
+    /// Slot `slot`'s layerwise stamp counters `(incarnation, seq)` (design
+    /// §3.9g). The orchestration reads these to synthesize a fresh
+    /// `MemoryStamp` per re-bootstrapped query; `None` when out of range.
+    pub fn layerwise_counters(&self, slot: usize) -> Option<(u64, u64)> {
+        self.slots.get(slot).map(|s| (s.lw_incarnation, s.lw_seq))
+    }
+
+    /// Advance slot `slot`'s layerwise transaction counter after an admitted
+    /// query (design §3.9g). No-op when out of range. Legacy never calls it.
+    pub fn advance_layerwise_seq(&mut self, slot: usize) {
+        if let Some(st) = self.slots.get_mut(slot) {
+            st.lw_seq += 1;
+        }
+    }
+
     /// Feed the tapped K rows [row_start, row_start + n_rows) of `slot`'s
     /// step batch to the per-layer key statistics. `pos0` is the absolute
     /// position of the first row and must be the store's current length.
@@ -650,6 +806,9 @@ impl KvMemCtl {
         pos0: usize,
         n_rows: usize,
         row_start: usize,
+        pool: &SlotPool,
+        k_arenas: &[GpuTensor],
+        v_arenas: &[GpuTensor],
     ) -> Result<(), String> {
         if n_rows == 0 {
             return Ok(());
@@ -707,6 +866,13 @@ impl KvMemCtl {
             st.q_ring_cursor = (cursor + 1) % span;
             st.q_ring_len = (st.q_ring_len + 1).min(span);
         }
+        // Layerwise write-through (design §3.7): seal this feed's packed Q8 K/V
+        // into the host archive so every fed token's payload survives for
+        // drop-evict + COW restore (D4). Legacy skips this entirely — the arena
+        // params are unused on the default path, keeping it byte-neutral.
+        if self.strategy.is_layerwise() {
+            self.write_through_archive(gpu, pool, k_arenas, v_arenas, slot, pos0, n_rows)?;
+        }
         if trace {
             eprintln!(
                 "[kvmem] slot {slot} feed rows {pos0}..{} ({n_rows})",
@@ -721,6 +887,103 @@ impl KvMemCtl {
                 t_read.as_secs_f64() * 1e3,
                 t_write.as_secs_f64() * 1e3,
             );
+        }
+        Ok(())
+    }
+
+    /// Layerwise write-through (design §3.7). Gather this feed's packed Q8 K/V
+    /// rows out of the GPU arenas into the contiguous staging buffers and seal
+    /// them into the slot's host archive (`write_layer_k_gpu`/`v_gpu`), so EVERY
+    /// fed token's payload survives — not just the spilled blocks the legacy
+    /// write-back path stores. The sealed archive is the source of truth for
+    /// drop-evict + COW restore (D4).
+    ///
+    /// The fed range is contiguous at the frontier, so its logical pages are
+    /// resident (never spilled): `physical()` returning `None` is a hard error,
+    /// not a silent skip. The core `write_layer_k_gpu` is token-granular (it
+    /// splits the range into blocks itself), so one contiguous gather + one
+    /// seal call per layer suffices even when the feed spans several pages or
+    /// ends on a partial tail. Only called when `strategy == Layerwise`.
+    ///
+    /// D2 gathers synchronously (matching the legacy `spill_page` D2H path) for
+    /// correctness; async pipelining over the Phase 1 pinned slab to overlap
+    /// compute is a later refinement within sub-patch ②.
+    fn write_through_archive(
+        &mut self,
+        gpu: &Gpu,
+        pool: &SlotPool,
+        k_arenas: &[GpuTensor],
+        v_arenas: &[GpuTensor],
+        slot: usize,
+        pos0: usize,
+        n_rows: usize,
+    ) -> Result<(), String> {
+        debug_assert_eq!(k_arenas.len(), self.n_fa_layers);
+        debug_assert_eq!(v_arenas.len(), self.n_fa_layers);
+        let bt = pool
+            .block_table(SlotId(slot))
+            .ok_or_else(|| format!("kvmem write-through: slot {slot} has no block table"))?;
+        let kpb = self.k_page_bytes;
+        let vpb = self.v_page_bytes;
+        let krow = kpb / KV_BLOCK_TOKENS;
+        let vrow = vpb / KV_BLOCK_TOKENS;
+        if n_rows * krow > self.wt_k.len() || n_rows * vrow > self.wt_v.len() {
+            return Err(format!(
+                "kvmem write-through: feed of {n_rows} rows exceeds the staging capacity \
+                 ({} K / {} V bytes)",
+                self.wt_k.len(),
+                self.wt_v.len()
+            ));
+        }
+        let first_lp = pos0 / KV_BLOCK_TOKENS;
+        let last_lp = (pos0 + n_rows - 1) / KV_BLOCK_TOKENS;
+        // Resolve every fed page's physical index up front so a non-resident
+        // page fails closed before any D2H or archive mutation.
+        let mut phys_pages = Vec::with_capacity(last_lp - first_lp + 1);
+        for lp in first_lp..=last_lp {
+            let phys = bt.physical(lp).ok_or_else(|| {
+                format!(
+                    "kvmem write-through: slot {slot} logical page {lp} is not resident \
+                     (spilled or out of range) at feed position {pos0}"
+                )
+            })?;
+            phys_pages.push(phys);
+        }
+        for il in 0..self.n_fa_layers {
+            // Gather the fed K rows page-by-page into the contiguous buffer.
+            for (i, lp) in (first_lp..=last_lp).enumerate() {
+                let phys = phys_pages[i] as usize;
+                let row_lo = pos0.max(lp * KV_BLOCK_TOKENS);
+                let row_hi = (pos0 + n_rows).min((lp + 1) * KV_BLOCK_TOKENS);
+                let cnt = row_hi - row_lo;
+                let intra = row_lo - lp * KV_BLOCK_TOKENS;
+                let dst = (row_lo - pos0) * krow;
+                let src = phys * kpb + intra * krow;
+                gpu.hip
+                    .memcpy_dtoh_at(&mut self.wt_k[dst..dst + cnt * krow], &k_arenas[il].buf, src)
+                    .map_err(|e| format!("kvmem write-through K gather (layer {il}): {e:?}"))?;
+            }
+            self.slots[slot]
+                .raw
+                .write_layer_k_gpu(pos0 as u32, n_rows as u32, il as u32, &self.wt_k[..n_rows * krow])
+                .map_err(|e| format!("kvmem write-through K seal (layer {il}): {e}"))?;
+            // Gather the fed V rows.
+            for (i, lp) in (first_lp..=last_lp).enumerate() {
+                let phys = phys_pages[i] as usize;
+                let row_lo = pos0.max(lp * KV_BLOCK_TOKENS);
+                let row_hi = (pos0 + n_rows).min((lp + 1) * KV_BLOCK_TOKENS);
+                let cnt = row_hi - row_lo;
+                let intra = row_lo - lp * KV_BLOCK_TOKENS;
+                let dst = (row_lo - pos0) * vrow;
+                let src = phys * vpb + intra * vrow;
+                gpu.hip
+                    .memcpy_dtoh_at(&mut self.wt_v[dst..dst + cnt * vrow], &v_arenas[il].buf, src)
+                    .map_err(|e| format!("kvmem write-through V gather (layer {il}): {e:?}"))?;
+            }
+            self.slots[slot]
+                .raw
+                .write_layer_v_gpu(pos0 as u32, n_rows as u32, il as u32, &self.wt_v[..n_rows * vrow])
+                .map_err(|e| format!("kvmem write-through V seal (layer {il}): {e}"))?;
         }
         Ok(())
     }
@@ -1537,3 +1800,238 @@ fn restore_page(
 /// honest for builds where the constant is only used in docs.
 #[allow(dead_code)]
 const _: u32 = SPILLED_PAGE;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rdna_compute::DType;
+
+    /// Small Q8 geometry: 2 fa layers, 2 KV heads, head_dim 64 →
+    /// `per_pos_bytes = 2 * (64/32) * 34 = 136`.
+    fn geom() -> KvMemGeometry {
+        KvMemGeometry {
+            n_fa_layers: 2,
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: 64,
+            per_pos_bytes: 136,
+            per_pos_v_bytes: 136,
+            max_rows: 512,
+        }
+    }
+    fn plan() -> KvMemPlan {
+        KvMemPlan { pages_total: 16, budget_blocks: 4, grow_blocks: 2, interval: 1 }
+    }
+
+    /// Host-only: the strategy parser/resolver mirror the core ordinals and
+    /// reject unknown spellings loudly, and the write-through staging is
+    /// allocated ONLY under Layerwise (Legacy stays byte-neutral — no extra
+    /// host buffer, no arena touch). The strategy is INJECTED, not `set_var`d:
+    /// the process config is a start-time snapshot, so a runtime env write after
+    /// the first config read would be an order-dependent coin flip.
+    #[test]
+    fn recall_strategy_parse_and_staging_gate() {
+        assert_eq!(parse_recall_strategy("legacy"), Some(RecallStrategy::Legacy));
+        assert_eq!(parse_recall_strategy("Layerwise"), Some(RecallStrategy::Layerwise));
+        assert_eq!(parse_recall_strategy("0"), Some(RecallStrategy::Legacy));
+        assert_eq!(parse_recall_strategy("1"), Some(RecallStrategy::Layerwise));
+        assert_eq!(parse_recall_strategy("  LEGACY  "), Some(RecallStrategy::Legacy));
+        assert_eq!(parse_recall_strategy("bogus"), None);
+        assert!(!RecallStrategy::Legacy.is_layerwise());
+        assert!(RecallStrategy::Layerwise.is_layerwise());
+
+        // Pure resolution contract (the exact body `new` runs on the env value).
+        assert_eq!(resolve_recall_strategy(None).unwrap(), RecallStrategy::Legacy);
+        assert_eq!(
+            resolve_recall_strategy(Some("legacy".into())).unwrap(),
+            RecallStrategy::Legacy
+        );
+        assert_eq!(
+            resolve_recall_strategy(Some("layerwise".into())).unwrap(),
+            RecallStrategy::Layerwise
+        );
+        assert!(resolve_recall_strategy(Some("bogus".into())).is_err());
+
+        // Small host ceiling for the tiny test geometry. The store commits
+        // lazily, so the default ceiling is also safe; this just keeps the
+        // reservation modest when this test is the first config reader.
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+
+        // Legacy: no write-through staging.
+        let legacy =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
+                .expect("legacy ctl");
+        assert_eq!(legacy.strategy(), RecallStrategy::Legacy);
+        assert!(legacy.wt_k.is_empty() && legacy.wt_v.is_empty());
+        // Layerwise: staging sized to max_rows * per_pos_bytes.
+        let lw =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("layerwise ctl");
+        assert_eq!(lw.strategy(), RecallStrategy::Layerwise);
+        assert_eq!(lw.wt_k.len(), 512 * 136);
+        assert_eq!(lw.wt_v.len(), 512 * 136);
+
+        // The env wrapper resolves the Legacy default when the knob is absent
+        // (the ambient test env never sets RECALL_STRATEGY, so the snapshot
+        // cannot carry it regardless of read order).
+        std::env::remove_var("HIPFIRE_KVMEM_RECALL_STRATEGY");
+        let default = KvMemCtl::new(1, &plan(), &geom()).expect("default ctl");
+        assert_eq!(default.strategy(), RecallStrategy::Legacy);
+        assert!(default.wt_k.is_empty() && default.wt_v.is_empty());
+
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// The Layerwise driver borrows the slot's statistics store + policy through
+    /// `layerwise_stores`: distinct objects per slot, `None` out of range, the
+    /// policy borrow is live (`&self` budget set), and `reset_slot` builds a
+    /// fresh empty store (the inline `SlotState` address is stable, so state —
+    /// not pointer identity — is the probe) — the lifetime contract that forces
+    /// the driver to be rebuilt per query (§3.9b).
+    #[test]
+    fn layerwise_stores_accessor_borrows_slot_state() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let mut ctl =
+            KvMemCtl::new_with_strategy(2, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("ctl");
+        let (raw0, kv0) = ctl.layerwise_stores(0).expect("slot 0");
+        let (raw1, kv1) = ctl.layerwise_stores(1).expect("slot 1");
+        assert!(!std::ptr::eq(raw0, raw1), "per-slot raw stores are distinct");
+        assert!(!std::ptr::eq(kv0, kv1), "per-slot policies are distinct");
+        assert!(ctl.layerwise_stores(2).is_none(), "out of range → None");
+        // The policy borrow is live: a &self budget set through it succeeds.
+        // The core admits a runtime budget only inside [sink+recent allocation,
+        // configured select_budget]; the configured maximum is always in that
+        // window, so it is the safe probe (the fixture's sink+recent floor is
+        // strictly below it).
+        kv0.set_runtime_select_budget(ctl.kv_cfg.select_budget)
+            .expect("budget through borrow");
+        // reset_slot builds a FRESH C++ store. SlotState lives inline in the
+        // Vec, so its address is stable across reset — probe STATE, not pointer
+        // identity. Allocate blocks on the old borrow; the post-reset borrow
+        // must report a smaller (fresh, empty) allocation. This is the lifetime
+        // contract that forces the driver to be rebuilt per query (§3.9b): a
+        // borrow taken before reset references a store that no longer exists.
+        raw0.ensure_blocks(4).expect("allocate on old store");
+        let old_bytes = raw0.allocated_bytes();
+        ctl.reset_slot(0).expect("reset");
+        let (raw0_new, _) = ctl.layerwise_stores(0).expect("slot 0 after reset");
+        assert!(
+            raw0_new.allocated_bytes() < old_bytes,
+            "reset yields a fresh empty store"
+        );
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// GPU qualification of the write-through gather + seal (design §3.7).
+    /// Fills the arenas with an independent byte pattern, drives two contiguous
+    /// feeds (the second starts mid-block), and asserts the sealed archive reads
+    /// back byte-exact against the pattern oracle resolved through the slot's
+    /// REAL logical→physical map (a dummy slot offsets the physical pages so
+    /// `phys != lp`, catching any gather that assumes identity mapping). Covers
+    /// multi-page spans, a partial tail, and fail-closed on a non-resident page.
+    ///
+    /// `#[ignore]`d: needs a GPU + HIP toolchain.
+    ///   cargo test -p hipfire-arch-qwen35 --features kvmem --release \
+    ///     --lib kvmem_ctl::tests::write_through_archive_readback_byte_exact -- --ignored
+    #[test]
+    #[ignore]
+    fn write_through_archive_readback_byte_exact() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let n_fa = 2usize;
+        let row = 136usize;
+        // Strategy injected (the config snapshot ignores runtime set_var).
+        let mut ctl =
+            KvMemCtl::new_with_strategy(2, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("ctl");
+
+        let mut gpu = Gpu::init().expect("gpu init");
+        let mut pool = SlotPool::new_paged_with_strides(2, 1024, row, row, 16).expect("pool");
+        let dummy = pool.acquire().expect("dummy slot");
+        pool.set_seq_len(dummy, 256).expect("dummy seq"); // grabs the first physical pages
+        let slot = pool.acquire().expect("test slot");
+        pool.set_seq_len(slot, 512).expect("test seq"); // 4 logical pages, phys != lp
+
+        let kpb = KV_BLOCK_TOKENS * row;
+        let arena_bytes = pool.k_arena_bytes();
+        // Independent oracle: a deterministic byte pattern keyed on the PHYSICAL
+        // page, intra-page position, byte index, layer, and K/V plane.
+        let pat = |phys: usize, intra: usize, b: usize, il: usize, kind: usize| -> u8 {
+            ((phys * 131 + intra * 17 + b * 7 + il * 251 + kind * 97) & 0xff) as u8
+        };
+        let mut k_arenas = Vec::new();
+        let mut v_arenas = Vec::new();
+        for il in 0..n_fa {
+            let mut hk = vec![0u8; arena_bytes];
+            let mut hv = vec![0u8; arena_bytes];
+            for phys in 0..16 {
+                for intra in 0..KV_BLOCK_TOKENS {
+                    for b in 0..row {
+                        let off = phys * kpb + intra * row + b;
+                        hk[off] = pat(phys, intra, b, il, 0);
+                        hv[off] = pat(phys, intra, b, il, 1);
+                    }
+                }
+            }
+            let tk = gpu.alloc_tensor(&[arena_bytes], DType::Raw).expect("k arena");
+            gpu.hip.memcpy_htod(&tk.buf, &hk).expect("k h2d");
+            let tv = gpu.alloc_tensor(&[arena_bytes], DType::Raw).expect("v arena");
+            gpu.hip.memcpy_htod(&tv.buf, &hv).expect("v h2d");
+            k_arenas.push(tk);
+            v_arenas.push(tv);
+        }
+        gpu.hip.device_synchronize().expect("sync");
+
+        // Two contiguous feeds: 0..300, then 300..400 (mid-block start on page 2).
+        ctl.write_through_archive(&gpu, &pool, &k_arenas, &v_arenas, slot.0, 0, 300)
+            .expect("feed 0..300");
+        ctl.write_through_archive(&gpu, &pool, &k_arenas, &v_arenas, slot.0, 300, 100)
+            .expect("feed 300..400");
+
+        // Readback byte-exact against the oracle, per logical page / layer.
+        let bt = pool.block_table(slot).expect("block table");
+        let total_fed = 400usize;
+        let mut kbuf = vec![0u8; kpb];
+        let mut vbuf = vec![0u8; kpb];
+        for lp in 0..bt.num_pages() {
+            let phys = bt.physical(lp).expect("fed page resident") as usize;
+            let fed = total_fed.saturating_sub(lp * KV_BLOCK_TOKENS).min(KV_BLOCK_TOKENS);
+            if fed == 0 {
+                continue;
+            }
+            for il in 0..n_fa {
+                let raw = &ctl.slots[slot.0].raw;
+                assert!(raw.has_k_gpu(lp as u32, il as u32, fed as u32), "K present lp={lp}");
+                assert!(raw.has_v_gpu(lp as u32, il as u32, fed as u32), "V present lp={lp}");
+                assert!(raw.copy_k_gpu(lp as u32, il as u32, &mut kbuf[..fed * row], fed as u32));
+                assert!(raw.copy_v_gpu(lp as u32, il as u32, &mut vbuf[..fed * row], fed as u32));
+                for intra in 0..fed {
+                    for b in 0..row {
+                        assert_eq!(
+                            kbuf[intra * row + b], pat(phys, intra, b, il, 0),
+                            "K mismatch lp={lp} phys={phys} il={il} intra={intra} b={b}"
+                        );
+                        assert_eq!(
+                            vbuf[intra * row + b], pat(phys, intra, b, il, 1),
+                            "V mismatch lp={lp} phys={phys} il={il} intra={intra} b={b}"
+                        );
+                    }
+                }
+            }
+        }
+        // Fail-closed: a feed beyond the provisioned pages has no resident
+        // physical page, so the gather must error before any archive mutation.
+        assert!(
+            ctl.write_through_archive(&gpu, &pool, &k_arenas, &v_arenas, slot.0, 512, 128).is_err(),
+            "non-resident page must fail closed"
+        );
+
+        for t in k_arenas {
+            gpu.free_tensor(t).expect("free k arena");
+        }
+        for t in v_arenas {
+            gpu.free_tensor(t).expect("free v arena");
+        }
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+}
