@@ -510,6 +510,80 @@ struct HkLayerwiseRequest {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+struct HkSpill {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct HkReservation {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct HkTape {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct HkTapeChunk {
+    _private: [u8; 0],
+}
+
+/// `hk_query_plane` — one opaque projected plane: an engine format/version
+/// identified row layout. `row_stride` is bytes per token row (incl. padding).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryProjectionPlane {
+    pub id: u32,
+    pub row_stride: u64,
+}
+
+#[repr(C)]
+struct HkQueryLayout {
+    format: *const c_char,
+    version: u32,
+    planes: *const QueryProjectionPlane,
+    plane_count: usize,
+}
+
+#[repr(C)]
+struct HkQueryPlaneBytes {
+    id: u32,
+    data: *const c_void,
+    bytes: usize,
+}
+
+/// Owned `kvmem::QueryProjectionLayout`: an engine-owned format/version plus the
+/// declared opaque planes, in chunk storage order. The tape stores each plane
+/// contiguously per chunk; no dtype conversion or GPU access is involved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryProjectionLayout {
+    pub format: String,
+    pub version: u32,
+    pub planes: Vec<QueryProjectionPlane>,
+}
+
+impl QueryProjectionLayout {
+    /// Borrowed C layout; the returned `CString` must outlive the FFI call.
+    fn ffi(&self) -> Result<(CString, HkQueryLayout)> {
+        let format = CString::new(self.format.as_str())
+            .map_err(|e| KvMemError(format!("tape layout format: {e}")))?;
+        let layout = HkQueryLayout {
+            format: format.as_ptr(),
+            version: self.version,
+            planes: self.planes.as_ptr(),
+            plane_count: self.planes.len(),
+        };
+        Ok((format, layout))
+    }
+}
+
+/// Borrowed caller-owned CPU rows for one plane, consumed synchronously by
+/// [`QueryProjectionTape::append`]. `data.len()` must equal `row_stride * count`.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryPlaneBytes<'a> {
+    pub id: u32,
+    pub data: &'a [u8],
+}
+
 // ── native (device-ready) Query projection: C struct mirrors ──
 
 /// Mirrors `kvmem::NativeQueryScalar` (`hk_native_query_scalar`).
@@ -568,6 +642,325 @@ struct HkQueryScoreFrame {
     transport_mask: *const u8,
     transport_mask_count: usize,
     accepted_through: u64,
+}
+
+// ── layerwise attention-mass pressure: C struct mirrors + opaque handles ──
+
+#[repr(C)]
+struct HkPrefillPressure {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct HkPrefillSnapshot {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct HkOutputPressure {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct HkOutputSnapshot {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct HkPressureChoices {
+    _private: [u8; 0],
+}
+
+/// `hk_prefill_options` — mirrors `kvmem::LayerwisePrefillOptions`. `block_tokens`
+/// MUST equal the catalog layout block_tokens (hipfire 128); `stride == 0` samples
+/// the last row only. Used directly as the borrowed C view (layout-identical).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrefillOptions {
+    pub block_tokens: u32,
+    pub select_tokens: u64,
+    pub reserve_tokens: u64,
+    pub interval: u64,
+    pub stride: u32,
+    pub half_life: f64,
+}
+
+/// Mirrors `kvmem::LayerwisePressureSource` (`hk_pressure_source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PressureSource {
+    Prefill = 0,
+    Output = 1,
+}
+
+impl PressureSource {
+    fn from_u32(v: u32) -> Self {
+        match v {
+            1 => Self::Output,
+            _ => Self::Prefill,
+        }
+    }
+}
+
+/// Owned `kvmem::LayerwisePrefillMass`: one model layer's accepted per-page
+/// probability mass. `starts` are physical dense-window segment starts; `history`
+/// are original logical block starts (duplicates meaningful); `masses` is
+/// `rows × history.len()` row-major, each sampled row summing to 1 within tolerance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefillMass {
+    pub model_layer: u32,
+    pub starts: Vec<u64>,
+    pub history: Vec<u64>,
+    pub masses: Vec<f64>,
+}
+
+#[repr(C)]
+struct HkPrefillMass {
+    model_layer: u32,
+    starts: *const u64,
+    start_count: usize,
+    history: *const u64,
+    history_count: usize,
+    masses: *const f64,
+    mass_count: usize,
+}
+
+impl PrefillMass {
+    fn ffi(&self) -> HkPrefillMass {
+        HkPrefillMass {
+            model_layer: self.model_layer,
+            starts: self.starts.as_ptr(),
+            start_count: self.starts.len(),
+            history: self.history.as_ptr(),
+            history_count: self.history.len(),
+            masses: self.masses.as_ptr(),
+            mass_count: self.masses.len(),
+        }
+    }
+}
+
+/// Owned `kvmem::LayerwisePrefillAcceptance`: a whole-model complete native
+/// acceptance. `history.frontier` is end; `count == accepted` for a complete
+/// boundary; `rows` are the sampled offsets; `layers` are exactly the configured
+/// public target layers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefillAcceptance {
+    pub history: MemoryStamp,
+    pub count: u64,
+    pub accepted: u64,
+    pub local_begin: u64,
+    pub rows: Vec<u32>,
+    pub layers: Vec<PrefillMass>,
+}
+
+#[repr(C)]
+struct HkPrefillAcceptance {
+    history: MemoryStamp,
+    count: u64,
+    accepted: u64,
+    local_begin: u64,
+    rows: *const u32,
+    row_count: usize,
+    layers: *const HkPrefillMass,
+    layer_count: usize,
+}
+
+/// Owned `kvmem::LayerwisePressureChoice`: one layer's resident-only keep-set
+/// selection. `candidates`/`fixed`/`selected` are native canonical IDs chronological;
+/// `scores` are candidate-aligned mass/exposure.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PressureChoice {
+    pub model_layer: u32,
+    pub candidates: Vec<u64>,
+    pub fixed: Vec<u64>,
+    pub selected: Vec<u64>,
+    pub scores: Vec<f64>,
+    pub accepted_score_end: u64,
+    pub samples: u64,
+    pub chunks: u64,
+    pub selected_tokens: u64,
+    pub charged_tokens: u64,
+    pub source: PressureSource,
+    pub output_samples: u64,
+    pub output_rounds: u64,
+}
+
+#[repr(C)]
+struct HkPressureChoice {
+    model_layer: u32,
+    candidates: *const u64,
+    candidate_count: usize,
+    fixed: *const u64,
+    fixed_count: usize,
+    selected: *const u64,
+    selected_count: usize,
+    scores: *const f64,
+    score_count: usize,
+    accepted_score_end: u64,
+    samples: u64,
+    chunks: u64,
+    selected_tokens: u64,
+    charged_tokens: u64,
+    source: u32,
+    output_samples: u64,
+    output_rounds: u64,
+}
+
+/// Owned `kvmem::LayerwisePrefillValue`: one logical block's accumulated mass/exposure.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrefillValue {
+    pub original_start: u64,
+    pub mass: f64,
+    pub exposure: f64,
+}
+
+/// Owned `kvmem::LayerwisePrefillState`: one layer's pressure history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefillState {
+    pub model_layer: u32,
+    pub values: Vec<PrefillValue>,
+    pub end: u64,
+    pub samples: u64,
+    pub chunks: u64,
+}
+
+/// Owned `kvmem::LayerwisePrefillSnapshot`: the complete prefill pressure state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefillSnapshot {
+    pub session: SessionIdentity,
+    pub layers: Vec<PrefillState>,
+}
+
+/// Mirrors `kvmem::LayerwiseOutputScope` (`hk_output_scope`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum OutputScope {
+    ToolCall = 0,
+    NonThinking = 1,
+}
+
+/// `hk_output_options` — mirrors `kvmem::LayerwiseOutputOptions`. `scope` carries a
+/// [`OutputScope`] ordinal. Used directly as the borrowed C view (layout-identical).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutputOptions {
+    pub scope: u32,
+    pub interval: u32,
+    pub decay: f64,
+    pub commit_max_bytes: u64,
+}
+
+impl Default for OutputOptions {
+    fn default() -> Self {
+        Self { scope: OutputScope::ToolCall as u32, interval: 16, decay: 0.5, commit_max_bytes: 16_777_216 }
+    }
+}
+
+/// `hk_output_scope_state` — explicit model-native semantic scope (by value).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputScopeState {
+    pub thinking: c_int,
+    pub tool_call: c_int,
+}
+
+impl OutputScopeState {
+    pub fn new(thinking: bool, tool_call: bool) -> Self {
+        Self { thinking: thinking as c_int, tool_call: tool_call as c_int }
+    }
+}
+
+/// `hk_output_scope_row` — one consumed row's semantic scope flags.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputScopeRow {
+    pub thinking: c_int,
+    pub tool_call: c_int,
+    pub body: c_int,
+}
+
+impl OutputScopeRow {
+    pub fn new(thinking: bool, tool_call: bool, body: bool) -> Self {
+        Self { thinking: thinking as c_int, tool_call: tool_call as c_int, body: body as c_int }
+    }
+}
+
+/// Owned `kvmem::LayerwiseOutputMass`: one layer's captured output mass (no
+/// renormalization). `history` maps native physical segment -> original logical start.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputMass {
+    pub model_layer: u32,
+    pub history: Vec<u64>,
+    pub masses: Vec<f64>,
+}
+
+#[repr(C)]
+struct HkOutputMass {
+    model_layer: u32,
+    history: *const u64,
+    history_count: usize,
+    masses: *const f64,
+    mass_count: usize,
+}
+
+impl OutputMass {
+    fn ffi(&self) -> HkOutputMass {
+        HkOutputMass {
+            model_layer: self.model_layer,
+            history: self.history.as_ptr(),
+            history_count: self.history.len(),
+            masses: self.masses.as_ptr(),
+            mass_count: self.masses.len(),
+        }
+    }
+}
+
+/// Owned `kvmem::LayerwiseOutputAcceptance`: `history.frontier` is the native
+/// consumed-row frontier (never predicted-token +1); `accepted` is the
+/// scheduler-confirmed prefix of the prepared verifier batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputAcceptance {
+    pub history: MemoryStamp,
+    pub request: u64,
+    pub accepted: u32,
+    pub rows: Vec<u32>,
+    pub layers: Vec<OutputMass>,
+}
+
+#[repr(C)]
+struct HkOutputAcceptance {
+    history: MemoryStamp,
+    request: u64,
+    accepted: u32,
+    rows: *const u32,
+    row_count: usize,
+    layers: *const HkOutputMass,
+    layer_count: usize,
+}
+
+/// Owned `kvmem::LayerwiseOutputParserState`: the shared accepted-token scope parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputParserState {
+    pub thinking: bool,
+    pub action: bool,
+    pub tokens: u64,
+}
+
+/// Owned `kvmem::LayerwiseOutputState`: one layer's output scores/pending mass.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputState {
+    pub model_layer: u32,
+    pub scores: Vec<(u64, f64)>,
+    pub pending: Vec<(u64, f64)>,
+    pub samples: u64,
+    pub rounds: u64,
+}
+
+/// Owned `kvmem::LayerwiseOutputSnapshot`: the complete output pressure state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputSnapshot {
+    pub session: SessionIdentity,
+    pub layers: Vec<OutputState>,
+    pub parser: OutputParserState,
+    pub request: u64,
+    pub accepted_end: u64,
+    pub active: bool,
 }
 
 mod ffi {
@@ -1063,6 +1456,284 @@ mod ffi {
             >,
             scorer_user: *mut c_void,
         ) -> c_int;
+
+        // ── layerwise activation accounts + projected-Q history tape ──
+        pub fn hk_spill_create(directory: *const c_char, capacity_bytes: u64) -> *mut HkSpill;
+        pub fn hk_spill_destroy(s: *mut HkSpill);
+        pub fn hk_spill_charged_bytes(s: *const HkSpill) -> u64;
+        pub fn hk_spill_capacity_bytes(s: *const HkSpill) -> u64;
+
+        pub fn hk_storage_reserve(s: *mut HkStorage, bytes: u64) -> *mut HkReservation;
+        pub fn hk_reservation_destroy(r: *mut HkReservation);
+        pub fn hk_reservation_remaining(r: *const HkReservation) -> u64;
+        pub fn hk_reservation_allocate(
+            r: *mut HkReservation,
+            bytes: *const u8,
+            len: usize,
+        ) -> *mut HkHostRecord;
+
+        pub fn hk_tape_create_ram(
+            activation: *mut HkStorage,
+            metadata: *mut HkStorage,
+            max_chunks: u64,
+            identity: *const LayerwiseIdentity,
+            model_layer: u32,
+            layout: *const HkQueryLayout,
+        ) -> *mut HkTape;
+        pub fn hk_tape_create_disk(
+            activation: *mut HkSpill,
+            metadata: *mut HkStorage,
+            max_chunks: u64,
+            identity: *const LayerwiseIdentity,
+            model_layer: u32,
+            layout: *const HkQueryLayout,
+        ) -> *mut HkTape;
+        pub fn hk_tape_destroy(t: *mut HkTape);
+        pub fn hk_tape_metadata_bound(layout: *const HkQueryLayout, max_chunks: u64) -> u64;
+        pub fn hk_tape_metadata_bytes(t: *const HkTape) -> u64;
+        pub fn hk_tape_max_chunks(t: *const HkTape) -> u64;
+        pub fn hk_tape_total_bytes(t: *const HkTape) -> u64;
+        pub fn hk_tape_reserved_bytes(t: *const HkTape) -> u64;
+        pub fn hk_tape_covered_end(t: *const HkTape) -> u64;
+        pub fn hk_tape_chunk_count(t: *const HkTape) -> usize;
+        pub fn hk_tape_model_layer(t: *const HkTape) -> u32;
+        pub fn hk_tape_complete(t: *const HkTape) -> c_int;
+        pub fn hk_tape_aborted(t: *const HkTape) -> c_int;
+        pub fn hk_tape_append(
+            t: *mut HkTape,
+            identity: *const LayerwiseIdentity,
+            model_layer: u32,
+            begin: u64,
+            count: u64,
+            planes: *const HkQueryPlaneBytes,
+            plane_count: usize,
+        ) -> *mut HkTapeChunk;
+        pub fn hk_tape_finish(
+            t: *mut HkTape,
+            identity: *const LayerwiseIdentity,
+            model_layer: u32,
+        ) -> c_int;
+        pub fn hk_tape_chunk_at(
+            t: *const HkTape,
+            identity: *const LayerwiseIdentity,
+            model_layer: u32,
+            index: usize,
+        ) -> *mut HkTapeChunk;
+        pub fn hk_tape_read_rows(
+            t: *const HkTape,
+            identity: *const LayerwiseIdentity,
+            model_layer: u32,
+            plane: u32,
+            begin: u64,
+            count: u64,
+            dest: *mut u8,
+            dest_bytes: usize,
+        ) -> c_int;
+        pub fn hk_tape_abort(t: *mut HkTape);
+
+        pub fn hk_tape_chunk_destroy(c: *mut HkTapeChunk);
+        pub fn hk_tape_chunk_model_layer(c: *const HkTapeChunk) -> u32;
+        pub fn hk_tape_chunk_begin(c: *const HkTapeChunk) -> u64;
+        pub fn hk_tape_chunk_end(c: *const HkTapeChunk) -> u64;
+        pub fn hk_tape_chunk_size(c: *const HkTapeChunk) -> usize;
+        pub fn hk_tape_chunk_read_rows(
+            c: *const HkTapeChunk,
+            identity: *const LayerwiseIdentity,
+            model_layer: u32,
+            plane: u32,
+            begin: u64,
+            count: u64,
+            dest: *mut u8,
+            dest_bytes: usize,
+        ) -> c_int;
+
+        // ── layerwise attention-mass pressure ──
+        pub fn hk_prefill_pressure_create(
+            session: SessionIdentity,
+            model_layers: *const u32,
+            n_layers: usize,
+            options: *const PrefillOptions,
+        ) -> *mut HkPrefillPressure;
+        pub fn hk_prefill_pressure_destroy(p: *mut HkPrefillPressure);
+        pub fn hk_prefill_pressure_rows(
+            p: *const HkPrefillPressure,
+            begin: u64,
+            count: u32,
+            local_begin: u64,
+            replay: c_int,
+            out: *mut u32,
+            capacity: u32,
+        ) -> u32;
+        pub fn hk_prefill_pressure_accept(
+            p: *mut HkPrefillPressure,
+            a: *const HkPrefillAcceptance,
+        ) -> c_int;
+        pub fn hk_prefill_pressure_options(
+            p: *const HkPrefillPressure,
+            out: *mut PrefillOptions,
+        ) -> c_int;
+        pub fn hk_prefill_pressure_snapshot(p: *const HkPrefillPressure) -> *mut HkPrefillSnapshot;
+        pub fn hk_prefill_pressure_restore(
+            p: *mut HkPrefillPressure,
+            s: *const HkPrefillSnapshot,
+            position: u64,
+        ) -> c_int;
+        pub fn hk_prefill_pressure_select(
+            p: *const HkPrefillPressure,
+            catalog: *const HkMemoryCatalog,
+            mandatory: *const u64,
+            n_mandatory: usize,
+            budget_tokens: u64,
+            sink_blocks: u32,
+        ) -> *mut HkPressureChoices;
+
+        pub fn hk_prefill_snapshot_destroy(s: *mut HkPrefillSnapshot);
+        pub fn hk_prefill_snapshot_session(
+            s: *const HkPrefillSnapshot,
+            out: *mut SessionIdentity,
+        ) -> c_int;
+        pub fn hk_prefill_snapshot_layer_count(s: *const HkPrefillSnapshot) -> usize;
+        pub fn hk_prefill_snapshot_layer(
+            s: *const HkPrefillSnapshot,
+            i: usize,
+            model_layer: *mut u32,
+            end: *mut u64,
+            samples: *mut u64,
+            chunks: *mut u64,
+        ) -> c_int;
+        pub fn hk_prefill_snapshot_value_count(s: *const HkPrefillSnapshot, i: usize) -> usize;
+        pub fn hk_prefill_snapshot_value(
+            s: *const HkPrefillSnapshot,
+            i: usize,
+            v: usize,
+            original_start: *mut u64,
+            mass: *mut f64,
+            exposure: *mut f64,
+        ) -> c_int;
+
+        pub fn hk_pressure_choices_destroy(c: *mut HkPressureChoices);
+        pub fn hk_pressure_choices_count(c: *const HkPressureChoices) -> usize;
+        pub fn hk_pressure_choices_get(
+            c: *const HkPressureChoices,
+            i: usize,
+            out: *mut HkPressureChoice,
+        ) -> c_int;
+
+        pub fn hk_output_pressure_create_markers(
+            session: SessionIdentity,
+            model_layers: *const u32,
+            n_layers: usize,
+            prefill: *const PrefillOptions,
+            markers5: *const i32,
+            options: *const OutputOptions,
+        ) -> *mut HkOutputPressure;
+        pub fn hk_output_pressure_create_external(
+            session: SessionIdentity,
+            model_layers: *const u32,
+            n_layers: usize,
+            prefill: *const PrefillOptions,
+            options: *const OutputOptions,
+        ) -> *mut HkOutputPressure;
+        pub fn hk_output_pressure_destroy(p: *mut HkOutputPressure);
+        pub fn hk_output_pressure_begin(
+            p: *mut HkOutputPressure,
+            accepted_history: *const MemoryStamp,
+            request: u64,
+            prompt: *const u32,
+            prompt_count: usize,
+        ) -> c_int;
+        pub fn hk_output_pressure_begin_scope(
+            p: *mut HkOutputPressure,
+            accepted_history: *const MemoryStamp,
+            request: u64,
+            scope: OutputScopeState,
+        ) -> c_int;
+        pub fn hk_output_pressure_accept_prefill(
+            p: *mut HkOutputPressure,
+            accepted_history: *const MemoryStamp,
+            request: u64,
+            begin: u64,
+        ) -> c_int;
+        pub fn hk_output_pressure_prepare(
+            p: *mut HkOutputPressure,
+            request: u64,
+            begin: u64,
+            consumed_tokens: *const u32,
+            count: usize,
+            out_mask: *mut u64,
+        ) -> c_int;
+        pub fn hk_output_pressure_prepare_scope(
+            p: *mut HkOutputPressure,
+            request: u64,
+            begin: u64,
+            rows: *const OutputScopeRow,
+            count: usize,
+            out_mask: *mut u64,
+        ) -> c_int;
+        pub fn hk_output_pressure_accept(
+            p: *mut HkOutputPressure,
+            a: *const HkOutputAcceptance,
+            out_mask: *mut u64,
+        ) -> c_int;
+        pub fn hk_output_pressure_finish(
+            p: *mut HkOutputPressure,
+            request: u64,
+            accepted_history: *const HkMemoryCatalog,
+        ) -> c_int;
+        pub fn hk_output_pressure_snapshot(p: *const HkOutputPressure) -> *mut HkOutputSnapshot;
+        pub fn hk_output_pressure_restore(
+            p: *mut HkOutputPressure,
+            s: *const HkOutputSnapshot,
+            position: u64,
+        ) -> c_int;
+        pub fn hk_output_pressure_select(
+            p: *const HkOutputPressure,
+            catalog: *const HkMemoryCatalog,
+            prefill: *const HkPrefillPressure,
+            mandatory: *const u64,
+            n_mandatory: usize,
+            budget_tokens: u64,
+            sink_blocks: u32,
+        ) -> *mut HkPressureChoices;
+
+        pub fn hk_output_snapshot_destroy(s: *mut HkOutputSnapshot);
+        pub fn hk_output_snapshot_session(
+            s: *const HkOutputSnapshot,
+            out: *mut SessionIdentity,
+        ) -> c_int;
+        pub fn hk_output_snapshot_meta(
+            s: *const HkOutputSnapshot,
+            request: *mut u64,
+            accepted_end: *mut u64,
+            active: *mut c_int,
+            thinking: *mut c_int,
+            action: *mut c_int,
+            parser_tokens: *mut u64,
+        ) -> c_int;
+        pub fn hk_output_snapshot_layer_count(s: *const HkOutputSnapshot) -> usize;
+        pub fn hk_output_snapshot_layer(
+            s: *const HkOutputSnapshot,
+            i: usize,
+            model_layer: *mut u32,
+            samples: *mut u64,
+            rounds: *mut u64,
+        ) -> c_int;
+        pub fn hk_output_snapshot_score_count(s: *const HkOutputSnapshot, i: usize) -> usize;
+        pub fn hk_output_snapshot_score(
+            s: *const HkOutputSnapshot,
+            i: usize,
+            j: usize,
+            start: *mut u64,
+            score: *mut f64,
+        ) -> c_int;
+        pub fn hk_output_snapshot_pending_count(s: *const HkOutputSnapshot, i: usize) -> usize;
+        pub fn hk_output_snapshot_pending(
+            s: *const HkOutputSnapshot,
+            i: usize,
+            j: usize,
+            start: *mut u64,
+            score: *mut f64,
+        ) -> c_int;
     }
 }
 
@@ -1156,6 +1827,16 @@ impl Storage {
     pub fn trim(&mut self, resident_target: u64) -> Result<()> {
         let p = self.ptr.as_ptr();
         checked(|| unsafe { ffi::hk_storage_trim(p, resident_target) })
+    }
+
+    /// Reserve a finite charge against this account (`kvmem::HostKvReservation`).
+    /// The reservation counts like live/leased payload; a failed allocation
+    /// retains it, and dropping the reservation returns unused capacity. Used
+    /// for the tape metadata control bound, independent of canonical KV.
+    pub fn reserve(&self, bytes: u64) -> Result<Reservation> {
+        clear_error();
+        let ptr = unsafe { ffi::hk_storage_reserve(self.ptr.as_ptr(), bytes) };
+        NonNull::new(ptr).map(|ptr| Reservation { ptr }).ok_or_else(err_from_last)
     }
 }
 
@@ -1735,6 +2416,736 @@ impl HostSource {
 impl Drop for HostSource {
     fn drop(&mut self) {
         unsafe { ffi::hk_host_source_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+/// A standalone process-local disk account (`kvmem::SpillFile`): one ephemeral
+/// file backing the projected-Q tape's disk tier. The quota covers reserved file
+/// ranges, not OS page cache. No crash/restart durability guarantee.
+pub struct SpillFile {
+    ptr: NonNull<HkSpill>,
+}
+
+impl SpillFile {
+    pub fn new(directory: &Path, capacity_bytes: u64) -> Result<Self> {
+        let dir = CString::new(directory.to_string_lossy().into_owned())
+            .map_err(|e| KvMemError(format!("spill dir: {e}")))?;
+        clear_error();
+        let ptr = unsafe { ffi::hk_spill_create(dir.as_ptr(), capacity_bytes) };
+        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
+    }
+
+    pub fn charged_bytes(&self) -> u64 {
+        unsafe { ffi::hk_spill_charged_bytes(self.ptr.as_ptr()) }
+    }
+
+    pub fn capacity_bytes(&self) -> u64 {
+        unsafe { ffi::hk_spill_capacity_bytes(self.ptr.as_ptr()) }
+    }
+}
+
+impl Drop for SpillFile {
+    fn drop(&mut self) {
+        unsafe { ffi::hk_spill_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+/// A finite charge against a [`Storage`] account (`kvmem::HostKvReservation`).
+/// Reservations count like live/leased payload; a failed allocation retains the
+/// reservation, and dropping it returns unused capacity.
+pub struct Reservation {
+    ptr: NonNull<HkReservation>,
+}
+
+impl Reservation {
+    pub fn remaining(&self) -> u64 {
+        unsafe { ffi::hk_reservation_remaining(self.ptr.as_ptr()) }
+    }
+
+    /// Allocate a sealed-source record from this reservation, copying `bytes`.
+    pub fn allocate(&self, bytes: &[u8]) -> Result<HostRecord> {
+        clear_error();
+        let ptr = unsafe {
+            ffi::hk_reservation_allocate(self.ptr.as_ptr(), bytes.as_ptr(), bytes.len())
+        };
+        NonNull::new(ptr).map(|ptr| HostRecord { ptr }).ok_or_else(err_from_last)
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        unsafe { ffi::hk_reservation_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+/// A sealed immutable projected chunk (`kvmem::QueryProjectionChunkSource`). Its
+/// byte source and identity survive the tape owner; reads acquire only a short
+/// source read lease and never promote an entire cold record into RAM.
+pub struct TapeChunk {
+    ptr: NonNull<HkTapeChunk>,
+}
+
+impl TapeChunk {
+    pub fn model_layer(&self) -> u32 {
+        unsafe { ffi::hk_tape_chunk_model_layer(self.ptr.as_ptr()) }
+    }
+    pub fn begin(&self) -> u64 {
+        unsafe { ffi::hk_tape_chunk_begin(self.ptr.as_ptr()) }
+    }
+    pub fn end(&self) -> u64 {
+        unsafe { ffi::hk_tape_chunk_end(self.ptr.as_ptr()) }
+    }
+    pub fn size(&self) -> usize {
+        unsafe { ffi::hk_tape_chunk_size(self.ptr.as_ptr()) }
+    }
+
+    /// Read a bounded covered range of one plane into caller-owned staging.
+    pub fn read_rows(
+        &self,
+        identity: &LayerwiseIdentity,
+        model_layer: u32,
+        plane: u32,
+        begin: u64,
+        count: u64,
+        dest: &mut [u8],
+    ) -> Result<()> {
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe {
+            ffi::hk_tape_chunk_read_rows(
+                p, identity, model_layer, plane, begin, count, dest.as_mut_ptr(), dest.len(),
+            );
+        })
+    }
+}
+
+impl Drop for TapeChunk {
+    fn drop(&mut self) {
+        unsafe { ffi::hk_tape_chunk_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+/// The engine-owned projected-Q history tape (`kvmem::QueryProjectionTape`): one
+/// fixed model layer and one exact Query evaluation span, recorded chunk by chunk
+/// into an explicit activation account. The finite-metadata constructors reserve
+/// the complete conservative descriptor/layout/chunk-table bound
+/// ([`Self::metadata_bound`]) against an independent metadata account BEFORE any
+/// payload is admitted. The RAM constructor admits against [`Storage`] RAM; the
+/// disk constructor against a [`SpillFile`] span (a layer larger than the RAM
+/// account). This is the layerwise activation-quota substrate; it never mutates
+/// statistics or the resident view, and is not consumed by the legacy path.
+pub struct QueryProjectionTape {
+    ptr: NonNull<HkTape>,
+}
+
+impl QueryProjectionTape {
+    /// RAM-backed tape with a finite independent metadata account.
+    pub fn new_ram(
+        activation: &Storage,
+        metadata: &Storage,
+        max_chunks: u64,
+        identity: &LayerwiseIdentity,
+        model_layer: u32,
+        layout: &QueryProjectionLayout,
+    ) -> Result<Self> {
+        let (_format, lay) = layout.ffi()?;
+        clear_error();
+        let ptr = unsafe {
+            ffi::hk_tape_create_ram(
+                activation.ptr.as_ptr(), metadata.ptr.as_ptr(), max_chunks, identity,
+                model_layer, &lay,
+            )
+        };
+        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
+    }
+
+    /// Disk-backed tape with a finite independent metadata account. Permits a
+    /// layer larger than the activation RAM account; a surviving source retains
+    /// the complete disk span until its last reader releases it.
+    pub fn new_disk(
+        activation: &SpillFile,
+        metadata: &Storage,
+        max_chunks: u64,
+        identity: &LayerwiseIdentity,
+        model_layer: u32,
+        layout: &QueryProjectionLayout,
+    ) -> Result<Self> {
+        let (_format, lay) = layout.ffi()?;
+        clear_error();
+        let ptr = unsafe {
+            ffi::hk_tape_create_disk(
+                activation.ptr.as_ptr(), metadata.ptr.as_ptr(), max_chunks, identity,
+                model_layer, &lay,
+            )
+        };
+        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
+    }
+
+    /// Conservative descriptor/layout/chunk-table bound, reserved before payload.
+    pub fn metadata_bound(layout: &QueryProjectionLayout, max_chunks: u64) -> Result<u64> {
+        let (_format, lay) = layout.ffi()?;
+        clear_error();
+        let bound = unsafe { ffi::hk_tape_metadata_bound(&lay, max_chunks) };
+        if bound == 0 {
+            // A zero bound is only valid for an empty layout; surface any error.
+            if let Some(e) = last_error() {
+                return Err(KvMemError(e));
+            }
+        }
+        Ok(bound)
+    }
+
+    pub fn metadata_bytes(&self) -> u64 {
+        unsafe { ffi::hk_tape_metadata_bytes(self.ptr.as_ptr()) }
+    }
+    pub fn max_chunks(&self) -> u64 {
+        unsafe { ffi::hk_tape_max_chunks(self.ptr.as_ptr()) }
+    }
+    pub fn total_bytes(&self) -> u64 {
+        unsafe { ffi::hk_tape_total_bytes(self.ptr.as_ptr()) }
+    }
+    pub fn reserved_bytes(&self) -> u64 {
+        unsafe { ffi::hk_tape_reserved_bytes(self.ptr.as_ptr()) }
+    }
+    pub fn covered_end(&self) -> u64 {
+        unsafe { ffi::hk_tape_covered_end(self.ptr.as_ptr()) }
+    }
+    pub fn chunk_count(&self) -> usize {
+        unsafe { ffi::hk_tape_chunk_count(self.ptr.as_ptr()) }
+    }
+    pub fn model_layer(&self) -> u32 {
+        unsafe { ffi::hk_tape_model_layer(self.ptr.as_ptr()) }
+    }
+    pub fn complete(&self) -> bool {
+        unsafe { ffi::hk_tape_complete(self.ptr.as_ptr()) != 0 }
+    }
+    pub fn aborted(&self) -> bool {
+        unsafe { ffi::hk_tape_aborted(self.ptr.as_ptr()) != 0 }
+    }
+
+    /// Append `count` contiguous rows starting at `begin`; `planes` carries one
+    /// borrowed CPU buffer per declared plane (`row_stride * count` bytes each).
+    /// Returns a new sealed chunk source. Coverage must be exact and contiguous.
+    pub fn append(
+        &mut self,
+        identity: &LayerwiseIdentity,
+        model_layer: u32,
+        begin: u64,
+        count: u64,
+        planes: &[QueryPlaneBytes<'_>],
+    ) -> Result<TapeChunk> {
+        let raw: Vec<HkQueryPlaneBytes> = planes
+            .iter()
+            .map(|p| HkQueryPlaneBytes { id: p.id, data: p.data.as_ptr().cast(), bytes: p.data.len() })
+            .collect();
+        clear_error();
+        let ptr = unsafe {
+            ffi::hk_tape_append(
+                self.ptr.as_ptr(), identity, model_layer, begin, count, raw.as_ptr(), raw.len(),
+            )
+        };
+        NonNull::new(ptr).map(|ptr| TapeChunk { ptr }).ok_or_else(err_from_last)
+    }
+
+    /// Complete only after exact contiguous coverage of the evaluation span.
+    pub fn finish(&mut self, identity: &LayerwiseIdentity, model_layer: u32) -> Result<()> {
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe { ffi::hk_tape_finish(p, identity, model_layer); })
+    }
+
+    /// Borrow a sealed chunk by index (a new caller-owned source handle).
+    pub fn chunk(
+        &self,
+        identity: &LayerwiseIdentity,
+        model_layer: u32,
+        index: usize,
+    ) -> Result<TapeChunk> {
+        clear_error();
+        let ptr = unsafe {
+            ffi::hk_tape_chunk_at(self.ptr.as_ptr(), identity, model_layer, index)
+        };
+        NonNull::new(ptr).map(|ptr| TapeChunk { ptr }).ok_or_else(err_from_last)
+    }
+
+    /// Read a bounded covered range of one plane into caller-owned staging. Full
+    /// layer completion is not required to read a previously sealed chunk.
+    pub fn read_rows(
+        &self,
+        identity: &LayerwiseIdentity,
+        model_layer: u32,
+        plane: u32,
+        begin: u64,
+        count: u64,
+        dest: &mut [u8],
+    ) -> Result<()> {
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe {
+            ffi::hk_tape_read_rows(
+                p, identity, model_layer, plane, begin, count, dest.as_mut_ptr(), dest.len(),
+            );
+        })
+    }
+
+    /// Release unused reservation and tape-owned chunk references; exported
+    /// sources stay valid. No device work is cancelled here.
+    pub fn abort(&mut self) {
+        unsafe { ffi::hk_tape_abort(self.ptr.as_ptr()) };
+    }
+}
+
+impl Drop for QueryProjectionTape {
+    fn drop(&mut self) {
+        unsafe { ffi::hk_tape_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+// ── layerwise attention-mass pressure: safe wrappers ──
+
+/// Copy a borrowed C array into an owned Vec (null/empty-safe).
+unsafe fn pressure_owned_u64(p: *const u64, n: usize) -> Vec<u64> {
+    if n == 0 { Vec::new() } else { std::slice::from_raw_parts(p, n).to_vec() }
+}
+unsafe fn pressure_owned_f64(p: *const f64, n: usize) -> Vec<f64> {
+    if n == 0 { Vec::new() } else { std::slice::from_raw_parts(p, n).to_vec() }
+}
+
+/// The session-lifetime prefill attention-mass pressure owner
+/// (`kvmem::LayerwisePrefillPressure`). It accumulates accepted per-page probability
+/// mass over a canonical history and refines a RESIDENT-ONLY keep-set: [`Self::select`]
+/// candidates come exclusively from each layer's accepted resident map (no cold
+/// recall), and the resulting [`PressureChoice::selected`] drives `catalog.plan`,
+/// exactly as ninfer's `compact_layerwise_pressure`. Independent of `plan_residency`;
+/// the attention kernels stay untouched. Not consumed by the legacy residency path.
+pub struct PrefillPressure {
+    ptr: NonNull<HkPrefillPressure>,
+}
+
+impl PrefillPressure {
+    /// `model_layers` are the configured public target layers (sorted, unique,
+    /// nonempty); `options.block_tokens` must equal the catalog layout block_tokens.
+    pub fn new(
+        session: SessionIdentity,
+        model_layers: &[u32],
+        options: &PrefillOptions,
+    ) -> Result<Self> {
+        clear_error();
+        let ptr = unsafe {
+            ffi::hk_prefill_pressure_create(
+                session, model_layers.as_ptr(), model_layers.len(), options,
+            )
+        };
+        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
+    }
+
+    /// Sampled row offsets for `[begin, begin+count)`. `replay` re-samples an
+    /// already accepted chunk. Deterministic; the count is queried then filled.
+    pub fn rows(&self, begin: u64, count: u32, local_begin: u64, replay: bool) -> Result<Vec<u32>> {
+        let p = self.ptr.as_ptr();
+        clear_error();
+        let n = unsafe {
+            ffi::hk_prefill_pressure_rows(p, begin, count, local_begin, replay as c_int, ptr::null_mut(), 0)
+        };
+        if n == u32::MAX {
+            return Err(err_from_last());
+        }
+        let mut out = vec![0u32; n as usize];
+        let written = unsafe {
+            ffi::hk_prefill_pressure_rows(p, begin, count, local_begin, replay as c_int, out.as_mut_ptr(), n)
+        };
+        if written == u32::MAX {
+            return Err(err_from_last());
+        }
+        out.truncate(written as usize);
+        Ok(out)
+    }
+
+    /// Whole-model acceptance. `Ok(true)` published; `Ok(false)` rejected unchanged
+    /// (partial acceptance, old end, or unsampled chunk); `Err` on a validation throw.
+    pub fn accept(&mut self, a: &PrefillAcceptance) -> Result<bool> {
+        let layers: Vec<HkPrefillMass> = a.layers.iter().map(|m| m.ffi()).collect();
+        let view = HkPrefillAcceptance {
+            history: a.history,
+            count: a.count,
+            accepted: a.accepted,
+            local_begin: a.local_begin,
+            rows: a.rows.as_ptr(),
+            row_count: a.rows.len(),
+            layers: layers.as_ptr(),
+            layer_count: layers.len(),
+        };
+        clear_error();
+        let rc = unsafe { ffi::hk_prefill_pressure_accept(self.ptr.as_ptr(), &view) };
+        match rc {
+            1 => Ok(true),
+            0 => Ok(false),
+            _ => Err(err_from_last()),
+        }
+    }
+
+    pub fn options(&self) -> Result<PrefillOptions> {
+        let mut out: PrefillOptions = unsafe { std::mem::zeroed() };
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe { ffi::hk_prefill_pressure_options(p, &mut out); })?;
+        Ok(out)
+    }
+
+    /// A NEW caller-owned snapshot handle (a copy of the current state).
+    pub fn snapshot(&self) -> Result<PrefillSnapshotRef> {
+        clear_error();
+        let ptr = unsafe { ffi::hk_prefill_pressure_snapshot(self.ptr.as_ptr()) };
+        NonNull::new(ptr).map(|ptr| PrefillSnapshotRef { ptr }).ok_or_else(err_from_last)
+    }
+
+    /// Rewind: a sampled history beyond `position` is cleared.
+    pub fn restore(&mut self, snap: &PrefillSnapshotRef, position: u64) -> Result<()> {
+        let p = self.ptr.as_ptr();
+        let s = snap.ptr.as_ptr();
+        checked(|| unsafe { ffi::hk_prefill_pressure_restore(p, s, position); })
+    }
+
+    /// Resident-only keep-set selection over `catalog`. `mandatory`/`sink_blocks`
+    /// must also be resident. Returns a NEW caller-owned choices handle.
+    pub fn select(
+        &self,
+        catalog: &MemoryCatalog,
+        mandatory: &[u64],
+        budget_tokens: u64,
+        sink_blocks: u32,
+    ) -> Result<PressureChoices> {
+        clear_error();
+        let ptr = unsafe {
+            ffi::hk_prefill_pressure_select(
+                self.ptr.as_ptr(), catalog.ptr.as_ptr(), mandatory.as_ptr(), mandatory.len(),
+                budget_tokens, sink_blocks,
+            )
+        };
+        NonNull::new(ptr).map(|ptr| PressureChoices { ptr }).ok_or_else(err_from_last)
+    }
+}
+
+impl Drop for PrefillPressure {
+    fn drop(&mut self) {
+        unsafe { ffi::hk_prefill_pressure_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+/// A caller-owned prefill pressure snapshot handle (for inspect/restore).
+pub struct PrefillSnapshotRef {
+    ptr: NonNull<HkPrefillSnapshot>,
+}
+
+impl PrefillSnapshotRef {
+    pub fn session(&self) -> Result<SessionIdentity> {
+        let mut out: SessionIdentity = unsafe { std::mem::zeroed() };
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe { ffi::hk_prefill_snapshot_session(p, &mut out); })?;
+        Ok(out)
+    }
+    pub fn layer_count(&self) -> usize {
+        unsafe { ffi::hk_prefill_snapshot_layer_count(self.ptr.as_ptr()) }
+    }
+
+    /// Materialize the complete owned snapshot.
+    pub fn read(&self) -> Result<PrefillSnapshot> {
+        let session = self.session()?;
+        let p = self.ptr.as_ptr();
+        let n = unsafe { ffi::hk_prefill_snapshot_layer_count(p) };
+        let mut layers = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut model_layer = 0u32;
+            let mut end = 0u64;
+            let mut samples = 0u64;
+            let mut chunks = 0u64;
+            checked(|| unsafe {
+                ffi::hk_prefill_snapshot_layer(p, i, &mut model_layer, &mut end, &mut samples, &mut chunks);
+            })?;
+            let vc = unsafe { ffi::hk_prefill_snapshot_value_count(p, i) };
+            let mut values = Vec::with_capacity(vc);
+            for v in 0..vc {
+                let mut original_start = 0u64;
+                let mut mass = 0f64;
+                let mut exposure = 0f64;
+                checked(|| unsafe {
+                    ffi::hk_prefill_snapshot_value(p, i, v, &mut original_start, &mut mass, &mut exposure);
+                })?;
+                values.push(PrefillValue { original_start, mass, exposure });
+            }
+            layers.push(PrefillState { model_layer, values, end, samples, chunks });
+        }
+        Ok(PrefillSnapshot { session, layers })
+    }
+}
+
+impl Drop for PrefillSnapshotRef {
+    fn drop(&mut self) {
+        unsafe { ffi::hk_prefill_snapshot_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+/// A caller-owned keep-set selection result (one [`PressureChoice`] per target layer).
+pub struct PressureChoices {
+    ptr: NonNull<HkPressureChoices>,
+}
+
+impl PressureChoices {
+    pub fn count(&self) -> usize {
+        unsafe { ffi::hk_pressure_choices_count(self.ptr.as_ptr()) }
+    }
+
+    /// Materialize one layer's choice (copies the borrowed arrays into owned Vecs).
+    pub fn get(&self, i: usize) -> Result<PressureChoice> {
+        let mut raw: HkPressureChoice = unsafe { std::mem::zeroed() };
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe { ffi::hk_pressure_choices_get(p, i, &mut raw); })?;
+        Ok(PressureChoice {
+            model_layer: raw.model_layer,
+            candidates: unsafe { pressure_owned_u64(raw.candidates, raw.candidate_count) },
+            fixed: unsafe { pressure_owned_u64(raw.fixed, raw.fixed_count) },
+            selected: unsafe { pressure_owned_u64(raw.selected, raw.selected_count) },
+            scores: unsafe { pressure_owned_f64(raw.scores, raw.score_count) },
+            accepted_score_end: raw.accepted_score_end,
+            samples: raw.samples,
+            chunks: raw.chunks,
+            selected_tokens: raw.selected_tokens,
+            charged_tokens: raw.charged_tokens,
+            source: PressureSource::from_u32(raw.source),
+            output_samples: raw.output_samples,
+            output_rounds: raw.output_rounds,
+        })
+    }
+
+    /// Materialize every layer's choice in order.
+    pub fn read_all(&self) -> Result<Vec<PressureChoice>> {
+        (0..self.count()).map(|i| self.get(i)).collect()
+    }
+}
+
+impl Drop for PressureChoices {
+    fn drop(&mut self) {
+        unsafe { ffi::hk_pressure_choices_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+/// The decode-output scope pressure owner (`kvmem::LayerwiseOutputPressure`): an
+/// independent-layer application of the ordinary ActionHistory rule. One
+/// accepted-token scope parser is shared by all target layers; layer scores/mass and
+/// publication are separate. Its [`Self::select`] replaces the prefill select whenever
+/// output exists, seeding from the prefill snapshot fallback; `compact_layerwise_pressure`
+/// compacts Prefill- and Output-source choices identically. Construct with either
+/// tokenizer-verified markers ([`Self::new_markers`]) or an explicit model-native
+/// semantic scope ([`Self::new_external`]).
+pub struct OutputPressure {
+    ptr: NonNull<HkOutputPressure>,
+}
+
+impl OutputPressure {
+    /// `markers5` = {tool-open, tool-close, think-open, think-close, message-start},
+    /// exact model/tokenizer-provided IDs. Missing/aliased markers are unsupported.
+    pub fn new_markers(
+        session: SessionIdentity,
+        model_layers: &[u32],
+        prefill: &PrefillOptions,
+        markers5: &[i32; 5],
+        options: &OutputOptions,
+    ) -> Result<Self> {
+        clear_error();
+        let ptr = unsafe {
+            ffi::hk_output_pressure_create_markers(
+                session, model_layers.as_ptr(), model_layers.len(), prefill,
+                markers5.as_ptr(), options,
+            )
+        };
+        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
+    }
+
+    /// Explicit model-native semantic scope (no Qwen markers installed; the
+    /// token-marker [`Self::begin`]/[`Self::prepare`] entry points reject this owner).
+    pub fn new_external(
+        session: SessionIdentity,
+        model_layers: &[u32],
+        prefill: &PrefillOptions,
+        options: &OutputOptions,
+    ) -> Result<Self> {
+        clear_error();
+        let ptr = unsafe {
+            ffi::hk_output_pressure_create_external(
+                session, model_layers.as_ptr(), model_layers.len(), prefill, options,
+            )
+        };
+        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
+    }
+
+    pub fn begin(&mut self, accepted_history: &MemoryStamp, request: u64, prompt: &[u32]) -> Result<()> {
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe {
+            ffi::hk_output_pressure_begin(p, accepted_history, request, prompt.as_ptr(), prompt.len());
+        })
+    }
+
+    pub fn begin_scope(&mut self, accepted_history: &MemoryStamp, request: u64, scope: OutputScopeState) -> Result<()> {
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe { ffi::hk_output_pressure_begin_scope(p, accepted_history, request, scope); })
+    }
+
+    /// Prompt rows advance native acceptance without becoming Output samples.
+    pub fn accept_prefill(&mut self, accepted_history: &MemoryStamp, request: u64, begin: u64) -> Result<()> {
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe { ffi::hk_output_pressure_accept_prefill(p, accepted_history, request, begin); })
+    }
+
+    /// Returns the sampled-row bitmask for the consumed tokens.
+    pub fn prepare(&mut self, request: u64, begin: u64, consumed_tokens: &[u32]) -> Result<u64> {
+        let mut mask = 0u64;
+        let p = self.ptr.as_ptr();
+        clear_error();
+        let rc = unsafe {
+            ffi::hk_output_pressure_prepare(p, request, begin, consumed_tokens.as_ptr(), consumed_tokens.len(), &mut mask)
+        };
+        if rc != 0 { return Err(err_from_last()); }
+        Ok(mask)
+    }
+
+    /// Scope-row variant of [`Self::prepare`] (explicit semantic scope owner).
+    pub fn prepare_scope(&mut self, request: u64, begin: u64, rows: &[OutputScopeRow]) -> Result<u64> {
+        let mut mask = 0u64;
+        let p = self.ptr.as_ptr();
+        clear_error();
+        let rc = unsafe {
+            ffi::hk_output_pressure_prepare_scope(p, request, begin, rows.as_ptr(), rows.len(), &mut mask)
+        };
+        if rc != 0 { return Err(err_from_last()); }
+        Ok(mask)
+    }
+
+    /// Atomically validates all target layers before committing parser or mass.
+    /// Returns only newly accepted sampled row bits; repeated prefix is idempotent.
+    pub fn accept(&mut self, a: &OutputAcceptance) -> Result<u64> {
+        let layers: Vec<HkOutputMass> = a.layers.iter().map(|m| m.ffi()).collect();
+        let view = HkOutputAcceptance {
+            history: a.history,
+            request: a.request,
+            accepted: a.accepted,
+            rows: a.rows.as_ptr(),
+            row_count: a.rows.len(),
+            layers: layers.as_ptr(),
+            layer_count: layers.len(),
+        };
+        let mut mask = 0u64;
+        clear_error();
+        let rc = unsafe { ffi::hk_output_pressure_accept(self.ptr.as_ptr(), &view, &mut mask) };
+        if rc != 0 { return Err(err_from_last()); }
+        Ok(mask)
+    }
+
+    /// Clears pending mass, retains sample N until begin(), publishes S'=decay*S+mass/N.
+    pub fn finish(&mut self, request: u64, accepted_history: &MemoryCatalog) -> Result<()> {
+        let p = self.ptr.as_ptr();
+        let c = accepted_history.ptr.as_ptr();
+        checked(|| unsafe { ffi::hk_output_pressure_finish(p, request, c); })
+    }
+
+    pub fn snapshot(&self) -> Result<OutputSnapshotRef> {
+        clear_error();
+        let ptr = unsafe { ffi::hk_output_pressure_snapshot(self.ptr.as_ptr()) };
+        NonNull::new(ptr).map(|ptr| OutputSnapshotRef { ptr }).ok_or_else(err_from_last)
+    }
+
+    pub fn restore(&mut self, snap: &OutputSnapshotRef, position: u64) -> Result<()> {
+        let p = self.ptr.as_ptr();
+        let s = snap.ptr.as_ptr();
+        checked(|| unsafe { ffi::hk_output_pressure_restore(p, s, position); })
+    }
+
+    /// Combined keep-set selection: seeds from the prefill snapshot fallback and
+    /// overrides per layer with positive decayed output scores.
+    pub fn select(
+        &self,
+        catalog: &MemoryCatalog,
+        prefill: &PrefillPressure,
+        mandatory: &[u64],
+        budget_tokens: u64,
+        sink_blocks: u32,
+    ) -> Result<PressureChoices> {
+        clear_error();
+        let ptr = unsafe {
+            ffi::hk_output_pressure_select(
+                self.ptr.as_ptr(), catalog.ptr.as_ptr(), prefill.ptr.as_ptr(),
+                mandatory.as_ptr(), mandatory.len(), budget_tokens, sink_blocks,
+            )
+        };
+        NonNull::new(ptr).map(|ptr| PressureChoices { ptr }).ok_or_else(err_from_last)
+    }
+}
+
+impl Drop for OutputPressure {
+    fn drop(&mut self) {
+        unsafe { ffi::hk_output_pressure_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+/// A caller-owned output pressure snapshot handle (for inspect/restore).
+pub struct OutputSnapshotRef {
+    ptr: NonNull<HkOutputSnapshot>,
+}
+
+impl OutputSnapshotRef {
+    pub fn session(&self) -> Result<SessionIdentity> {
+        let mut out: SessionIdentity = unsafe { std::mem::zeroed() };
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe { ffi::hk_output_snapshot_session(p, &mut out); })?;
+        Ok(out)
+    }
+    pub fn layer_count(&self) -> usize {
+        unsafe { ffi::hk_output_snapshot_layer_count(self.ptr.as_ptr()) }
+    }
+
+    /// Materialize the complete owned snapshot.
+    pub fn read(&self) -> Result<OutputSnapshot> {
+        let session = self.session()?;
+        let p = self.ptr.as_ptr();
+        let mut request = 0u64;
+        let mut accepted_end = 0u64;
+        let mut active = 0 as c_int;
+        let mut thinking = 0 as c_int;
+        let mut action = 0 as c_int;
+        let mut parser_tokens = 0u64;
+        checked(|| unsafe {
+            ffi::hk_output_snapshot_meta(p, &mut request, &mut accepted_end, &mut active, &mut thinking, &mut action, &mut parser_tokens);
+        })?;
+        let parser = OutputParserState { thinking: thinking != 0, action: action != 0, tokens: parser_tokens };
+        let n = unsafe { ffi::hk_output_snapshot_layer_count(p) };
+        let mut layers = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut model_layer = 0u32;
+            let mut samples = 0u64;
+            let mut rounds = 0u64;
+            checked(|| unsafe { ffi::hk_output_snapshot_layer(p, i, &mut model_layer, &mut samples, &mut rounds); })?;
+            let read_pairs = |count: usize, get: &dyn Fn(usize, &mut u64, &mut f64) -> Result<()>| -> Result<Vec<(u64, f64)>> {
+                let mut v = Vec::with_capacity(count);
+                for j in 0..count {
+                    let mut start = 0u64;
+                    let mut score = 0f64;
+                    get(j, &mut start, &mut score)?;
+                    v.push((start, score));
+                }
+                Ok(v)
+            };
+            let sc = unsafe { ffi::hk_output_snapshot_score_count(p, i) };
+            let scores = read_pairs(sc, &|j, start, score| {
+                checked(|| unsafe { ffi::hk_output_snapshot_score(p, i, j, start, score); })
+            })?;
+            let pc = unsafe { ffi::hk_output_snapshot_pending_count(p, i) };
+            let pending = read_pairs(pc, &|j, start, score| {
+                checked(|| unsafe { ffi::hk_output_snapshot_pending(p, i, j, start, score); })
+            })?;
+            layers.push(OutputState { model_layer, scores, pending, samples, rounds });
+        }
+        Ok(OutputSnapshot { session, layers, parser, request, accepted_end, active: active != 0 })
+    }
+}
+
+impl Drop for OutputSnapshotRef {
+    fn drop(&mut self) {
+        unsafe { ffi::hk_output_snapshot_destroy(self.ptr.as_ptr()) };
     }
 }
 

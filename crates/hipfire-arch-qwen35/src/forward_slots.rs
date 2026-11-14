@@ -740,6 +740,29 @@ fn layerwise_fa_slots(
     };
     layer_kv_write_attend(gpu, config, kv, &lw_addr, pbs, s, n, physical_cap, max_ctx_len)?;
 
+    // ③-E3 mass hook (design §3.10a): sample this layer's per-page attention
+    // mass at the post-attention boundary. `pbs.fa_q_batch` is now POST-RoPE
+    // (fa_rope_slots above) — the SAME rotational space as the restored arena K —
+    // and the current token's K is written. No-op unless a pressure owner backs
+    // the step AND the core `rows()` schedule admitted it (the page-first Query
+    // steps where the frontier advances). Purely additive: the mass kernel reads
+    // disjoint workspaces and never touches the attention output / arena / view,
+    // so the forward residual is byte-identical with or without it.
+    {
+        use rdna_compute::kvmem_page_mass::{PageMassQuery, PageMassScalar};
+        let mass_q = PageMassQuery {
+            data: pbs.fa_q_batch.buf.as_ptr() as *const std::ffi::c_void,
+            rows: 1,
+            query_heads: config.n_heads as u32,
+            kv_heads: config.n_kv_heads as u32,
+            head_dim: config.head_dim as u32,
+            attention_scale: 0.0,
+            scalar: PageMassScalar::F32,
+        };
+        lq.capture_mass_layer(gpu, fa, &mass_q)
+            .map_err(|e| HipError::new(0, &e))?;
+    }
+
     // Report the attended evaluation span and close the attending phase.
     lq.attend_complete_layer(fa)
         .map_err(|e| HipError::new(0, &e))?;

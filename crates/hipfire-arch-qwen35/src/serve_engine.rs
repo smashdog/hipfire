@@ -5309,6 +5309,28 @@ fn run_loop(
                             .iter()
                             .filter(|t| **t == LayerType::FullAttention)
                             .count();
+                        let fa_layers: Vec<u32> = (0..n_fa as u32).collect();
+                        // Ensure + DETACH the persistent pressure owner (design
+                        // §3.10a borrow resolution): the carrier borrows `&ctl`
+                        // (keys/policy), so the owner is taken out into an
+                        // independent local to allow `&mut` accept after the
+                        // forward, then restored on EVERY exit path. Layerwise-only
+                        // (ensure fails closed under Legacy, which never reaches
+                        // this arm). The slot keeps its keep-set / counters.
+                        let mut pressure_owner = None;
+                        if let Some(k) = kvmem.as_mut() {
+                            let incarnation =
+                                k.layerwise_counters(slot).map(|(inc, _)| inc).unwrap_or(0);
+                            if let Err(e) =
+                                k.ensure_layerwise_pressure(slot, session_id, incarnation, &fa_layers)
+                            {
+                                rig.model.kvmem = kvmem;
+                                fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                                poison = Some(e);
+                                break 'serve;
+                            }
+                            pressure_owner = k.take_layerwise_pressure(slot);
+                        }
                         let ctl = kvmem
                             .as_ref()
                             .expect("admissible layerwise step has a controller");
@@ -5322,6 +5344,11 @@ fn run_loop(
                             match ctl.layerwise_policy(ctl.fed_tokens(slot).unwrap_or(0)) {
                                 Ok(p) => p,
                                 Err(e) => {
+                                    if let Some(p) = pressure_owner {
+                                        if let Some(k) = kvmem.as_mut() {
+                                            k.restore_layerwise_pressure(slot, p);
+                                        }
+                                    }
                                     rig.model.kvmem = kvmem;
                                     fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
                                     poison = Some(e);
@@ -5340,6 +5367,7 @@ fn run_loop(
                             rig.model.config.head_dim,
                             rig.cap_tokens as u32,
                             "qwen35",
+                            pressure_owner.as_ref(),
                         );
                         match built {
                             Ok(Some(mut carrier)) => {
@@ -5353,25 +5381,70 @@ fn run_loop(
                                     any_dflash_rows,
                                     Some(&mut carrier),
                                 );
+                                // Keep-set contribution (design §3.10a): read the
+                                // previous resident pool while the carrier still
+                                // borrows ctl, then combine with this step's
+                                // restored pages (Query union / Pressure truncate).
+                                let is_pressure = carrier.is_pressure();
+                                let prev_keep: Vec<Vec<u64>> = ctl
+                                    .layerwise_keep_set(slot)
+                                    .map(|s| s.to_vec())
+                                    .unwrap_or_default();
+                                let keep_res = carrier.restored_keep_set().map(|restored| {
+                                    crate::layerwise_driver::combine_keep_set(
+                                        &prev_keep, &restored, is_pressure, n_fa,
+                                    )
+                                });
+                                // Accept the captured mass into the detached owner
+                                // (no-op when the rows() schedule was empty). The
+                                // &mut owner is independent of the carrier's ctl
+                                // borrow, so this runs before free.
+                                let accept_res = match pressure_owner.as_mut() {
+                                    Some(p) => carrier.accept_pressure(p),
+                                    None => Ok(false),
+                                };
                                 // Release the carrier exactly once (its GPU
                                 // buffers have no Drop). `free` consumes it,
-                                // ending its borrow of `kvmem` before the mutable
-                                // counter bump / restore.
-                                if let Err(e) = carrier.free(&mut rig.gpu) {
+                                // ending its borrow of `kvmem`/`lw_policy` before
+                                // the mutable counter bump / keep-set / restore.
+                                let free_res = carrier.free(&mut rig.gpu);
+                                // Return the detached owner on EVERY path so the
+                                // session-lifetime pressure state persists.
+                                if let Some(p) = pressure_owner {
+                                    if let Some(k) = kvmem.as_mut() {
+                                        k.restore_layerwise_pressure(slot, p);
+                                    }
+                                }
+                                if let Some(e) = accept_res.err().or_else(|| free_res.err()) {
                                     rig.model.kvmem = kvmem;
                                     fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
                                     poison = Some(e);
                                     break 'serve;
                                 }
+                                let new_keep = match keep_res {
+                                    Ok(k) => k,
+                                    Err(e) => {
+                                        rig.model.kvmem = kvmem;
+                                        fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                                        poison = Some(e);
+                                        break 'serve;
+                                    }
+                                };
                                 if let Some(k) = kvmem.as_mut() {
                                     k.advance_layerwise_seq(slot);
+                                    k.set_layerwise_keep_set(slot, new_keep);
                                 }
                                 rig.model.kvmem = kvmem;
                                 fwd
                             }
                             // No sealed history page yet (fed < 128): restore the
-                            // controller and run Legacy; no transaction admitted.
+                            // controller + owner and run Legacy; no transaction.
                             Ok(None) => {
+                                if let Some(p) = pressure_owner {
+                                    if let Some(k) = kvmem.as_mut() {
+                                        k.restore_layerwise_pressure(slot, p);
+                                    }
+                                }
                                 rig.model.kvmem = kvmem;
                                 rig.model.forward_step(
                                     &mut rig.gpu,
@@ -5385,6 +5458,11 @@ fn run_loop(
                                 )
                             }
                             Err(e) => {
+                                if let Some(p) = pressure_owner {
+                                    if let Some(k) = kvmem.as_mut() {
+                                        k.restore_layerwise_pressure(slot, p);
+                                    }
+                                }
                                 rig.model.kvmem = kvmem;
                                 fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
                                 poison = Some(e);

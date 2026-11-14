@@ -5905,6 +5905,32 @@ fn layerwise_fa_attend(
     // the attended evaluation span. On the error paths above the carrier is
     // dropped with the cell (its GPU buffers are freed by the owner's `free`).
     let lq = cell.into_inner();
+    // ③-E3 mass hook (design §3.10a): sample this layer's per-page attention
+    // mass at the post-attention boundary. `s.fa_q` is now POST-RoPE — the
+    // attend op rotated it in place (rope_partial_interleaved_f32, the non-fused
+    // arm taken whenever the restore tap is present) — the SAME rotational space
+    // as the restored arena K, and the current token's K is written. No-op unless
+    // a pressure owner backs the step AND the core `rows()` schedule admitted it
+    // (the page-first Query steps where the frontier advances). Purely additive:
+    // the mass kernel reads disjoint workspaces and never touches the attention
+    // output / arena / view, so the forward residual is byte-identical with or
+    // without it. This is the Dense Path A/C sibling of the MoE Path B hook in
+    // `forward_slots::layerwise_fa_slots`; the real Qwen3.5 dense model decodes
+    // through THIS seam, so the production pressure accept needs it here too.
+    {
+        use rdna_compute::kvmem_page_mass::{PageMassQuery, PageMassScalar};
+        let mass_q = PageMassQuery {
+            data: s.fa_q.buf.as_ptr() as *const std::ffi::c_void,
+            rows: 1,
+            query_heads: config.n_heads as u32,
+            kv_heads: config.n_kv_heads as u32,
+            head_dim: config.head_dim as u32,
+            attention_scale: 0.0,
+            scalar: PageMassScalar::F32,
+        };
+        lq.capture_mass_layer(gpu, fa, &mass_q)
+            .map_err(DispatchError::Hip)?;
+    }
     lq.attend_complete_layer(fa).map_err(DispatchError::Hip)?;
     Ok(prerotated)
 }

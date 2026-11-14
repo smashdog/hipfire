@@ -44,8 +44,8 @@
 use std::path::PathBuf;
 
 use hipfire_kvmem::{
-    mean_key_retrieval_scores, page_softmax_scores, GqaAggregation, KvStore, KvStoreConfig, RawStore,
-    RawStoreConfig, Storage,
+    mean_key_retrieval_scores, page_softmax_scores, GqaAggregation, KvStore, KvStoreConfig,
+    PrefillOptions, PrefillPressure, RawStore, RawStoreConfig, SessionIdentity, Storage,
 };
 use rdna_compute::page_pool::SPILLED_PAGE;
 use rdna_compute::slot_pool::{SlotId, SlotPool};
@@ -208,6 +208,211 @@ fn resolve_recall_strategy(raw: Option<String>) -> Result<RecallStrategy, String
     }
 }
 
+/// Layerwise fail-closed policy guard (design §4, R2d-D1). The per-layer
+/// composite-slot subsystem drives residency by admission + per-layer
+/// current-Q GPU scoring + pressure mass/exposure, NOT the global working-set
+/// policy knobs. ninfer forces lrfu=false and retrieval selection; the
+/// watermark hysteresis and the multi-row query-span ring belong to the Legacy
+/// global path. Under Layerwise any non-default value is an explicit error
+/// naming the strategy (no silent override/fallback), mirroring the core
+/// selection guards (layerwise_selection.cpp:25) and the engine watermark
+/// validation style. Legacy admits every combination — the caller has already
+/// range-checked the values, so this guard is Layerwise-specific and the
+/// default serve stays byte-neutral. Pure so the decision table is testable
+/// without the process-start config snapshot (same rationale as
+/// [`resolve_recall_strategy`]: `developer_var` is a `OnceLock`, a runtime
+/// `set_var` is invisible).
+fn resolve_layerwise_policy(
+    strategy: RecallStrategy,
+    select_method: u32,
+    lrfu: bool,
+    watermark_enabled: bool,
+    query_span: usize,
+) -> Result<(), String> {
+    if !strategy.is_layerwise() {
+        return Ok(());
+    }
+    if select_method != 0 {
+        return Err(format!(
+            "kvmem: SELECT_METHOD={select_method} incompatible with \
+             RECALL_STRATEGY=layerwise (per-layer admission drives retrieval \
+             selection); use retrieval or unset HIPFIRE_KVMEM_SELECT_METHOD"
+        ));
+    }
+    if lrfu {
+        return Err(
+            "kvmem: LRFU=1 incompatible with RECALL_STRATEGY=layerwise \
+             (ninfer forces lrfu=false; per-layer mass/exposure replaces the \
+             decay history); unset HIPFIRE_KVMEM_LRFU"
+                .to_string(),
+        );
+    }
+    if watermark_enabled {
+        return Err(
+            "kvmem: GPU_HIGH/LOW_WATERMARK incompatible with \
+             RECALL_STRATEGY=layerwise (admission-driven pressure replaces the \
+             global watermark hysteresis); unset HIPFIRE_KVMEM_GPU_HIGH_WATERMARK \
+             and HIPFIRE_KVMEM_GPU_LOW_WATERMARK"
+                .to_string(),
+        );
+    }
+    if query_span > 1 {
+        return Err(format!(
+            "kvmem: QUERY_SPAN={query_span} incompatible with \
+             RECALL_STRATEGY=layerwise (per-layer current-Q GPU scoring replaces \
+             the multi-row page-softmax ring); use 1 or unset HIPFIRE_KVMEM_QUERY_SPAN"
+        ));
+    }
+    Ok(())
+}
+
+/// Ninfer-faithful layerwise activation quotas (design §3.11, ③-E1). Five
+/// explicit host-resource envelopes backing the projected-Q history tapes and
+/// their transfer/metadata staging. Resolved once at controller construction
+/// from `HIPFIRE_KVMEM_LAYERWISE_*_MIB` (MiB units), defaulting to the ninfer
+/// engine seeds (64/32/8/1024/96 MiB). Only the Layerwise path creates accounts
+/// against them — under Legacy the defaults are carried unread, so the legacy
+/// serve stays byte-neutral. Orthogonal to the GPU selection budget
+/// (`budget_tokens`): these bound HOST activation memory, not device residency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerwiseQuotas {
+    /// `activation_ram`: RAM backing for the per-layer Q tapes (less staging).
+    pub activation_ram: u64,
+    /// `activation_disk`: disk backing when the tape peak exceeds the RAM account.
+    pub activation_disk: u64,
+    /// `staging`: pinned Q D2H readback transfer budget.
+    pub staging: u64,
+    /// `metadata`: retained source-version / frozen-index / feedback envelope.
+    pub metadata: u64,
+    /// `activation_metadata`: finite tape descriptor/chunk-table account.
+    pub activation_metadata: u64,
+    /// Disk-tier directory (reuses `HIPFIRE_KVMEM_SPILL_DIR`); required only when
+    /// the tape peak forces the disk tier.
+    pub disk_directory: Option<PathBuf>,
+}
+
+impl Default for LayerwiseQuotas {
+    /// The ninfer engine seeds (`native_query_runner` activation limits).
+    fn default() -> Self {
+        Self {
+            activation_ram: 64 << 20,
+            activation_disk: 32 << 20,
+            staging: 8 << 20,
+            metadata: 1024 << 20,
+            activation_metadata: 96 << 20,
+            disk_directory: None,
+        }
+    }
+}
+
+/// Resolve the five activation quotas from raw env values (MiB integers). Absent
+/// → the ninfer seed; an unparseable or overflowing value is rejected loudly
+/// rather than silently degenerating (mirrors [`resolve_recall_strategy`]). Pure
+/// so the resolution contract is testable without the process-start config
+/// snapshot. `disk_directory` is the already-resolved spill dir (if any).
+fn resolve_layerwise_quotas(
+    ram: Option<String>,
+    disk: Option<String>,
+    staging: Option<String>,
+    metadata: Option<String>,
+    activation_metadata: Option<String>,
+    disk_directory: Option<PathBuf>,
+) -> Result<LayerwiseQuotas, String> {
+    let d = LayerwiseQuotas::default();
+    fn mib(raw: Option<String>, name: &str, def: u64) -> Result<u64, String> {
+        match raw {
+            Some(v) => {
+                let m: u64 = v
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("kvmem: {name}={v} invalid (MiB integer)"))?;
+                m.checked_mul(1 << 20)
+                    .ok_or_else(|| format!("kvmem: {name}={v} MiB overflow"))
+            }
+            None => Ok(def),
+        }
+    }
+    Ok(LayerwiseQuotas {
+        activation_ram: mib(ram, "HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_RAM_MIB", d.activation_ram)?,
+        activation_disk: mib(disk, "HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_DISK_MIB", d.activation_disk)?,
+        staging: mib(staging, "HIPFIRE_KVMEM_LAYERWISE_STAGING_MIB", d.staging)?,
+        metadata: mib(metadata, "HIPFIRE_KVMEM_LAYERWISE_METADATA_MIB", d.metadata)?,
+        activation_metadata: mib(
+            activation_metadata,
+            "HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB",
+            d.activation_metadata,
+        )?,
+        disk_directory,
+    })
+}
+
+/// Byte size of one retained [`LayerwisePrefillValue`] (`original_start: u64` +
+/// `mass: f64` + `exposure: f64` = 24). The pressure owner keeps at most one such
+/// value per resident logical block start per FA layer.
+const PRESSURE_VALUE_BYTES: u64 = 24;
+/// Per-layer fixed overhead of a `LayerwisePrefillState` (`model_layer: u32` +
+/// `end/samples/chunks: u64` + the `values` Vec header). A conservative constant
+/// so the ceiling bounds the whole mutable history, not just the value payload.
+const PRESSURE_STATE_OVERHEAD: u64 = 64;
+
+/// Finite mutable-history ceiling of one SESSION-lifetime pressure owner
+/// (design §3.11, ③-E4; ninfer essence = "complete mutable history ceiling").
+/// The core `LayerwisePrefillPressure::accept` rebuilds each layer's retained
+/// `values` from ONLY the current packet's `history` keys, and the driver feeds
+/// it the restored compact working set (≤ `budget_blocks`) plus the suffix page
+/// — so a layer retains at most `budget_blocks + 1` values. Across `n_fa_layers`
+/// independent target layers the complete mutable history is bounded by
+/// `n_fa_layers × ((budget_blocks + 1) × 24 + overhead)`. Saturating arithmetic
+/// keeps the bound finite for any geometry; a too-small partition then fails
+/// closed rather than wrapping. Pure (no accounts, no GPU) so admission is
+/// host-testable before `PrefillPressure::new` acquires anything.
+fn layerwise_pressure_ceiling(n_fa_layers: usize, budget_blocks: usize) -> u64 {
+    let per_layer = (budget_blocks as u64)
+        .saturating_add(1)
+        .saturating_mul(PRESSURE_VALUE_BYTES)
+        .saturating_add(PRESSURE_STATE_OVERHEAD);
+    (n_fa_layers as u64).saturating_mul(per_layer)
+}
+
+/// The pressure partition of the metadata envelope: the last transient eighth,
+/// carved out of E1's source share (3/4 → 5/8) so the per-query activation
+/// (source/frozen/feedback) and the per-session pressure jointly fit one metadata
+/// quota with no double-spend across the two lifetimes. Mirrors
+/// `LayerwiseActivation::admit`'s `transient = metadata / 8`.
+fn layerwise_pressure_cap(metadata: u64) -> u64 {
+    metadata / 8
+}
+
+/// Fail-closed finite admission for the SESSION-lifetime pressure owner
+/// (design §3.11, ③-E4). The owner's complete mutable-history ceiling must fit
+/// the metadata pressure partition BEFORE `PrefillPressure::new` is called — a
+/// quota too small for the model geometry yields `Err` with nothing acquired,
+/// exactly ninfer's allocation-phase admission contract. Layerwise-only: under
+/// Legacy the owner is never created (byte-neutral). Pure so the decision is
+/// testable without the process-start config snapshot (same `OnceLock` rationale
+/// as [`resolve_recall_strategy`]).
+fn resolve_pressure_admission(
+    strategy: RecallStrategy,
+    n_fa_layers: usize,
+    budget_blocks: usize,
+    quotas: &LayerwiseQuotas,
+) -> Result<(), String> {
+    if !strategy.is_layerwise() {
+        return Err("kvmem: pressure owner requires RECALL_STRATEGY=Layerwise".to_string());
+    }
+    let ceiling = layerwise_pressure_ceiling(n_fa_layers, budget_blocks);
+    let cap = layerwise_pressure_cap(quotas.metadata);
+    if cap == 0 || ceiling > cap {
+        return Err(format!(
+            "kvmem: layerwise pressure history ceiling {ceiling}B exceeds the metadata \
+             pressure partition {cap}B (1/8 of {}B); raise \
+             HIPFIRE_KVMEM_LAYERWISE_METADATA_MIB",
+            quotas.metadata
+        ));
+    }
+    Ok(())
+}
+
 /// True when `HIPFIRE_KVMEM` names an enabling value. Callers must also check
 /// that the crate was built with the `kvmem` feature — the engine refuses the
 /// knob loudly when it was not.
@@ -347,10 +552,29 @@ struct SlotState {
     lw_incarnation: u64,
     /// Layerwise transaction counter (design §3.9g). Bumped once per admitted
     /// layerwise query; drives the synthesized `MemoryStamp` revisions
-    /// (history_revision / view_version / execution_history). The re-bootstrap
-    /// model persists NO snapshots — the host store is the source of truth — so
-    /// this monotonic counter is the only cross-step layerwise bookkeeping.
+    /// (history_revision / view_version / execution_history). The host store
+    /// (RawStore) remains the byte-persistence base; under decision A (§3.10)
+    /// the selection state additionally persists in `lw_pressure` / `lw_keep`.
     lw_seq: u64,
+    /// Session-lifetime prefill attention-mass pressure owner (decision A,
+    /// design §3.10). Constructed lazily on the first admitted Layerwise query
+    /// of a session ([`KvMemCtl::ensure_layerwise_pressure`]); `None` under
+    /// Legacy (never created — byte-neutral) and after [`KvMemCtl::reset_slot`].
+    /// Accumulates accepted per-page mass and refines the resident keep-set via
+    /// `select` (no cold recall). Replaces the pure re-bootstrap "persist NO
+    /// snapshots" model: the production path now calls `accept`.
+    lw_pressure: Option<PrefillPressure>,
+    /// Persistent PER-LAYER resident keep-set (decision A, design §3.10a):
+    /// `lw_keep[ordinal]` is the canonical block ids chosen for FA ordinal
+    /// `ordinal` by the previous step's `pressure.select` (Pressure step) or the
+    /// ② scorer (Query step). Drives each layer's canonical `resident` list
+    /// (replacing the re-bootstrap `[]`); this is SELECTION-state persistence
+    /// (session-lifetime, cleared on reset_slot), distinct from the host store's
+    /// byte persistence. Per-layer because `pressure.select` returns independent
+    /// per-layer choices (the composite arena's mixed-stripe destinations let
+    /// each FA layer keep its own mass-ranked pages). Empty before the first
+    /// selection / under Legacy; an absent ordinal entry reads as `[]`.
+    lw_keep: Vec<Vec<u64>>,
 }
 
 /// Per-slot residency plan for one step.
@@ -405,6 +629,10 @@ pub struct KvMemCtl {
     /// Layerwise-only path (write-through archive, per-layer driver, packed
     /// residency); Legacy keeps the historical serve bit-identical.
     strategy: RecallStrategy,
+    /// Resolved layerwise activation quotas (design §3.11, ③-E1). Only the
+    /// Layerwise carrier creates accounts against these; under Legacy the
+    /// ninfer seeds are carried unread (byte-neutral).
+    layerwise_quotas: LayerwiseQuotas,
     /// Resolved `HIPFIRE_KVMEM_SELECT_METHOD` ordinal (0 Retrieval, 2 Recency).
     /// H2O (1) is rejected at construction until the attention-heat tap lands.
     select_method: u32,
@@ -536,6 +764,13 @@ impl KvMemCtl {
             ));
         }
 
+        // ── Layerwise fail-closed policy guards (design §4, R2d-D1) ──
+        // Pure decision table (see resolve_layerwise_policy): under Layerwise
+        // each global working-set knob the per-layer subsystem replaces is an
+        // explicit Err; Legacy is admitted unconditionally (range checks above
+        // already ran), so the default serve stays byte-neutral.
+        resolve_layerwise_policy(strategy, select_method, lrfu, watermark_enabled, query_span)?;
+
         // Recall execution model. Legacy (the default) keeps the historical
         // whole-working-set path byte-identical. Layerwise enables the per-layer
         // composite-slot subsystem: D2 adds the write-through sealed host
@@ -596,6 +831,8 @@ impl KvMemCtl {
                 q_ring_cursor: 0,
                 lw_incarnation: 0,
                 lw_seq: 0,
+                lw_pressure: None,
+                lw_keep: Vec::new(),
             });
         }
 
@@ -638,6 +875,22 @@ impl KvMemCtl {
             );
         }
 
+        // Resolve the layerwise activation quotas only under Layerwise; Legacy
+        // carries the unread ninfer seeds so a malformed quota env can never
+        // change the byte-neutral default path (design §3.11).
+        let layerwise_quotas = if strategy.is_layerwise() {
+            resolve_layerwise_quotas(
+                env_raw("HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_RAM_MIB"),
+                env_raw("HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_DISK_MIB"),
+                env_raw("HIPFIRE_KVMEM_LAYERWISE_STAGING_MIB"),
+                env_raw("HIPFIRE_KVMEM_LAYERWISE_METADATA_MIB"),
+                env_raw("HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB"),
+                env_raw("HIPFIRE_KVMEM_SPILL_DIR").map(PathBuf::from),
+            )?
+        } else {
+            LayerwiseQuotas::default()
+        };
+
         Ok(Self {
             slots,
             storage,
@@ -664,6 +917,7 @@ impl KvMemCtl {
             xfer_slab: None,
             batch_xfer: batch_xfer_flag(),
             strategy,
+            layerwise_quotas,
             select_method,
             watermark,
             query_span,
@@ -677,6 +931,14 @@ impl KvMemCtl {
     /// per-layer driver, packed residency) on this; Legacy is the default.
     pub fn strategy(&self) -> RecallStrategy {
         self.strategy
+    }
+
+    /// Resolved layerwise activation quotas (design §3.11, ③-E1). The Layerwise
+    /// carrier creates its projected-Q tape accounts against these; Legacy never
+    /// reads them. Borrowed for the carrier's lifetime (the accounts are built
+    /// per query from the copied limits, so no borrow outlives the controller).
+    pub fn layerwise_quotas(&self) -> &LayerwiseQuotas {
+        &self.layerwise_quotas
     }
 
     /// Borrow slot `slot`'s statistics store (`RawStore`) and policy (`KvStore`)
@@ -754,6 +1016,12 @@ impl KvMemCtl {
             q_ring_cursor: 0,
             lw_incarnation,
             lw_seq: 0,
+            // Decision A (§3.10): a fresh session drops the pressure owner and
+            // its keep-set. The next admitted query lazily reconstructs the
+            // owner under the bumped incarnation, so accepted mass / selected
+            // pages never alias the previous session. Legacy: both stay empty.
+            lw_pressure: None,
+            lw_keep: Vec::new(),
         };
         Ok(())
     }
@@ -792,6 +1060,117 @@ impl KvMemCtl {
     pub fn advance_layerwise_seq(&mut self, slot: usize) {
         if let Some(st) = self.slots.get_mut(slot) {
             st.lw_seq += 1;
+        }
+    }
+
+    /// Lazily construct slot `slot`'s session-lifetime prefill pressure owner
+    /// (decision A, design §3.10). Idempotent within a session: once built it is
+    /// reused for every admitted query until [`Self::reset_slot`] drops it (the
+    /// incarnation bump on reset guarantees a fresh session reconstructs under a
+    /// distinct identity). `session_id` / `incarnation` are the ENGINE's 0-based
+    /// counters; they are normalized to the core's 1-based logical identity with
+    /// the SAME `+1` bijection `bootstrap_layerwise` applies, so the owner's
+    /// session matches the canonical `MemoryStamp.session` the picker validates.
+    /// `fa_layers` are the dense FA ordinals `0..n_fa_layers`.
+    ///
+    /// Options pin `block_tokens = 128` (the catalog layout block size, which the
+    /// core requires to match exactly) and derive the select ceiling from the
+    /// per-slot resident budget; interval/stride/half_life carry the ninfer
+    /// defaults. Layerwise-only: under Legacy this returns `Err` (fail-closed —
+    /// the owner is never created, keeping the default path byte-neutral).
+    /// Admission is finite and fail-closed BEFORE any acquisition: the owner's
+    /// complete mutable-history ceiling must fit the metadata pressure partition
+    /// (③-E4, [`resolve_pressure_admission`]), mirroring ninfer's allocation-phase
+    /// contract.
+    pub fn ensure_layerwise_pressure(
+        &mut self,
+        slot: usize,
+        session_id: u64,
+        incarnation: u64,
+        fa_layers: &[u32],
+    ) -> Result<(), String> {
+        resolve_pressure_admission(
+            self.strategy,
+            self.n_fa_layers,
+            self.budget_blocks,
+            &self.layerwise_quotas,
+        )?;
+        let st = self
+            .slots
+            .get_mut(slot)
+            .ok_or_else(|| format!("kvmem: ensure_layerwise_pressure slot {slot} out of range"))?;
+        if st.lw_pressure.is_some() {
+            return Ok(());
+        }
+        let session = SessionIdentity { id: session_id + 1, incarnation: incarnation + 1 };
+        let options = PrefillOptions {
+            block_tokens: KV_BLOCK_TOKENS as u32,
+            select_tokens: (self.budget_blocks * KV_BLOCK_TOKENS) as u64,
+            reserve_tokens: KV_BLOCK_TOKENS as u64,
+            interval: 1024,
+            stride: 32,
+            half_life: 8192.0,
+        };
+        let pressure = PrefillPressure::new(session, fa_layers, &options)
+            .map_err(|e| format!("kvmem: layerwise pressure create: {e}"))?;
+        st.lw_pressure = Some(pressure);
+        Ok(())
+    }
+
+    /// Immutable borrow of slot `slot`'s pressure owner (`None` under Legacy,
+    /// before the first admitted query, or out of range). The owner stays owned
+    /// by this controller; the driver borrows it for `select`/`snapshot`.
+    pub fn layerwise_pressure(&self, slot: usize) -> Option<&PrefillPressure> {
+        self.slots.get(slot).and_then(|st| st.lw_pressure.as_ref())
+    }
+
+    /// Mutable borrow of slot `slot`'s pressure owner for `accept`/`restore`
+    /// (`None` under Legacy, before construction, or out of range). The caller
+    /// must have called [`Self::ensure_layerwise_pressure`] first this session.
+    pub fn layerwise_pressure_mut(&mut self, slot: usize) -> Option<&mut PrefillPressure> {
+        self.slots.get_mut(slot).and_then(|st| st.lw_pressure.as_mut())
+    }
+
+    /// Slot `slot`'s persistent PER-LAYER resident keep-set (decision A, design
+    /// §3.10a): `keep[ordinal]` holds the canonical block ids selected for FA
+    /// ordinal `ordinal` by the previous step (pressure.select on a Pressure
+    /// step, the ② scorer on a Query step). Drives each layer's canonical
+    /// `resident` list. Empty before the first selection / under Legacy; `None`
+    /// when out of range. Borrowed for the bootstrap synthesis (an absent ordinal
+    /// entry reads as `[]`).
+    pub fn layerwise_keep_set(&self, slot: usize) -> Option<&[Vec<u64>]> {
+        self.slots.get(slot).map(|st| st.lw_keep.as_slice())
+    }
+
+    /// Replace slot `slot`'s per-layer keep-set with the latest selection result
+    /// (decision A). `keep[ordinal]` is the canonical sealed-page ids restored
+    /// for FA ordinal `ordinal` this step; the bootstrap filters any id beyond
+    /// the current sealed history defensively. No-op when out of range. Legacy
+    /// never calls it (the keep-set stays empty).
+    pub fn set_layerwise_keep_set(&mut self, slot: usize, keep: Vec<Vec<u64>>) {
+        if let Some(st) = self.slots.get_mut(slot) {
+            st.lw_keep = keep;
+        }
+    }
+
+    /// Move slot `slot`'s pressure owner OUT of the controller (design §3.10a
+    /// borrow resolution). The scoped serve orchestration takes the owner before
+    /// building the carrier (which borrows the slot's `&RawStore`/`&KvStore`), so
+    /// `select`/`accept` can use `&mut PrefillPressure` independently of those
+    /// borrows; [`Self::restore_layerwise_pressure`] puts it back after the
+    /// forward. `None` under Legacy, before construction, or out of range. The
+    /// slot keeps its keep-set / counters; only the pressure owner is detached.
+    pub fn take_layerwise_pressure(&mut self, slot: usize) -> Option<PrefillPressure> {
+        self.slots.get_mut(slot).and_then(|st| st.lw_pressure.take())
+    }
+
+    /// Return a previously [`Self::take_layerwise_pressure`]-detached owner to
+    /// slot `slot` (design §3.10a). No-op when out of range. The orchestration
+    /// calls this exactly once after the forward, before restoring the `KvMemCtl`
+    /// into the rig, so the session-lifetime owner persists to the next step.
+    pub fn restore_layerwise_pressure(&mut self, slot: usize, pressure: PrefillPressure) {
+        if let Some(st) = self.slots.get_mut(slot) {
+            st.lw_pressure = Some(pressure);
         }
     }
 
@@ -1882,6 +2261,73 @@ mod tests {
         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
     }
 
+    /// Host-only: the Layerwise fail-closed policy guards (design §4, R2d-D1).
+    /// The knobs are read through the process-start config snapshot
+    /// (`hipfire_config::developer_var` is a `OnceLock`), so a runtime
+    /// `set_var` is invisible — the guard decision is extracted pure
+    /// (`resolve_layerwise_policy`, same injection rationale as
+    /// `resolve_recall_strategy`) and the full table is tested here: under
+    /// Layerwise each global working-set knob the per-layer subsystem replaces
+    /// (select_method≠retrieval, lrfu, watermark, query_span>1) is an explicit
+    /// Err naming both the knob and the strategy — no silent override/fallback;
+    /// Legacy admits every combination (the guard is Layerwise-specific, so the
+    /// default serve stays byte-neutral). The all-default Layerwise controller
+    /// still constructs end-to-end, proving the wired guard call admits the
+    /// default path.
+    #[test]
+    fn layerwise_policy_knobs_fail_closed() {
+        // (select_method, lrfu, watermark_enabled, query_span, expected):
+        // None = admitted, Some(fragment) = Err naming that knob. Each
+        // non-default knob alone fails closed; the combined row proves the
+        // first violation wins.
+        let cases: &[(u32, bool, bool, usize, Option<&str>)] = &[
+            (0, false, false, 1, None),
+            (2, false, false, 1, Some("SELECT_METHOD")),
+            (0, true, false, 1, Some("LRFU")),
+            (0, false, true, 1, Some("WATERMARK")),
+            (0, false, false, 2, Some("QUERY_SPAN")),
+            (2, true, true, 8, Some("SELECT_METHOD")),
+        ];
+        for &(sm, lrfu, wm, qs, expected) in cases {
+            let lw = resolve_layerwise_policy(RecallStrategy::Layerwise, sm, lrfu, wm, qs);
+            match expected {
+                None => lw.unwrap_or_else(|e| {
+                    panic!("default Layerwise must admit (sm={sm} lrfu={lrfu} wm={wm} qs={qs}): {e}")
+                }),
+                Some(frag) => {
+                    let msg = lw.err().unwrap_or_else(|| {
+                        panic!(
+                            "Layerwise must fail closed for sm={sm} lrfu={lrfu} wm={wm} qs={qs}"
+                        )
+                    });
+                    assert!(
+                        msg.contains("layerwise"),
+                        "guard message names the strategy for {frag}: {msg}"
+                    );
+                    assert!(
+                        msg.contains(frag),
+                        "guard message names the knob {frag}: {msg}"
+                    );
+                }
+            }
+            // Legacy admits every combination — byte-neutral guard gating.
+            resolve_layerwise_policy(RecallStrategy::Legacy, sm, lrfu, wm, qs)
+                .unwrap_or_else(|e| {
+                    panic!("Legacy must admit sm={sm} lrfu={lrfu} wm={wm} qs={qs}: {e}")
+                });
+        }
+
+        // End-to-end: the wired guard call admits the all-default Layerwise
+        // construction (HOST_BYTES is best-effort through the snapshot; the
+        // store commits lazily, so the default ceiling is also safe).
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let ctl =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("default layerwise ctl");
+        assert_eq!(ctl.strategy(), RecallStrategy::Layerwise);
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
     /// The Layerwise driver borrows the slot's statistics store + policy through
     /// `layerwise_stores`: distinct objects per slot, `None` out of range, the
     /// policy borrow is live (`&self` budget set), and `reset_slot` builds a
@@ -1920,6 +2366,251 @@ mod tests {
             raw0_new.allocated_bytes() < old_bytes,
             "reset yields a fresh empty store"
         );
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// Host-only: the decision-A (§3.10) persistent pressure owner + keep-set
+    /// lifecycle. Legacy never creates the owner (fail-closed `ensure`, `None`
+    /// borrow, empty keep-set — byte-neutral). Layerwise constructs lazily and
+    /// idempotently with `block_tokens=128` pinned to the catalog and the select
+    /// ceiling derived from the resident budget; the keep-set round-trips; and
+    /// `reset_slot` drops BOTH the owner and the keep-set (a fresh session never
+    /// aliases the previous session's accepted mass / selected pages). Finally,
+    /// the bootstrap canonical `resident` is driven by the keep-set (filtered to
+    /// the sealed history), replacing the pure re-bootstrap `[]`.
+    #[test]
+    fn layerwise_pressure_owner_and_keep_set_lifecycle() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let fa_layers = [0u32, 1];
+
+        // Legacy: the owner is never created; ensure fails closed.
+        let mut legacy =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
+                .expect("legacy ctl");
+        assert!(legacy.layerwise_pressure(0).is_none(), "Legacy: no owner");
+        assert_eq!(legacy.layerwise_keep_set(0), Some(&[][..]), "Legacy: empty keep-set");
+        assert!(
+            legacy.ensure_layerwise_pressure(0, 0, 0, &fa_layers).is_err(),
+            "Legacy: ensure must fail closed (byte-neutral)"
+        );
+        assert!(legacy.layerwise_pressure(0).is_none(), "Legacy: still no owner after ensure");
+
+        // Layerwise: lazy, idempotent construction.
+        let mut lw =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("layerwise ctl");
+        assert!(lw.layerwise_pressure(0).is_none(), "before ensure: no owner");
+        assert!(lw.layerwise_pressure_mut(0).is_none(), "before ensure: no mut owner");
+        lw.ensure_layerwise_pressure(0, 0, 0, &fa_layers).expect("construct owner");
+        let opts = lw.layerwise_pressure(0).expect("owner").options().expect("options");
+        assert_eq!(opts.block_tokens, KV_BLOCK_TOKENS as u32, "block_tokens pinned to catalog");
+        assert_eq!(
+            opts.select_tokens,
+            (plan().budget_blocks * KV_BLOCK_TOKENS) as u64,
+            "select ceiling = resident budget"
+        );
+        // Idempotent within a session: a second ensure is a no-op, owner persists.
+        lw.ensure_layerwise_pressure(0, 0, 0, &fa_layers).expect("idempotent ensure");
+        assert!(lw.layerwise_pressure(0).is_some(), "owner persists across ensure");
+        assert!(lw.layerwise_pressure_mut(0).is_some(), "mut borrow available");
+
+        // Per-layer keep-set round-trip (selection-state persistence).
+        assert_eq!(lw.layerwise_keep_set(0), Some(&[][..]), "initial keep-set empty");
+        lw.set_layerwise_keep_set(0, vec![vec![0, 2, 3], vec![1, 2]]);
+        assert_eq!(
+            lw.layerwise_keep_set(0),
+            Some(&[vec![0u64, 2, 3], vec![1u64, 2]][..]),
+            "per-layer keep-set round-trip"
+        );
+
+        // take/restore detaches the owner for the scoped forward borrow, then
+        // returns it (the slot keeps its keep-set / counters throughout).
+        let detached = lw.take_layerwise_pressure(0).expect("take owner");
+        assert!(lw.layerwise_pressure(0).is_none(), "owner detached");
+        assert_eq!(
+            lw.layerwise_keep_set(0),
+            Some(&[vec![0u64, 2, 3], vec![1u64, 2]][..]),
+            "keep-set survives take"
+        );
+        lw.restore_layerwise_pressure(0, detached);
+        assert!(lw.layerwise_pressure(0).is_some(), "owner restored");
+
+        // Out-of-range accessors are None / Err (no panic).
+        assert!(lw.layerwise_pressure(9).is_none());
+        assert!(lw.layerwise_keep_set(9).is_none());
+        assert!(lw.take_layerwise_pressure(9).is_none());
+        assert!(lw.ensure_layerwise_pressure(9, 0, 0, &fa_layers).is_err());
+
+        // reset_slot drops the owner AND the keep-set; incarnation bumps.
+        let (inc_before, _) = lw.layerwise_counters(0).expect("counters");
+        lw.reset_slot(0).expect("reset");
+        assert!(lw.layerwise_pressure(0).is_none(), "reset drops the owner");
+        assert_eq!(lw.layerwise_keep_set(0), Some(&[][..]), "reset clears the keep-set");
+        let (inc_after, _) = lw.layerwise_counters(0).expect("counters after reset");
+        assert_eq!(inc_after, inc_before + 1, "reset bumps incarnation");
+        // A fresh session reconstructs under the new incarnation.
+        lw.ensure_layerwise_pressure(0, 0, inc_after, &fa_layers).expect("reconstruct");
+        assert!(lw.layerwise_pressure(0).is_some(), "reconstructed owner");
+
+        // The bootstrap canonical resident is driven PER-LAYER by the keep-set,
+        // filtered to the sealed history (fed=512 ⇒ 4 full pages; id 99 is out of
+        // history). Ordinal 0 keeps [0,2], ordinal 1 keeps [1] (independent).
+        let boot = crate::layerwise_driver::bootstrap_layerwise(
+            512, 0, inc_after, 0, &fa_layers, 4, 2, 64, 4, 136,
+            &[vec![0, 2, 99], vec![1]],
+        )
+        .expect("bootstrap with keep-set");
+        assert_eq!(boot.canonical[0].memory.resident, vec![0u64, 2], "ordinal 0 filtered keep-set");
+        assert_eq!(boot.canonical[1].memory.resident, vec![1u64], "ordinal 1 independent keep-set");
+        let boot_empty = crate::layerwise_driver::bootstrap_layerwise(
+            512, 0, inc_after, 0, &fa_layers, 4, 2, 64, 4, 136, &[],
+        )
+        .expect("bootstrap empty keep-set");
+        for snap in &boot_empty.canonical {
+            assert!(snap.memory.resident.is_empty(), "empty keep-set ⇒ re-bootstrap []");
+        }
+
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// Host-only: the SESSION-lifetime pressure owner's finite, fail-closed
+    /// admission (design §3.11, ③-E4; ninfer essence = "complete mutable history
+    /// ceiling"). The owner's retained history is bounded by
+    /// `n_fa_layers × ((budget_blocks + 1) × 24 + overhead)` and must fit the
+    /// metadata pressure partition (the last transient 1/8, carved from E1's
+    /// source share) BEFORE `PrefillPressure::new` acquires anything. Pure
+    /// decision table (the quotas are read through the process-start `OnceLock`
+    /// snapshot, so a runtime `set_var` is invisible — same injection rationale
+    /// as `resolve_layerwise_policy`): the default geometry admits, a too-small
+    /// partition fails closed naming the METADATA knob, the exact boundary
+    /// admits while one byte over rejects, Legacy never admits the owner, and a
+    /// saturating-huge geometry stays finite (Err, never a wrap). The wired
+    /// success path is proven end-to-end by the lifecycle test above.
+    #[test]
+    fn layerwise_pressure_admission_fail_closed() {
+        let d = LayerwiseQuotas::default();
+        // Ceiling formula: 2 layers × ((2+1)×24 + 64) = 2 × 136 = 272B.
+        assert_eq!(layerwise_pressure_ceiling(2, 2), 272);
+        assert_eq!(layerwise_pressure_ceiling(1, 0), 88);
+        // Partition = metadata / 8 (the last transient eighth).
+        assert_eq!(layerwise_pressure_cap(d.metadata), 128 << 20);
+
+        // Default quotas admit the tiny geometry with nothing acquired.
+        resolve_pressure_admission(RecallStrategy::Layerwise, 2, 2, &d)
+            .unwrap_or_else(|e| panic!("default Layerwise pressure must admit: {e}"));
+
+        // Legacy never admits the owner (byte-neutral fail-closed).
+        let legacy = resolve_pressure_admission(RecallStrategy::Legacy, 2, 2, &d)
+            .err()
+            .unwrap_or_else(|| panic!("Legacy must not admit a pressure owner"));
+        assert!(legacy.contains("Layerwise"), "Legacy guard names the strategy: {legacy}");
+
+        // A partition too small for the ceiling fails closed naming METADATA.
+        for metadata in [0u64, 8, 703] {
+            let q = LayerwiseQuotas { metadata, ..d.clone() };
+            let msg = resolve_pressure_admission(RecallStrategy::Layerwise, 1, 0, &q)
+                .err()
+                .unwrap_or_else(|| panic!("metadata={metadata} must fail closed (ceiling 88B)"));
+            assert!(msg.contains("layerwise"), "admission names the strategy: {msg}");
+            assert!(
+                msg.contains("HIPFIRE_KVMEM_LAYERWISE_METADATA_MIB"),
+                "admission names the knob: {msg}"
+            );
+        }
+
+        // Exact boundary: ceiling 88B == partition 88B admits; one byte short rejects.
+        let exact = LayerwiseQuotas { metadata: 704, ..d.clone() }; // 704/8 == 88
+        resolve_pressure_admission(RecallStrategy::Layerwise, 1, 0, &exact)
+            .unwrap_or_else(|e| panic!("ceiling == partition must admit: {e}"));
+
+        // Saturating-huge geometry stays finite and fails closed (no wrap).
+        assert_eq!(layerwise_pressure_ceiling(usize::MAX, usize::MAX), u64::MAX);
+        assert!(
+            resolve_pressure_admission(RecallStrategy::Layerwise, usize::MAX, usize::MAX, &d)
+                .is_err(),
+            "saturating-huge ceiling must fail closed against a finite partition"
+        );
+    }
+
+    /// Host-only: the five activation quotas resolve from MiB env integers with
+    /// the ninfer seeds as defaults, reject malformed/overflowing values loudly
+    /// (fail-closed, mirroring `resolve_recall_strategy`), and trim whitespace.
+    /// Pure resolution contract — no process-config snapshot, no GPU.
+    #[test]
+    fn layerwise_quotas_resolve_defaults_overrides_fail_closed() {
+        let d = LayerwiseQuotas::default();
+        // Absent env → the ninfer engine seeds (64/32/8/1024/96 MiB).
+        assert_eq!(
+            resolve_layerwise_quotas(None, None, None, None, None, None).unwrap(),
+            d
+        );
+        assert_eq!(d.activation_ram, 64 << 20);
+        assert_eq!(d.activation_disk, 32 << 20);
+        assert_eq!(d.staging, 8 << 20);
+        assert_eq!(d.metadata, 1024 << 20);
+        assert_eq!(d.activation_metadata, 96 << 20);
+        assert_eq!(d.disk_directory, None);
+
+        // Explicit MiB overrides (whitespace trimmed) + the spill-dir passthrough.
+        let dir = PathBuf::from("/tmp/hipfire-quota-test");
+        let q = resolve_layerwise_quotas(
+            Some(" 128 ".into()),
+            Some("64".into()),
+            Some("16".into()),
+            Some("2048".into()),
+            Some("192".into()),
+            Some(dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(q.activation_ram, 128 << 20);
+        assert_eq!(q.activation_disk, 64 << 20);
+        assert_eq!(q.staging, 16 << 20);
+        assert_eq!(q.metadata, 2048 << 20);
+        assert_eq!(q.activation_metadata, 192 << 20);
+        assert_eq!(q.disk_directory, Some(dir));
+
+        // Zero is a valid explicit quota (admission rejects it later, not here).
+        assert_eq!(
+            resolve_layerwise_quotas(Some("0".into()), None, None, None, None, None)
+                .unwrap()
+                .activation_ram,
+            0
+        );
+
+        // Malformed / negative / fractional / empty values fail closed (no seed).
+        assert!(resolve_layerwise_quotas(Some("abc".into()), None, None, None, None, None).is_err());
+        assert!(resolve_layerwise_quotas(Some("-1".into()), None, None, None, None, None).is_err());
+        assert!(resolve_layerwise_quotas(Some("1.5".into()), None, None, None, None, None).is_err());
+        assert!(resolve_layerwise_quotas(None, Some("".into()), None, None, None, None).is_err());
+        // u64::MAX MiB overflows the byte conversion.
+        assert!(resolve_layerwise_quotas(
+            Some(u64::MAX.to_string()), None, None, None, None, None
+        ).is_err());
+        // Each quota rejects independently.
+        assert!(resolve_layerwise_quotas(None, None, Some("x".into()), None, None, None).is_err());
+        assert!(resolve_layerwise_quotas(None, None, None, Some("x".into()), None, None).is_err());
+        assert!(resolve_layerwise_quotas(None, None, None, None, Some("x".into()), None).is_err());
+    }
+
+    /// Host-only: the quota accessor is gated by strategy — Legacy carries the
+    /// unread ninfer seeds (byte-neutral: a malformed quota env can never perturb
+    /// the default path), while Layerwise resolves them. The ambient test env
+    /// sets no LAYERWISE_*_MIB, so both resolve to the seeds here; the parsing
+    /// contract itself is covered by the pure-resolver test above.
+    #[test]
+    fn layerwise_quotas_gated_by_strategy() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let legacy =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
+                .expect("legacy ctl");
+        assert_eq!(legacy.strategy(), RecallStrategy::Legacy);
+        assert_eq!(legacy.layerwise_quotas(), &LayerwiseQuotas::default());
+
+        let lw =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("layerwise ctl");
+        assert_eq!(lw.strategy(), RecallStrategy::Layerwise);
+        assert_eq!(lw.layerwise_quotas(), &LayerwiseQuotas::default());
         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
     }
 
