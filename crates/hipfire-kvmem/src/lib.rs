@@ -1820,6 +1820,32 @@ mod ffi {
             state: WindowState,
             out: *mut HkLayerwiseImportStart,
         ) -> c_int;
+
+        // ── checkpoint policy: capture plan + coverage retention ──
+        pub fn hk_checkpoint_plan_create(
+            base: u64,
+            stride: u64,
+            root_at: u64,
+            tail_at: u64,
+        ) -> *mut HkCheckpointPlan;
+        pub fn hk_checkpoint_plan_destroy(p: *mut HkCheckpointPlan);
+        pub fn hk_checkpoint_plan_cut(p: *const HkCheckpointPlan, begin: u64, end: u64) -> u64;
+        pub fn hk_checkpoint_plan_due(
+            p: *const HkCheckpointPlan,
+            frontier: u64,
+            purpose: *mut u32,
+        ) -> c_int;
+        pub fn hk_checkpoint_plan_saved(p: *mut HkCheckpointPlan, frontier: u64);
+        pub fn hk_checkpoint_coverage_retain(
+            infos: *const CoverageInfo,
+            n: usize,
+            count: u64,
+            bytes: u64,
+            interval: u64,
+            min_gap: u64,
+            out: *mut usize,
+            out_capacity: usize,
+        ) -> usize;
     }
 }
 
@@ -4349,4 +4375,140 @@ impl Drop for WindowPlan {
     fn drop(&mut self) {
         unsafe { ffi::hk_layerwise_window_plan_destroy(self.ptr.as_ptr()) };
     }
+}
+
+// ── checkpoint policy: capture plan + coverage retention ──
+
+#[repr(C)]
+struct HkCheckpointPlan {
+    _private: [u8; 0],
+}
+
+/// Mirrors `kvmem::CoveragePurpose` (append-only ordinals).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum CoveragePurpose {
+    Periodic = 0,
+    Tail = 1,
+    Root = 2,
+    Anchor = 3,
+    Input = 4,
+    Endpoint = 5,
+}
+
+impl CoveragePurpose {
+    pub fn from_ordinal(v: u32) -> Option<Self> {
+        match v {
+            0 => Some(Self::Periodic),
+            1 => Some(Self::Tail),
+            2 => Some(Self::Root),
+            3 => Some(Self::Anchor),
+            4 => Some(Self::Input),
+            5 => Some(Self::Endpoint),
+            _ => None,
+        }
+    }
+}
+
+/// Mirrors `kvmem::CoverageInfo`: planning metadata only. `identity == 0`
+/// marks an absent slot; any nonzero value is compared by equality.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CoverageInfo {
+    pub frontier: u64,
+    pub bytes: u64,
+    pub used: u64,
+    pub identity: u64,
+    pub purpose: u32,
+    pub protections: u32,
+}
+
+/// Pure `kvmem::CheckpointCapturePlan`: semantic cut points plus periodic
+/// capture timing. The caller owns the checkpoint payload and its proof.
+pub struct CheckpointCapturePlan {
+    ptr: NonNull<HkCheckpointPlan>,
+}
+
+impl CheckpointCapturePlan {
+    pub fn new(base: u64, stride: u64, root_at: u64, tail_at: u64) -> Result<Self> {
+        clear_error();
+        let ptr = unsafe { ffi::hk_checkpoint_plan_create(base, stride, root_at, tail_at) };
+        NonNull::new(ptr)
+            .map(|ptr| Self { ptr })
+            .ok_or_else(err_from_last)
+    }
+
+    /// Clamp a native prefill chunk end to the next semantic cut.
+    pub fn cut(&self, begin: u64, end: u64) -> u64 {
+        unsafe { ffi::hk_checkpoint_plan_cut(self.ptr.as_ptr(), begin, end) }
+    }
+
+    pub fn due(&self, frontier: u64) -> Result<Option<CoveragePurpose>> {
+        let mut purpose = 0u32;
+        let p = self.ptr.as_ptr();
+        clear_error();
+        match unsafe { ffi::hk_checkpoint_plan_due(p, frontier, &mut purpose) } {
+            1 => CoveragePurpose::from_ordinal(purpose)
+                .map(Some)
+                .ok_or_else(|| KvMemError(format!("unknown coverage purpose {purpose}"))),
+            0 => Ok(None),
+            _ => Err(err_from_last()),
+        }
+    }
+
+    pub fn saved(&mut self, frontier: u64) {
+        unsafe { ffi::hk_checkpoint_plan_saved(self.ptr.as_ptr(), frontier) };
+    }
+}
+
+impl Drop for CheckpointCapturePlan {
+    fn drop(&mut self) {
+        unsafe { ffi::hk_checkpoint_plan_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+/// Select the retained checkpoint coverage (core
+/// `retain_checkpoint_coverage`): count/byte caps, interval spacing and
+/// `min_gap`, with root/anchor/input roles and the newest endpoint protected.
+pub fn retain_checkpoint_coverage(
+    infos: &[CoverageInfo],
+    count: u64,
+    bytes: u64,
+    interval: u64,
+    min_gap: u64,
+) -> Result<Vec<usize>> {
+    clear_error();
+    let n = unsafe {
+        ffi::hk_checkpoint_coverage_retain(
+            infos.as_ptr(),
+            infos.len(),
+            count,
+            bytes,
+            interval,
+            min_gap,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if n == usize::MAX {
+        return Err(err_from_last());
+    }
+    let mut out = vec![0usize; n];
+    let written = unsafe {
+        ffi::hk_checkpoint_coverage_retain(
+            infos.as_ptr(),
+            infos.len(),
+            count,
+            bytes,
+            interval,
+            min_gap,
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    };
+    if written == usize::MAX {
+        return Err(err_from_last());
+    }
+    out.truncate(written.min(out.len()));
+    Ok(out)
 }
