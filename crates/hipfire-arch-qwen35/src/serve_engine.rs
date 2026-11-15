@@ -8750,38 +8750,82 @@ fn admit(
                     .ok_or_else(|| "kvmem reuse: no controller".to_string())?;
                 // 1. Host fork: validates the FULL provenance (geometry +
                 // fingerprint + token proof) before any mutation.
-                let frontier = ctl.fork_prefix_into(slot.0, ckpt_id, &req.prompt_tokens)?;
-                // 1b. P2.2a fenced-import admission (ninfer `prepare_import_start`):
-                // the restored exact prefix is measured against the layerwise
-                // window capacity B+R. A pressure import arms a one-shot
-                // selection budget for the first Layerwise step. Narrowing the
-                // prefix would need a DeltaNet checkpoint at the narrowed
-                // frontier, which P4.3 does not capture — fail closed to cold.
+                let mut frontier = ctl.fork_prefix_into(slot.0, ckpt_id, &req.prompt_tokens)?;
+                let mut reuse_id = ckpt_id;
+                // 1b. P2.2a/P2.2b fenced-import admission (ninfer
+                // `prepare_import_start`): the restored exact prefix is measured
+                // against the layerwise window capacity B+R. A pressure import
+                // arms a one-shot selection budget for the first Layerwise step.
+                // When the FULL checkpoint would have to narrow, fall back to the
+                // longest coverage checkpoint at or below the narrowed extent
+                // (its DeltaNet state exists at its own page-aligned frontier);
+                // no such checkpoint closes the reuse to cold.
                 if ctl.strategy().is_layerwise() {
-                    let start = ctl
-                        .import_window(
-                            req.prompt_tokens.len() as u64,
-                            req.max_tokens as u64,
-                            frontier,
-                        )
-                        .map_err(|e| format!("kvmem reuse: import admission: {e}"))?;
-                    if start.pressure() {
-                        if start.restore_tokens < frontier as u64 {
-                            return Err(format!(
-                                "kvmem reuse: import pressure narrows {} -> {} tokens                                  without a narrowed DeltaNet checkpoint",
-                                frontier, start.restore_tokens
-                            ));
+                    let admission = (|| -> Result<Option<u32>, String> {
+                        let start = ctl
+                            .import_window(
+                                req.prompt_tokens.len() as u64,
+                                req.max_tokens as u64,
+                                frontier,
+                            )
+                            .map_err(|e| format!("kvmem reuse: import admission: {e}"))?;
+                        if !start.pressure() {
+                            return Ok(None);
                         }
-                        ctl.set_layerwise_import_blocks(
-                            slot.0,
+                        if start.restore_tokens < frontier as u64 {
+                            let cap = start.restore_tokens as u32;
+                            let shorter = ctl.prefix_lookup_capped(&req.prompt_tokens, cap);
+                            let Some(sid) = shorter.filter(|&sid| sid != reuse_id) else {
+                                return Err(format!(
+                                    "kvmem reuse: import pressure narrows {} -> {} tokens \
+                                     and no coverage checkpoint fits",
+                                    frontier, start.restore_tokens
+                                ));
+                            };
+                            frontier = ctl.fork_prefix_into(slot.0, sid, &req.prompt_tokens)?;
+                            reuse_id = sid;
+                            let retry = ctl
+                                .import_window(
+                                    req.prompt_tokens.len() as u64,
+                                    req.max_tokens as u64,
+                                    frontier,
+                                )
+                                .map_err(|e| format!("kvmem reuse: import retry: {e}"))?;
+                            if retry.pressure() {
+                                if retry.restore_tokens < frontier as u64 {
+                                    return Err(format!(
+                                        "kvmem reuse: coverage checkpoint {} narrows {} -> {} tokens",
+                                        reuse_id, frontier, retry.restore_tokens
+                                    ));
+                                }
+                                let blocks = (retry.selection_budget
+                                    / crate::kvmem_ctl::KV_BLOCK_TOKENS as u64)
+                                    as u32;
+                                return Ok(Some(blocks));
+                            }
+                            return Ok(None);
+                        }
+                        let blocks =
                             (start.selection_budget / crate::kvmem_ctl::KV_BLOCK_TOKENS as u64)
-                                as u32,
-                        )
-                        .map_err(|e| format!("kvmem reuse: import budget: {e}"))?;
+                                as u32;
+                        Ok(Some(blocks))
+                    })();
+                    match admission {
+                        Ok(Some(blocks)) => ctl
+                            .set_layerwise_import_blocks(slot.0, blocks)
+                            .map_err(|e| format!("kvmem reuse: import budget: {e}"))?,
+                        Ok(None) => {}
+                        Err(e) => {
+                            // The fork already reset this slot to the checkpoint
+                            // prefix; a refused admission must hand it back cold.
+                            let _ = ctl.reset_slot(slot.0);
+                            let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+                            return Err(e);
+                        }
                     }
                 }
                 let gpu_pages = ctl
-                    .prefix_checkpoint(ckpt_id)
+                    .prefix_checkpoint(reuse_id)
                     .map(|c| c.gpu_pages.clone())
                     .unwrap_or_default();
                 // 2. DeltaNet restore (fail-closed pairing, spec §5.4 S4):

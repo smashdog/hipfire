@@ -295,6 +295,35 @@ impl PrefixCatalog {
         }
     }
 
+    /// Look up the LONGEST frozen prefix fully proven by `prompt` whose
+    /// frontier does not exceed `max_frontier`. Import narrowing uses this to
+    /// fall back to an earlier coverage checkpoint when the longest one cannot
+    /// start inside the layerwise window. Touches the winner (LRU).
+    pub fn lookup_at_most(&mut self, prompt: &[u32], dst_layout: u64, max_frontier: u32) -> Option<u64> {
+        let mut best: Option<(u64, u32)> = None;
+        for e in &self.entries {
+            if e.layout_id != dst_layout || e.frontier > max_frontier || e.frontier as usize > prompt.len() {
+                continue;
+            }
+            let f = e.frontier as usize;
+            if prefix_fingerprint(&prompt[..f]) != e.fingerprint {
+                continue;
+            }
+            if prompt[..f] != e.prefix_tokens[..] {
+                continue;
+            }
+            if best.map(|(_, bf)| e.frontier > bf).unwrap_or(true) {
+                best = Some((e.id, e.frontier));
+            }
+        }
+        if let Some((id, _)) = best {
+            self.touch(id);
+            Some(id)
+        } else {
+            None
+        }
+    }
+
     pub fn get(&self, id: u64) -> Option<&PrefixCheckpoint> {
         self.entries.iter().find(|e| e.id == id)
     }
@@ -494,6 +523,27 @@ mod tests {
         assert_eq!(cat.lookup(&bad, layout), None);
         // Wrong geometry picks nothing.
         assert_eq!(cat.lookup(&toks, layout ^ 1), None);
+    }
+
+    #[test]
+    fn catalog_lookup_at_most_caps_the_frontier() {
+        let st = storage();
+        let toks = tokens(512);
+        let mut cat = PrefixCatalog::new(4);
+        let short = checkpoint(&st, cat.mint_id(), 128, &toks[..128]);
+        let long = checkpoint(&st, cat.mint_id(), 384, &toks[..384]);
+        cat.insert(short).expect("insert short");
+        cat.insert(long).expect("insert long");
+        let layout = layout_fingerprint(&raw_config());
+        assert_eq!(cat.lookup_at_most(&toks, layout, 384), Some(2));
+        assert_eq!(cat.lookup_at_most(&toks, layout, 383), Some(1));
+        assert_eq!(cat.lookup_at_most(&toks, layout, 128), Some(1));
+        assert_eq!(cat.lookup_at_most(&toks, layout, 127), None);
+        // The full token proof still gates the capped lookup.
+        let mut bad = toks.clone();
+        bad[10] ^= 1;
+        assert_eq!(cat.lookup_at_most(&bad, layout, 512), None);
+        assert_eq!(cat.lookup_at_most(&toks, layout ^ 1, 512), None);
     }
 
     #[test]
