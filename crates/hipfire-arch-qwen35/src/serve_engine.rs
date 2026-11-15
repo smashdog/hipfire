@@ -789,6 +789,11 @@ struct Rig {
     cache_domain: Option<hipfire_runtime::serve_contract::CacheDomain>,
     /// True when cross-session prefix reuse is enabled.
     prefix_cache: bool,
+    /// P4.3: true when KVMem-native prefix sharing is enabled
+    /// (`HIPFIRE_KVMEM_PREFIX_PIN`, opt-in under KVMem). The radix stays off;
+    /// canonical prefixes freeze into the KVMem catalog and their sealed GPU
+    /// pages are PIN-shared across sessions.
+    kvmem_prefix_pin: bool,
     /// The configured `serve.prefix_cache_max_bytes` ceiling. Retained on
     /// the Rig so the Reset path can re-apply it to the replacement index
     /// (`PrefixIndex::new` starts with no ceiling; losing it on reset
@@ -1246,6 +1251,23 @@ impl Rig {
             eprintln!(
                 "  [hipfire] prefix cache disabled: HIPFIRE_KVMEM owns page \
                  residency (cold prefill per request)"
+            );
+        }
+        // P4.3 KVMem-native prefix sharing (opt-in, default off): the radix
+        // stays disabled under KVMem; instead the KVMem host store freezes
+        // immutable canonical prefixes and shares their sealed GPU pages
+        // (cache-ref PIN) across sessions. Independent of cfg.prefix_cache.
+        #[cfg(feature = "kvmem")]
+        let kvmem_prefix_pin = kvmem_on
+            && hipfire_config::developer_var("HIPFIRE_KVMEM_PREFIX_PIN")
+                .ok()
+                .is_some_and(|v| v == "1" || v == "on" || v == "true");
+        #[cfg(not(feature = "kvmem"))]
+        let kvmem_prefix_pin = false;
+        if kvmem_prefix_pin {
+            eprintln!(
+                "  [hipfire] KVMem prefix PIN enabled: canonical-prefix freeze + \
+                 shared sealed pages (radix stays off)"
             );
         }
         // Resolve the KVMem pool geometry before the pool is sized: the
@@ -2121,15 +2143,17 @@ impl Rig {
         // ── Prefix cache (spec §4.1–4.6) ──────────────────────────────────
         // Build the CacheDomain ONCE from available identities. When
         // prefix_cache is off, all three are None and the existing path is
-        // bitwise unchanged.
-        let (prefix_index, checkpoint_pool, cache_domain) = if prefix_cache {
+        // bitwise unchanged. P4.3: KVMem PREFIX_PIN also needs the domain +
+        // DeltaNet checkpoint pool (cross-session reuse must restore the
+        // recurrent state); the radix index itself stays OFF under KVMem.
+        let (prefix_index, checkpoint_pool, cache_domain) = if prefix_cache || kvmem_prefix_pin {
             // `prefix_cache_max_bytes` is a hard retention ceiling including
             // hybrid snapshots; zero means NO retained cache, never
             // unlimited (spec §9.1). A zero ceiling cannot retain a
             // checkpoint, so reuse can never satisfy the hybrid resumability
             // requirement — refuse the combination instead of running a
             // churn cache that publishes pages it can never resume.
-            if cfg.prefix_cache_max_bytes == 0 {
+            if prefix_cache && cfg.prefix_cache_max_bytes == 0 {
                 return Err(
                     "serve.prefix_cache requires serve.prefix_cache_max_bytes > 0 \
                      (0 means no retained cache, never unlimited)"
@@ -2207,24 +2231,47 @@ impl Rig {
                     domain_id: "default".to_string(),
                 },
             };
-            let idx = hipfire_runtime::prefix_index::PrefixIndex::new(1 << 16);
-            // The retained-cache ceiling also bounds the KV page bytes the
-            // radix references (spec §9.1: a retention ceiling, never a
-            // permanently reserved partition — the checkpoint pool below
-            // holds its own ceiling on snapshot bytes).
-            let mut idx = idx;
-            idx.set_max_retained_bytes(cfg.prefix_cache_max_bytes as usize);
-            let pool = crate::checkpoint::CheckpointPool::<DeltaNetSnapshot>::new(
-                cfg.prefix_cache_max_bytes,
-            );
-            eprintln!(
-                "  [hipfire] prefix cache enabled: radix max {} nodes / {} MiB \
-                 retained-page ceiling, checkpoint pool {} bytes",
-                1 << 16,
-                cfg.prefix_cache_max_bytes / (1024 * 1024),
-                cfg.prefix_cache_max_bytes,
-            );
-            (Some(idx), Some(pool), Some(domain))
+            // P4.3: under KVMem PREFIX_PIN the radix index stays OFF (KVMem
+            // owns sharing through its canonical catalog); only the
+            // checkpoint pool + domain identity are built. The retained-cache
+            // ceiling also bounds the KV page bytes the radix references
+            // (spec §9.1: a retention ceiling, never a permanently reserved
+            // partition — the checkpoint pool below holds its own ceiling on
+            // snapshot bytes).
+            let idx = if prefix_cache {
+                let mut idx = hipfire_runtime::prefix_index::PrefixIndex::new(1 << 16);
+                idx.set_max_retained_bytes(cfg.prefix_cache_max_bytes as usize);
+                Some(idx)
+            } else {
+                None
+            };
+            let ckpt_ceiling = if prefix_cache {
+                cfg.prefix_cache_max_bytes
+            } else {
+                // PREFIX_PIN snapshot ceiling (DeltaNet snapshots only, no
+                // radix pages): HIPFIRE_KVMEM_PREFIX_PIN_BYTES, default 512 MiB.
+                hipfire_config::developer_var("HIPFIRE_KVMEM_PREFIX_PIN_BYTES")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|&b| b > 0)
+                    .unwrap_or(512 * 1024 * 1024)
+            };
+            let pool = crate::checkpoint::CheckpointPool::<DeltaNetSnapshot>::new(ckpt_ceiling);
+            if prefix_cache {
+                eprintln!(
+                    "  [hipfire] prefix cache enabled: radix max {} nodes / {} MiB \
+                     retained-page ceiling, checkpoint pool {} bytes",
+                    1 << 16,
+                    cfg.prefix_cache_max_bytes / (1024 * 1024),
+                    cfg.prefix_cache_max_bytes,
+                );
+            } else {
+                eprintln!(
+                    "  [hipfire] KVMem prefix PIN: checkpoint pool {} bytes (radix off)",
+                    ckpt_ceiling,
+                );
+            }
+            (idx, Some(pool), Some(domain))
         } else {
             (None, None, None)
         };
@@ -2326,6 +2373,7 @@ impl Rig {
             prefix_index,
             cache_domain,
             prefix_cache,
+            kvmem_prefix_pin,
             prefix_cache_max_bytes: if prefix_cache {
                 Some(cfg.prefix_cache_max_bytes as usize)
             } else {
@@ -4384,6 +4432,10 @@ struct InFlight {
     /// that shared pages from a prefix cache hit are not re-published.
     /// 0 when prefix_cache is off.
     last_published_boundary: usize,
+    /// P4.3: last page-aligned boundary frozen into the KVMem canonical
+    /// catalog for this request. Initialized to `reused` at admit (a reused
+    /// prefix is already frozen); 0 when PREFIX_PIN is off.
+    last_frozen_boundary: usize,
     /// Per-request grammar constraint for structured output (spec §7 G1/G2).
     /// `None` for unconstrained requests. When present, a grammar mask is
     /// applied to the slot's logits row BEFORE the GPU sampler's
@@ -5428,6 +5480,14 @@ fn run_loop(
             if batch.is_empty() {
                 continue;
             }
+            // P4.3: batch-time prefill snapshot for the end-of-iteration
+            // canonical freeze. The spec/emit sections flip `work[s].decoding`
+            // and advance `next_pos` mid-iteration; the freeze must see the
+            // chunk exactly as it was fed (boundary = post-chunk next_pos).
+            #[cfg(feature = "kvmem")]
+            let freeze_snapshot: Vec<(bool, usize)> = (0..n)
+                .map(|s| (!work[s].decoding, work[s].next_pos))
+                .collect();
             // ── KVMem residency pass (HIPFIRE_KVMEM) ────────────────────────
             // Runs BEFORE provisioning: a step's new pages come from the
             // pool's free list, so the pages this step sheds must be back in
@@ -7188,6 +7248,179 @@ fn run_loop(
                     rig.sessions.touch(session);
                 }
             }
+            // ── P4.3 KVMem canonical-prefix freeze (HIPFIRE_KVMEM_PREFIX_PIN) ──
+            // END of the iteration: the trunk feed AND the MTP head aux
+            // co-archive (spec prefill section) have both completed, so the
+            // composite archive covers the chunk on BOTH planes (freezing
+            // earlier snapshots an aux plane one chunk behind the trunk and
+            // the branch's composite export fails closed). Freeze
+            // the newly completed page-aligned prefix into the canonical
+            // catalog: DeltaNet checkpoint + immutable host fork + sealed GPU
+            // page PIN (cache refs). Prefill chunks of text-only sessions only;
+            // the chunk must END page-aligned (the live recurrent state sits at
+            // next_pos and cannot be relabelled to an earlier boundary, spec
+            // §4.5). Generated rows are never frozen — the shared prefix is
+            // prompt content; generation stays session-private. Opportunistic:
+            // a failed freeze skips the boundary (the request continues cold-
+            // reusable at earlier anchors), it never poisons the serve loop.
+            #[cfg(feature = "kvmem")]
+            if rig.kvmem_prefix_pin && fwd.is_ok() {
+                for s in 0..n {
+                    if batch.m_per_slot[s] == 0 || !freeze_snapshot[s].0 {
+                        continue;
+                    }
+                    if work[s].vl_prefill.is_some() {
+                        continue;
+                    }
+                    if slots[s]
+                        .as_ref()
+                        .and_then(|f| rig.sessions.get(f.session))
+                        .map(|sess| sess.has_image)
+                        .unwrap_or(true)
+                    {
+                        continue;
+                    }
+                    let boundary = freeze_snapshot[s].1;
+                    if boundary == 0 || boundary % PAGE_TOKENS != 0 {
+                        continue;
+                    }
+                    let last_frozen = slots[s]
+                        .as_ref()
+                        .map(|f| f.last_frozen_boundary)
+                        .unwrap_or(0);
+                    if boundary <= last_frozen {
+                        continue;
+                    }
+                    let session = match slots[s].as_ref().map(|f| f.session) {
+                        Some(sid) => sid,
+                        None => continue,
+                    };
+                    let tokens: Vec<u32> = match rig.sessions.get(session) {
+                        Some(sess) if sess.tokens.len() >= boundary => {
+                            sess.tokens[..boundary].to_vec()
+                        }
+                        _ => continue,
+                    };
+                    // PIN requires residency: every prefix page must still be
+                    // bound (a spilled page has no physical handle to pin).
+                    let n_pages = boundary / PAGE_TOKENS;
+                    let page_indices: Vec<u32> = match rig.pool.block_table(SlotId(s)) {
+                        Some(bt) if bt.num_pages() >= n_pages => {
+                            bt.page_indices()[..n_pages].to_vec()
+                        }
+                        _ => continue,
+                    };
+                    if page_indices
+                        .iter()
+                        .any(|&p| p == rdna_compute::page_pool::SPILLED_PAGE)
+                    {
+                        if rig.gpu.slot_trace() {
+                            eprintln!(
+                                "[kvmem-prefix] slot {s} boundary {boundary} not frozen: \
+                                 prefix pages spilled"
+                            );
+                        }
+                        continue;
+                    }
+                    let freeze_result = (|| -> Result<(), String> {
+                        // 1. DeltaNet checkpoint FIRST (fail-closed pairing:
+                        // a cataloged prefix without a restorable recurrent
+                        // state is unusable for the hybrid model). The live
+                        // state sits exactly at `boundary` (chunk end).
+                        let domain = rig
+                            .cache_domain
+                            .as_ref()
+                            .ok_or_else(|| "kvmem freeze: no cache domain".to_string())?;
+                        let ckpt_pool = rig
+                            .model
+                            .checkpoint_pool
+                            .as_mut()
+                            .ok_or_else(|| "kvmem freeze: no checkpoint pool".to_string())?;
+                        let cid = crate::checkpoint::capture_checkpoint(
+                            &mut rig.gpu,
+                            ckpt_pool,
+                            domain,
+                            boundary as u64,
+                            &tokens,
+                            &rig.model.dn_states[s],
+                        )
+                        .map_err(|e| format!("kvmem freeze DN capture: {e:?}"))?;
+                        if cid == crate::checkpoint::CheckpointId::NONE {
+                            return Err(
+                                "kvmem freeze: checkpoint pool ceiling refused capture"
+                                    .to_string(),
+                            );
+                        }
+                        // 2. Host canonical freeze (immutable fork + catalog).
+                        let ctl = rig
+                            .model
+                            .kvmem
+                            .as_mut()
+                            .ok_or_else(|| "kvmem freeze: no controller".to_string())?;
+                        let (id, displaced, deduped) =
+                            ctl.freeze_prefix(s, boundary as u32, &tokens)?;
+                        // 3. Displaced catalog entries: release their GPU
+                        // cache refs (pages with live table refs survive).
+                        for d in displaced {
+                            if let Some(pp) = rig.pool.page_pool_mut() {
+                                for &phys in &d.gpu_pages {
+                                    let _ = pp.release_cache_ref(phys);
+                                }
+                            }
+                        }
+                        // 4. PIN this prefix's pages. On dedup the existing
+                        // entry already pins content-identical pages — taking
+                        // refs again would double-pin them.
+                        if !deduped {
+                            let pp = rig
+                                .pool
+                                .page_pool_mut()
+                                .ok_or_else(|| "kvmem freeze: not paged".to_string())?;
+                            let mut taken: Vec<u32> = Vec::new();
+                            let mut ref_err = None;
+                            for &phys in &page_indices {
+                                match pp.add_cache_ref(phys) {
+                                    Ok(()) => taken.push(phys),
+                                    Err(e) => {
+                                        ref_err = Some(e);
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(e) = ref_err {
+                                // Roll back the partial pin AND the catalog
+                                // entry: a half-pinned prefix must never be
+                                // reusable.
+                                for phys in taken {
+                                    let _ = pp.release_cache_ref(phys);
+                                }
+                                ctl.release_prefix(id);
+                                return Err(format!("kvmem freeze cache ref: {e}"));
+                            }
+                            if let Some(ckpt) = ctl.prefix_checkpoint_mut(id) {
+                                ckpt.gpu_pages = page_indices.clone();
+                            }
+                        }
+                        Ok(())
+                    })();
+                    match freeze_result {
+                        Ok(()) => {
+                            if let Some(f) = slots[s].as_mut() {
+                                f.last_frozen_boundary = boundary;
+                            }
+                            if rig.gpu.slot_trace() {
+                                eprintln!(
+                                    "[kvmem-prefix] slot {s} froze canonical prefix at \
+                                     boundary {boundary}"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[kvmem-prefix] freeze skipped: {e}");
+                        }
+                    }
+                }
+            }
             let emit_ns = t_emit.elapsed().as_nanos() as u64;
             let total_ns = t_step.elapsed().as_nanos() as u64;
             if hipfire_dispatch::moe_trace_enabled() {
@@ -7891,6 +8124,68 @@ fn admit(
                         // the next cold attempt — rather than corrupt it.
                         #[cfg(feature = "kvmem")]
                         if kvmem_enabled(rig) {
+                            // P4.3 fed coordination: a continuation resuming
+                            // BELOW the stored frontier (client edit) truncates
+                            // the host store to the reuse point instead of
+                            // rejecting — but ONLY when a DeltaNet checkpoint
+                            // at exactly that frontier pairs with it (ninfer
+                            // truncate_to + restore_mean_checkpoint + checkpoint
+                            // provenance). Without the pairing the fail-closed
+                            // cold rebuild below stands.
+                            if rig.kvmem_prefix_pin {
+                                let fed_now = rig
+                                    .model
+                                    .kvmem
+                                    .as_ref()
+                                    .and_then(|ctl| ctl.fed_tokens(slot.0))
+                                    .unwrap_or(0);
+                                if (plan.reused as u32) < fed_now {
+                                    let truncated = (|| -> Result<(), String> {
+                                        let domain = rig.cache_domain.as_ref().ok_or_else(
+                                            || "kvmem truncate: no cache domain".to_string(),
+                                        )?;
+                                        let ckpt_pool =
+                                            rig.model.checkpoint_pool.as_mut().ok_or_else(
+                                                || "kvmem truncate: no checkpoint pool".to_string(),
+                                            )?;
+                                        let fp = crate::checkpoint::prefix_fingerprint(
+                                            &extended[..plan.reused],
+                                        );
+                                        let restored = ckpt_pool
+                                            .peek(domain, plan.reused as u64, fp)
+                                            .map(|snapshot| {
+                                                snapshot
+                                                    .restore_to(
+                                                        &mut rig.model.dn_states[slot.0],
+                                                        &mut rig.gpu,
+                                                    )
+                                                    .is_ok()
+                                            })
+                                            .unwrap_or(false);
+                                        if !restored {
+                                            return Err(
+                                                "no DeltaNet checkpoint at the truncation frontier"
+                                                    .to_string(),
+                                            );
+                                        }
+                                        let ctl = rig.model.kvmem.as_mut().ok_or_else(
+                                            || "kvmem truncate: no controller".to_string(),
+                                        )?;
+                                        ctl.truncate_slot(slot.0, plan.reused as u32)
+                                    })();
+                                    if let Err(e) = truncated {
+                                        // A failed restore may have advanced
+                                        // the DN part-way; reset before the
+                                        // cold rebuild (spec §5.4 S4 pairing).
+                                        let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+                                        if rig.gpu.slot_trace() {
+                                            eprintln!(
+                                                "[kvmem-prefix] continuation truncate refused: {e}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             let fed = rig
                                 .model
                                 .kvmem
@@ -8078,6 +8373,9 @@ fn admit(
                             max_tokens: req.max_tokens.max(1),
                             repeat_window_req,
                             last_published_boundary: session_pub,
+                            // P4.3: freezing resumes at the turn's reuse point
+                            // (the prefix below it was fed by earlier turns).
+                            last_frozen_boundary: plan.reused,
                             grammar: grammar_constraint,
                             // Continuation reuse is session-local (convo hash),
                             // not a radix lookup — no pin to hold.
@@ -8344,14 +8642,101 @@ fn admit(
         }
     }
 
+    // ── P4.3 KVMem-native prefix reuse (HIPFIRE_KVMEM_PREFIX_PIN) ─────────
+    // Cross-session reuse from the canonical catalog (the radix stays OFF
+    // under KVMem). Order: provenance-validated host fork → DeltaNet restore
+    // → GPU page share. Any failure unwinds to the cold state (host reset +
+    // DN reset; a refused share is non-mutating by contract). Vision requests
+    // skip reuse (their KV carries M-RoPE phases the shared prefix lacks).
+    let mut prefix_reused: usize = 0;
+    let mut prefix_hit = false;
+    #[cfg(feature = "kvmem")]
+    if rig.kvmem_prefix_pin && req.visual_data.is_none() {
+        let hit = rig
+            .model
+            .kvmem
+            .as_mut()
+            .and_then(|ctl| ctl.prefix_lookup(&req.prompt_tokens));
+        if let Some(ckpt_id) = hit {
+            let reuse = (|| -> Result<usize, String> {
+                let ctl = rig
+                    .model
+                    .kvmem
+                    .as_mut()
+                    .ok_or_else(|| "kvmem reuse: no controller".to_string())?;
+                // 1. Host fork: validates the FULL provenance (geometry +
+                // fingerprint + token proof) before any mutation.
+                let frontier = ctl.fork_prefix_into(slot.0, ckpt_id, &req.prompt_tokens)?;
+                let gpu_pages = ctl
+                    .prefix_checkpoint(ckpt_id)
+                    .map(|c| c.gpu_pages.clone())
+                    .unwrap_or_default();
+                // 2. DeltaNet restore (fail-closed pairing, spec §5.4 S4):
+                // shared KV must never pair with a zeroed/partial recurrent
+                // state. On any failure below, reset BOTH halves.
+                let domain = rig
+                    .cache_domain
+                    .as_ref()
+                    .ok_or_else(|| "kvmem reuse: no cache domain".to_string())?;
+                let ckpt_pool = rig
+                    .model
+                    .checkpoint_pool
+                    .as_mut()
+                    .ok_or_else(|| "kvmem reuse: no checkpoint pool".to_string())?;
+                let restored = ckpt_pool
+                    .peek(
+                        domain,
+                        frontier as u64,
+                        crate::checkpoint::prefix_fingerprint(
+                            &req.prompt_tokens[..frontier as usize],
+                        ),
+                    )
+                    .map(|snapshot| {
+                        snapshot
+                            .restore_to(&mut rig.model.dn_states[slot.0], &mut rig.gpu)
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                if !restored {
+                    let _ = ctl.reset_slot(slot.0);
+                    let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+                    return Err("kvmem reuse: DeltaNet checkpoint restore failed".to_string());
+                }
+                // 3. Share the pinned pages into the (empty) block table.
+                if gpu_pages.is_empty()
+                    || rig.pool.share_published_pages(slot, &gpu_pages).is_err()
+                {
+                    let _ = ctl.reset_slot(slot.0);
+                    let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+                    return Err("kvmem reuse: GPU page share failed".to_string());
+                }
+                Ok(frontier as usize)
+            })();
+            match reuse {
+                Ok(frontier) => {
+                    prefix_reused = frontier;
+                    prefix_hit = true;
+                    if rig.gpu.slot_trace() {
+                        eprintln!(
+                            "[slot-trace] KVMem prefix HIT: reused {}/{} tokens",
+                            frontier,
+                            req.prompt_tokens.len()
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[kvmem-prefix] reuse did not convert: {e} — cold prefill");
+                }
+            }
+        }
+    }
+
     // ── Prefix cache lookup (spec §4.5–4.6) ──────────────────────────────
     // Cross-session prefix reuse: consult the radix index for reusable KV
     // pages and the checkpoint pool for recurrent state. This is SEPARATE
     // from the session-local continuation path (convo hashes) — the radix
     // index is keyed by exact token sequences across sessions. Vision
     // requests skip the radix entirely (spec X2: Vision+prefix reuse OFF).
-    let mut prefix_reused: usize = 0;
-    let mut prefix_hit = false;
     // The lookup's pin on the matched radix path. Held until the request
     // terminates (released by release_pin_ticket on every exit path) or
     // released immediately below when the hit does not convert.
@@ -8508,6 +8893,43 @@ fn admit(
                 eprintln!(
                     "[slot-trace] reclaimed {} cache-only pages under admission pressure",
                     evicted.len()
+                );
+            }
+        }
+    }
+
+    // ── P4.3 canonical-prefix reclaim under page pressure ────────────────
+    // Pinned canonical prefixes hold pool pages beyond the per-slot working
+    // sets. When the free list cannot back one slot's resident budget plus
+    // headroom, release LRU catalog entries (their cache refs drop; pages
+    // still held by live block tables survive). Bounded: the catalog is
+    // finite, and an empty catalog ends the loop.
+    #[cfg(feature = "kvmem")]
+    if rig.kvmem_prefix_pin {
+        let headroom = rig
+            .model
+            .kvmem
+            .as_ref()
+            .map(|ctl| ctl.budget_blocks() + 2)
+            .unwrap_or(2);
+        loop {
+            let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
+            if free >= headroom {
+                break;
+            }
+            let victim = rig.model.kvmem.as_mut().and_then(|ctl| ctl.pop_lru_prefix());
+            let Some(victim) = victim else { break };
+            if let Some(pp) = rig.pool.page_pool_mut() {
+                for &phys in &victim.gpu_pages {
+                    let _ = pp.release_cache_ref(phys);
+                }
+            }
+            if rig.gpu.slot_trace() {
+                eprintln!(
+                    "[kvmem-prefix] reclaimed canonical prefix {} ({} pages) under \
+                     admission pressure",
+                    victim.id,
+                    victim.gpu_pages.len()
                 );
             }
         }
@@ -8750,10 +9172,26 @@ fn admit(
                                      // over a zeroed prefix collapses acceptance to ~1 — pure overhead
                                      // on exactly the turns reuse was meant to accelerate. AR produces
                                      // identical output without the overhead.
+        // P4.3: under KVMem PREFIX_PIN + Layerwise the reused prefix's head
+        // history lives in the shared composite aux archive and the draft
+        // carrier restores it before attend (P4.1② G4) — the zeroed-head-KV
+        // concern above does not apply, so reuse keeps MTP (and the suffix
+        // prefill co-archives the aux plane the composite export requires).
+        // Legacy reuse stays AR (no aux restore path). The radix is off under
+        // KVMem, so `reused > 0` here is always a P4.3 canonical reuse.
+        #[cfg(feature = "kvmem")]
+        let kvmem_lw_reuse = rig.kvmem_prefix_pin
+            && rig
+                .model
+                .kvmem
+                .as_ref()
+                .is_some_and(|ctl| ctl.strategy().is_layerwise());
+        #[cfg(not(feature = "kvmem"))]
+        let kvmem_lw_reuse = false;
         let mtp_ok = rig.model.mtp_head.is_some()
             && rig.model.mtp_k > 0
             && !grammar_constrained
-            && reused == 0;
+            && (reused == 0 || kvmem_lw_reuse);
         // DFlash2 admit on the new-session arm: same request-shape gates as
         // MTP (text only, no grammar), including the reused==0 rule — a radix
         // hit's reused span was never forwarded this turn, so its
@@ -8834,6 +9272,7 @@ fn admit(
         max_tokens: req.max_tokens.max(1),
         repeat_window_req,
         last_published_boundary: reused,
+        last_frozen_boundary: reused,
         grammar: grammar_constraint,
         pin_ticket,
     });

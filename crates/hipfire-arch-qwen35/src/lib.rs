@@ -115,6 +115,12 @@ pub mod kvmem_taps;
 /// `HIPFIRE_KVMEM=1`; requires the paged Q8 pool.
 #[cfg(all(feature = "deltanet", feature = "kvmem"))]
 pub mod kvmem_ctl;
+/// P4.3 KVMem-native prefix sharing: immutable canonical source + checkpoint
+/// catalog (host model; ninfer-aligned provenance). Additive sibling to
+/// `kvmem_ctl`; an empty catalog (the default, PREFIX_PIN off) allocates
+/// nothing and mutates nothing, keeping the Legacy serve byte-neutral.
+#[cfg(feature = "kvmem")]
+pub mod kvmem_prefix;
 /// Layerwise Q8 packed-page layout adapter (Phase 3.2 ①地基): bridges hipfire Q8
 /// geometry to the core generic `PayloadLayout` manifest + the crate-agnostic
 /// packed arena. Clean sibling to `kvmem_ctl`; not wired into live serve in ①.
