@@ -625,7 +625,7 @@ impl ModelRig {
 /// Every other step — prefill, multi-slot, VL (image sessions carry M-RoPE
 /// phases the compacted view does not reproduce), spec, non-q8, non-paged, or
 /// Legacy strategy — returns `None` and runs the byte-neutral Legacy path. The
-/// host-store length gate (`fed >= 128`) lives in `engine_carrier`.
+/// host-store length gate (`fed >= 128`) lives in `engine_carrier_rows`.
 #[cfg(feature = "kvmem")]
 fn layerwise_admissible(
     rig: &Rig,
@@ -666,6 +666,73 @@ fn layerwise_admissible(
         return None;
     }
     Some((slot, frame.session.0))
+}
+
+/// Layerwise MTP-verify admission (P4.1②, design §A.6 / §B D1.4②). The multi-row
+/// sibling of [`layerwise_admissible`]: admits a single-slot MTP verify span under
+/// Layerwise so the trunk's accepted-only write-through + drop-evict +
+/// restore-before-attend runs over the whole `width`-row verifier batch (Path B
+/// `run_layers_slots`, already width-aware). Returns `(slot, session_id, width)`
+/// where `width` is the slot's verify-row count (`m_per_slot`, == the drafted span
+/// from `inject_spec_verify_tokens`). Everything else threads `None` (Legacy
+/// byte-neutral): non-Layerwise, non-paged / non-q8, GQA-decode disabled, DFlash
+/// rows, multi-slot batches, prefill, image / M-RoPE steps. The accepted PREFIX is
+/// published post-sampling through the OUTPUT-scope owner
+/// (`accept_output_pressure`), not the all-or-nothing prefill owner the single-row
+/// AR path uses. Automatic: no dedicated on/off env (design §B D1.5) — gated solely
+/// on the Layerwise strategy + native MTP being active this step.
+#[cfg(feature = "kvmem")]
+fn layerwise_mtp_verify_admissible(
+    rig: &Rig,
+    batch: &SlotBatch,
+    slots: &[Option<InFlight>],
+    work: &[PendingWork],
+    any_verify: bool,
+    any_dflash_rows: bool,
+) -> Option<(usize, u64, u64)> {
+    let ctl = rig.model.kvmem.as_ref()?;
+    if !ctl.strategy().is_layerwise() {
+        return None;
+    }
+    // MTP only this sub-patch (②): DFlash verify is a separate spec mechanism.
+    if !any_verify || any_dflash_rows || !rig.pool.is_paged() || !rig.model.kv_tier.is_q8() {
+        return None;
+    }
+    // Same paged GQA decode tile gate as AR: an operator who disabled it falls
+    // back to Legacy rather than failing closed.
+    if !hipfire_config::developer_bool("HIPFIRE_KVMEM_GQA_DECODE", true) {
+        return None;
+    }
+    // A verify span is multi-row; exactly one slot contributes rows (single-slot
+    // focus — multi-slot batching is P4.2). The verify slot's `m_per_slot` is the
+    // drafted span width.
+    if batch.total_rows() <= 1 {
+        return None;
+    }
+    let slot = batch.m_per_slot.iter().position(|&m| m > 1)?;
+    if batch
+        .m_per_slot
+        .iter()
+        .enumerate()
+        .any(|(s, &m)| s != slot && m != 0)
+    {
+        return None;
+    }
+    let width = batch.m_per_slot[slot] as u64;
+    if work[slot].spec != SpecKind::Mtp || !work[slot].decoding {
+        return None;
+    }
+    // Text-only this step (same throat as AR): no vision-tower embedding rows, no
+    // M-RoPE phases, no image conversation.
+    if !batch.ext_emb.iter().all(|&e| e < 0) || !batch.pos3.is_empty() {
+        return None;
+    }
+    let frame = slots[slot].as_ref()?;
+    let sess = rig.sessions.get(frame.session)?;
+    if sess.has_image {
+        return None;
+    }
+    Some((slot, frame.session.0, width))
 }
 
 struct Rig {
@@ -1998,6 +2065,12 @@ impl Rig {
                     per_pos_bytes,
                     per_pos_v_bytes,
                     max_rows: max_batch,
+                    // P4.1② G3: the composite head aux plane is active only when
+                    // the engine actually runs the native MTP head (the same
+                    // enablement the spec-verify tape gates on below). Under
+                    // Layerwise this appends the head ordinal to the host record;
+                    // Legacy carries it unread (byte-neutral).
+                    mtp_head: mtp_head.is_some() && mtp_k > 0,
                 },
             )?),
             None => None,
@@ -2755,6 +2828,15 @@ impl ModelRig {
             return Err("mtp_head_prefill_chunk: batched head scratch missing".to_string());
         };
         if self.mtp_states[slot.0].is_none() {
+            // P4.1② f2 (E): bound the head KV under Layerwise+MTP; Legacy / AR-only
+            // get None ⇒ full-resident (byte-neutral).
+            #[cfg(feature = "kvmem")]
+            let head_cap = self
+                .kvmem
+                .as_ref()
+                .and_then(|ctl| ctl.head_bounded_capacity());
+            #[cfg(not(feature = "kvmem"))]
+            let head_cap: Option<usize> = None;
             let state = crate::mtp_spec::MtpSpecState::new_for_components(
                 &mut gpu,
                 &self.config,
@@ -2762,6 +2844,7 @@ impl ModelRig {
                 head,
                 self.mtp_k,
                 crate::mtp_head::MtpKvMode::Q8,
+                head_cap,
             )
             .map_err(|e| format!("mtp state alloc: {e}"))?;
             self.mtp_states[slot.0] = Some(state);
@@ -2803,6 +2886,40 @@ impl ModelRig {
             )
             .map_err(|e| format!("mtp prefill hidden norm: {e}"));
 
+        // P4.1② f2 (E): bounded head staging under Layerwise+MTP. The resident
+        // head cache is a per-chunk archive staging buffer (window + one scratch
+        // block), NOT the attention source (the G4 carrier is). Write prompt K/V
+        // at COMPACT pool-local positions (global - removed) and rotate at GLOBAL
+        // (rope_shift = removed), mirroring ninfer cache_position_shift (NL:8442).
+        // Legacy / AR-only: removed = 0 ⇒ compact == global, rope_shift = 0
+        // (byte-neutral). Each chunk re-stages independently — no slide.
+        #[cfg(feature = "kvmem")]
+        let rope_shift = self
+            .kvmem
+            .as_ref()
+            .map(|ctl| ctl.head_prefill_shift(chunk_positions[0] as usize + m))
+            .unwrap_or(0);
+        #[cfg(not(feature = "kvmem"))]
+        let rope_shift = 0usize;
+        let compact_positions: Vec<i32> = if rope_shift == 0 {
+            chunk_positions.to_vec()
+        } else {
+            // Fail closed if the chunk straddles the window front (compact < 0):
+            // the scheduler's layerwise prefill credit bounds m <= window, so this
+            // guards a mis-sized chunk, never a normal path.
+            if (chunk_positions[0] as usize) < rope_shift {
+                self.mtp_states[slot.0] = Some(state);
+                return Err(format!(
+                    "mtp head prefill: chunk at {} exceeds head window (removed {rope_shift})",
+                    chunk_positions[0]
+                ));
+            }
+            chunk_positions
+                .iter()
+                .map(|&p| p - rope_shift as i32)
+                .collect()
+        };
+
         // Disjoint field borrows: `scratch`/`rot` from mtp_prefill_batched,
         // `gpu`/`weights`/head separately. No closure — it would capture all of
         // `rig` and collide with the scratch borrow.
@@ -2814,11 +2931,12 @@ impl ModelRig {
                 &mut state.mtp_kv,
                 chunk_tokens,
                 &staged,
-                chunk_positions,
+                &compact_positions,
                 m,
                 &self.weights,
                 Some(rot),
                 /* kv_only */ true,
+                /* rope_shift */ rope_shift as i32,
             )
             .map_err(|e| format!("mtp head prefill: {e}"))
         });
@@ -2835,8 +2953,61 @@ impl ModelRig {
                 )
                 .map_err(|e| format!("mtp prev_hidden capture: {e:?}"))
         });
+        // P4.1② f2 (B+E): the head archive bootstrap. Under Layerwise+MTP,
+        // co-archive this chunk's head K/V into the composite aux plane (ordinal
+        // `n_fa`) so every prompt token's head payload survives for drop-evict +
+        // stripe restore-before-attend (G4). The trunk Main plane is archived
+        // separately by `feed_rows` (which write-through archives whenever the
+        // strategy is Layerwise, regardless of the prefill arm). The bounded head
+        // staging cache is position-major at the shared trunk Q8 stride; E writes
+        // it at COMPACT positions, so the gather offset is the pool-local
+        // `pos0 - rope_shift` while the canonical archive seal stays at the GLOBAL
+        // `pos0`. `ensure_head_plane` is idempotent (session-lifetime map). Legacy /
+        // AR-only: `head_plane_enabled()` is false ⇒ no allocation, no seal, and
+        // rope_shift == 0 ⇒ gather offset == pos0 (byte-neutral).
+        #[cfg_attr(not(feature = "kvmem"), allow(unused_mut))]
+        let mut outcome = hidden_outcome;
+        #[cfg(feature = "kvmem")]
+        if outcome.is_ok() {
+            let head_plane = self
+                .kvmem
+                .as_ref()
+                .map(|k| k.head_plane_enabled())
+                .unwrap_or(false);
+            if head_plane {
+                let pos0 = chunk_positions[0] as usize;
+                let mut kvmem = self.kvmem.take();
+                let res = match kvmem.as_mut() {
+                    Some(ctl) => ctl.ensure_head_plane(slot.0).and_then(|()| {
+                        ctl.head_write_through_archive(
+                            gpu,
+                            &state.mtp_kv.inner.k_gpu[0],
+                            &state.mtp_kv.inner.v_gpu[0],
+                            slot.0,
+                            pos0,
+                            m,
+                            // E: gather from the COMPACT staging offset; the seal
+                            // above stays at the GLOBAL canonical pos0.
+                            pos0 - rope_shift,
+                        )?;
+                        // f2-D: grow the head resident selection map with this
+                        // chunk's accepted canonical pages (ninfer prefill
+                        // `initialize`/append, NL:12274/12309). Full-resident
+                        // transitional: every prompt page stays resident, so the
+                        // map reconstructs the frontier with removed == 0; the
+                        // consume pass (mtp_verify_accept_step) appends onto it.
+                        ctl.accept_head_append(slot.0, pos0 as u64, (pos0 + m) as u64)
+                    }),
+                    None => Err("mtp head prefill: controller vanished".to_string()),
+                };
+                self.kvmem = kvmem;
+                if let Err(e) = res {
+                    outcome = Err(e);
+                }
+            }
+        }
         self.mtp_states[slot.0] = Some(state);
-        hidden_outcome
+        outcome
     }
 }
 
@@ -2847,6 +3018,155 @@ impl ModelRig {
 /// for rollback during verify. Returns the draft output for the batched
 /// verify phase.
 impl ModelRig {
+    /// P4.1② f2 (C): the draft phase's head-layerwise restore-before-attend.
+    ///
+    /// Under Layerwise+MTP with a bound FirstLayer aux selection (G5), restore
+    /// the head's bounded aux arena from the B+D-populated composite archive,
+    /// then run `draft` through the [`HeadLayerwise`] handle. Mirroring the trunk
+    /// verify carrier, the handle is created, attended and freed *inside* the
+    /// `Ok(Some)` arm so its borrow of `ctl` never escapes to the `&mut ctl`
+    /// cleanup siblings. On any gate miss (Legacy / AR-only / cold start /
+    /// unbound aux / absent head map / no sealed page) `draft` runs full-resident
+    /// (`None`, byte-neutral) and anything consumed is put back. A hard restore
+    /// error restores the head map + aux binding and propagates (fail-closed).
+    /// `policy` is a block local: the handle borrows it but is freed before it
+    /// drops, so nothing referencing it escapes.
+    #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+    #[allow(clippy::too_many_arguments)]
+    fn mtp_draft_head_restore<'a, F>(
+        gpu: &mut Gpu,
+        ctl: &'a mut crate::kvmem_ctl::KvMemCtl,
+        slot: usize,
+        session_id: u64,
+        cap_tokens: usize,
+        config: &crate::qwen35::Qwen35Config,
+        draft: F,
+    ) -> Result<crate::mtp_spec::MtpDraftOutput, String>
+    where
+        F: for<'b> FnOnce(
+            &mut Gpu,
+            Option<&mut crate::layerwise_driver::HeadLayerwise<'b>>,
+        ) -> Result<crate::mtp_spec::MtpDraftOutput, String>,
+    {
+        use crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as BT;
+        let fed = match ctl.fed_tokens(slot) {
+            Some(f) => f,
+            None => return draft(gpu, None),
+        };
+        // No sealed full page yet ⇒ nothing to recall; stay full-resident.
+        if fed < BT {
+            return draft(gpu, None);
+        }
+        let aux = match ctl.take_aux_selection(slot) {
+            Some(a) => a,
+            None => return draft(gpu, None),
+        };
+        let mut head = match ctl.take_head_plane(slot) {
+            Some(h) => h,
+            None => {
+                ctl.set_aux_selection(slot, aux);
+                return draft(gpu, None);
+            }
+        };
+        // Committed: every failure below restores the head map + aux binding.
+        let policy = match ctl.layerwise_policy(fed) {
+            Ok(p) => p,
+            Err(e) => {
+                ctl.restore_head_plane(slot, head);
+                ctl.set_aux_selection(slot, aux);
+                return Err(e);
+            }
+        };
+        let window = ctl.budget_blocks() * BT as usize;
+        let n_fa = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == LayerType::FullAttention)
+            .count();
+        // The carrier borrows `ctl` + `policy`; confine it to the `Ok(Some)` arm
+        // and run+free the draft handle there so the borrow never escapes to the
+        // `None`/`Err` cleanup siblings (mirrors the trunk verify carrier match).
+        match crate::layerwise_driver::engine_carrier_head(
+            gpu,
+            ctl,
+            &policy,
+            slot,
+            session_id,
+            n_fa,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            cap_tokens as u32,
+            "qwen35",
+            /* width */ 1,
+            window,
+        ) {
+            Ok(Some(carrier)) => {
+                let selected: Vec<u64> = aux
+                    .selected()
+                    .map(|s| s.iter().map(|&x| x as u64).collect())
+                    .unwrap_or_default();
+                let suffix = crate::layerwise_driver::HeadSuffix {
+                    page: fed / BT,
+                    partial_tokens: fed % BT,
+                    rows: 1,
+                };
+                let rope_pos = match gpu.hip.malloc(4) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let _ = carrier.free(gpu);
+                        ctl.restore_head_plane(slot, head);
+                        ctl.set_aux_selection(slot, aux);
+                        return Err(format!("mtp head rope_pos alloc: {e}"));
+                    }
+                };
+                match crate::layerwise_driver::HeadLayerwise::restore(
+                    gpu,
+                    ctl,
+                    &mut head,
+                    carrier,
+                    slot,
+                    &selected,
+                    fed as u64,
+                    window,
+                    session_id,
+                    cap_tokens as u32,
+                    "qwen35",
+                    &suffix,
+                    rope_pos,
+                ) {
+                    Ok(mut hlw) => {
+                        // Attend the draft through the handle, then free it
+                        // *here* so its `ctl` borrow ends before the `&mut ctl`
+                        // head-map restore below (verify-pattern confinement).
+                        let res = draft(gpu, Some(&mut hlw));
+                        let free_res = hlw.free(gpu);
+                        ctl.restore_head_plane(slot, head);
+                        if let Err(e) = free_res {
+                            return Err(format!("mtp head carrier free: {e}"));
+                        }
+                        res
+                    }
+                    Err(e) => {
+                        ctl.restore_head_plane(slot, head);
+                        ctl.set_aux_selection(slot, aux);
+                        Err(e)
+                    }
+                }
+            }
+            Ok(None) => {
+                ctl.restore_head_plane(slot, head);
+                ctl.set_aux_selection(slot, aux);
+                draft(gpu, None)
+            }
+            Err(e) => {
+                ctl.restore_head_plane(slot, head);
+                ctl.set_aux_selection(slot, aux);
+                Err(e)
+            }
+        }
+    }
+
     /// MTP draft phase: run K serial head-forward steps, save DN snapshot.
     ///
     /// Called when `work.decoding` (subsequent MTP steps). Takes the seed
@@ -2859,13 +3179,28 @@ impl ModelRig {
         slot: SlotId,
         work: &mut PendingWork,
         emitted: &[u32],
+        session_id: u64,
+        cap_tokens: usize,
     ) -> Result<crate::mtp_spec::MtpDraftOutput, String> {
+        // The head-layerwise restore (C) is the only consumer of these; silence
+        // them in the no-kvmem default build where the draft stays full-resident.
+        #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+        let _ = (session_id, cap_tokens);
         let head = self
             .mtp_head
             .as_ref()
             .ok_or_else(|| "mtp_draft_step: MTP head not loaded".to_string())?;
 
         if self.mtp_states[slot.0].is_none() {
+            // P4.1② f2 (E): bound the head KV under Layerwise+MTP; Legacy / AR-only
+            // get None ⇒ full-resident (byte-neutral).
+            #[cfg(feature = "kvmem")]
+            let head_cap = self
+                .kvmem
+                .as_ref()
+                .and_then(|ctl| ctl.head_bounded_capacity());
+            #[cfg(not(feature = "kvmem"))]
+            let head_cap: Option<usize> = None;
             let state = crate::mtp_spec::MtpSpecState::new_for_components(
                 &mut gpu,
                 &self.config,
@@ -2873,6 +3208,7 @@ impl ModelRig {
                 head,
                 self.mtp_k,
                 crate::mtp_head::MtpKvMode::Q8,
+                head_cap,
             )
             .map_err(|e| format!("mtp state alloc: {e}"))?;
             self.mtp_states[slot.0] = Some(state);
@@ -2922,7 +3258,24 @@ impl ModelRig {
         let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
         let pos = work.next_pos;
 
-        let outcome: Result<crate::mtp_spec::MtpDraftOutput, String> = (|| {
+        // P4.1② f2 (C): restore the head's bounded aux arena before the draft
+        // attends (ninfer NL:10274-10339). The controller is taken out so the
+        // head map can be driven mutably while the draft closure holds shared
+        // borrows of `self.weights`/`config`/`mtp_head`. The restore helper runs
+        // the draft *inside* the carrier arm (verify-pattern borrow confinement);
+        // `None` (Legacy / AR-only / cold start / unbound aux) keeps the
+        // full-resident draft byte-neutral.
+        #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+        type HeadLw<'a> = crate::layerwise_driver::HeadLayerwise<'a>;
+        #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+        type HeadLw<'a> = core::marker::PhantomData<&'a ()>;
+
+        // The draft body, factored so the restore helper can run it through the
+        // head handle (kvmem) or full-resident (fallback / default build). `gpu`
+        // and the handle are parameters; the rest is captured disjointly.
+        let mut run_draft = |gpu: &mut Gpu,
+                         hlw: Option<&mut HeadLw<'_>>|
+         -> Result<crate::mtp_spec::MtpDraftOutput, String> {
             if prompt_tokens.is_empty() {
                 return Err("mtp_draft_step: no seed token".to_string());
             }
@@ -2931,11 +3284,11 @@ impl ModelRig {
             // Save DN snapshot for rollback during verify phase.
             state
                 .trunk_snap
-                .save_from(&mut self.dn_states[slot.0], &mut gpu)
+                .save_from(&mut self.dn_states[slot.0], gpu)
                 .map_err(|e| format!("mtp dn snapshot: {e}"))?;
 
             let draft_outcome = crate::mtp_spec::mtp_draft_phase_inner(
-                &mut gpu,
+                gpu,
                 &self.weights,
                 &self.config,
                 head,
@@ -2944,14 +3297,43 @@ impl ModelRig {
                 seed,
                 self.mtp_k,
                 /* skip_proposal_graph */ true,
+                hlw,
             )
             .map_err(|e| format!("mtp draft: {e}"));
             if crate::mtp_spec::mtp_trace_enabled() {
                 eprintln!("[mtp-trace] draft done pos={pos} seed={seed}");
             }
             draft_outcome
-        })();
+        };
 
+        #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+        let mut kvmem_taken = self.kvmem.take();
+        #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+        let outcome: Result<crate::mtp_spec::MtpDraftOutput, String> = 'c: {
+            let ctl = match kvmem_taken.as_mut() {
+                Some(c) => c,
+                None => break 'c run_draft(&mut gpu, None),
+            };
+            if !ctl.head_plane_enabled() {
+                break 'c run_draft(&mut gpu, None);
+            }
+            Self::mtp_draft_head_restore(
+                &mut gpu,
+                ctl,
+                slot.0,
+                session_id,
+                cap_tokens,
+                &self.config,
+                run_draft,
+            )
+        };
+        #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+        let outcome: Result<crate::mtp_spec::MtpDraftOutput, String> = run_draft(&mut gpu, None);
+
+        #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+        {
+            self.kvmem = kvmem_taken;
+        }
         self.mtp_states[slot.0] = Some(state);
         self.spec_req_sampling[slot.0] = req_sampling;
         outcome
@@ -3007,6 +3389,33 @@ impl ModelRig {
             .max(1);
 
         let outcome: Result<Vec<u32>, String> = (|| {
+            // P4.1② f2-D: under Layerwise+MTP the consume pass (below) recomputes
+            // the accepted head K/V from the trunk's ACTUAL verify hidden (ninfer
+            // `final_hidden`, NL:10259-10339). The head pairs token `p` with
+            // hidden `p-1`, so fill row 0 must hold the pre-window hidden
+            // h_{pos-1}. Stage it NOW: `mtp_batched_verify_accept_from_batch`
+            // overwrites `state.prev_hidden` with the last accepted verify row
+            // (h_{pos+advance-1}) before returning. Legacy / AR-only skip this
+            // (head_plane_enabled() == false ⇒ byte-neutral).
+            #[cfg(feature = "kvmem")]
+            let head_consume = self
+                .kvmem
+                .as_ref()
+                .map(|k| k.head_plane_enabled())
+                .unwrap_or(false);
+            #[cfg(feature = "kvmem")]
+            if head_consume {
+                let dim = self.config.dim;
+                gpu.hip
+                    .memcpy_dtod_at(
+                        &state.takeover_fill_hidden.buf,
+                        0,
+                        &state.prev_hidden.buf,
+                        0,
+                        dim * 4,
+                    )
+                    .map_err(|e| format!("mtp head consume stage: {e:?}"))?;
+            }
             let result = crate::mtp_spec::mtp_batched_verify_accept_from_batch(
                 &mut gpu,
                 &self.weights,
@@ -3037,18 +3446,92 @@ impl ModelRig {
             // KVMem statistics: only the committed prefix of the verify rows
             // survives (`advance` rows starting at `pos`); rejected draft rows
             // are overwritten by later writes and never enter the host store.
+            // The controller is taken OUT so the head consume below can borrow
+            // `self.weights` / `self.mtp_head` immutably alongside `&mut ctl`
+            // (the f2-D head fill needs the trunk weights; an in-place
+            // `self.kvmem.as_mut()` would conflict). Restored unconditionally.
             #[cfg(feature = "kvmem")]
-            if let Some(ctl) = self.kvmem.as_mut() {
-                let taps = self
-                    .pbs
-                    .kvmem_taps
-                    .as_ref()
-                    .expect("kvmem controller without statistics taps");
-                ctl.feed_rows(
-                    gpu, taps, slot.0, pos, result.advance, hidden_row_offset,
-                    pool, &self.k_arenas, &self.v_arenas,
-                )
-                    .map_err(|e| format!("kvmem statistics feed: {e}"))?;
+            {
+                let mut kvmem = self.kvmem.take();
+                if let Some(ctl) = kvmem.as_mut() {
+                    let taps = self
+                        .pbs
+                        .kvmem_taps
+                        .as_ref()
+                        .expect("kvmem controller without statistics taps");
+                    ctl.feed_rows(
+                        gpu, taps, slot.0, pos, result.advance, hidden_row_offset,
+                        pool, &self.k_arenas, &self.v_arenas,
+                    )
+                        .map_err(|e| format!("kvmem statistics feed: {e}"))?;
+                    // P4.1② (design §A.6): publish the Layerwise MTP verify's captured
+                    // output mass at the scheduler-confirmed accepted PREFIX — the same
+                    // `result.advance` rows just fed to the host store, so the output
+                    // owner's `accepted_end` and the store frontier stay in lockstep.
+                    // The snapshot was extracted from the verify carrier pre-free; the
+                    // owner is taken out for `&mut` accept then restored. No-op under
+                    // Legacy / AR-only / when no verify is pending (byte-neutral).
+                    if ctl.strategy().is_layerwise() {
+                        if let Some(snap) = ctl.take_layerwise_pending_output(slot.0) {
+                            let mut owner = ctl.take_layerwise_output_pressure(slot.0).ok_or_else(
+                                || "kvmem: layerwise verify pending without output owner".to_string(),
+                            )?;
+                            let pub_res = crate::layerwise_driver::publish_output_acceptance(
+                                &mut owner,
+                                snap,
+                                result.advance as u32,
+                            );
+                            ctl.restore_layerwise_output_pressure(slot.0, owner);
+                            pub_res.map_err(|e| format!("kvmem: layerwise output publish: {e}"))?;
+                        }
+                    }
+                    // P4.1② f2-D+E: head aux-plane consume co-archive. The trunk
+                    // Main plane just archived the accepted verify rows (feed_rows);
+                    // now recompute the accepted head K/V from the ACTUAL verify
+                    // hidden (the draft used its own predicted hidden chain, and its
+                    // ephemeral arena is already freed) via the kv_only batched head
+                    // forward, then co-archive to the composite aux plane and append
+                    // the head resident map. Archive = source of truth the next draft
+                    // restore (f2-C) reads. Mirrors the takeover fill
+                    // (`mtp_takeover_fill_head_kv`) + ninfer `final_hidden`/`accept`
+                    // (NL:10338/10387). E: the bounded staging cache writes COMPACT
+                    // (pos - removed) while RoPE stays GLOBAL; the gather offset is
+                    // pool-local, the canonical seal stays at GLOBAL pos. Legacy /
+                    // AR-only skip entirely (head_consume == false ⇒ byte-neutral).
+                    if head_consume && result.advance > 0 {
+                        let head = self.mtp_head.as_ref().ok_or_else(|| {
+                            "mtp head consume: MTP head not loaded".to_string()
+                        })?;
+                        let rope_shift = ctl.head_prefill_shift(pos + result.advance);
+                        let tokens = crate::mtp_spec::mtp_takeover_fill_tokens(
+                            draft.last_committed,
+                            &draft.candidates,
+                            result.advance,
+                        );
+                        crate::mtp_spec::mtp_takeover_fill_head_kv(
+                            gpu, head, &mut state, &self.weights, pos, &tokens, rope_shift,
+                        )
+                        .map_err(|e| format!("mtp head consume fill: {e}"))?;
+                        ctl.head_write_through_archive(
+                            gpu,
+                            &state.mtp_kv.inner.k_gpu[0],
+                            &state.mtp_kv.inner.v_gpu[0],
+                            slot.0,
+                            pos,
+                            result.advance,
+                            // E: gather from the COMPACT staging offset; seal at GLOBAL pos.
+                            pos - rope_shift,
+                        )
+                        .map_err(|e| format!("mtp head consume archive: {e}"))?;
+                        ctl.accept_head_append(
+                            slot.0,
+                            pos as u64,
+                            (pos + result.advance) as u64,
+                        )
+                        .map_err(|e| format!("mtp head consume append: {e}"))?;
+                    }
+                }
+                self.kvmem = kvmem;
             }
 
             Ok(result.committed)
@@ -4618,10 +5101,20 @@ fn run_loop(
                             _ => Vec::new(),
                         };
                         let outcome = match work[s].spec {
-                            SpecKind::Mtp => rig
-                                .model
-                                .mtp_draft_step(&mut rig.gpu, SlotId(s), &mut work[s], &emitted)
-                                .map(SpecDraftRows::Mtp),
+                            SpecKind::Mtp => {
+                                let session_id =
+                                    slots[s].as_ref().map(|f| f.session.0).unwrap_or(0);
+                                rig.model
+                                    .mtp_draft_step(
+                                        &mut rig.gpu,
+                                        SlotId(s),
+                                        &mut work[s],
+                                        &emitted,
+                                        session_id,
+                                        rig.cap_tokens,
+                                    )
+                                    .map(SpecDraftRows::Mtp)
+                            }
                             SpecKind::Dflash => rig
                                 .model
                                 .dflash_draft_step(&mut rig.gpu, SlotId(s), &mut work[s], &emitted)
@@ -5312,30 +5805,40 @@ fn run_loop(
                             .filter(|t| **t == LayerType::FullAttention)
                             .count();
                         let fa_layers: Vec<u32> = (0..n_fa as u32).collect();
-                        // Ensure + DETACH the persistent pressure owner (design
-                        // §3.10a borrow resolution): the carrier borrows `&ctl`
-                        // (keys/policy), so the owner is taken out into an
-                        // independent local to allow `&mut` accept after the
+                        // Ensure + DETACH the persistent OUTPUT-scope owner (A'-1:
+                        // AR decode rides the same OutputPressure infrastructure as
+                        // MTP verify, design §3.10a borrow resolution): the carrier
+                        // borrows `&ctl` (keys/policy), so the owner is taken out into
+                        // an independent local to allow `&mut` accept after the
                         // forward, then restored on EVERY exit path. Layerwise-only
                         // (ensure fails closed under Legacy, which never reaches
                         // this arm). The slot keeps its keep-set / counters.
-                        let mut pressure_owner = None;
+                        let mut output_owner = None;
+                        // [P4.1② fix] consume the per-request Query gate in the
+                        // mutable window (before the immutable ctl borrow below).
+                        let mut force_query = false;
                         if let Some(k) = kvmem.as_mut() {
                             let incarnation =
                                 k.layerwise_counters(slot).map(|(inc, _)| inc).unwrap_or(0);
-                            if let Err(e) =
-                                k.ensure_layerwise_pressure(slot, session_id, incarnation, &fa_layers)
-                            {
+                            if let Err(e) = k.ensure_layerwise_output_pressure(
+                                slot, session_id, incarnation, &fa_layers,
+                            ) {
                                 rig.model.kvmem = kvmem;
                                 fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
                                 poison = Some(e);
                                 break 'serve;
                             }
-                            pressure_owner = k.take_layerwise_pressure(slot);
+                            output_owner = k.take_layerwise_output_pressure(slot);
+                            force_query = k.take_layerwise_query_due(slot);
                         }
                         let ctl = kvmem
                             .as_ref()
                             .expect("admissible layerwise step has a controller");
+                        // G5: the accepted frontier this restore opens at (the
+                        // single AR decode row's position). The head aux history is
+                        // bound from the first FA layer's restored view here, so
+                        // the first MTP draft (next step) has a selection to take.
+                        let begin = ctl.fed_tokens(slot).unwrap_or(0) as u64;
                         // Fresh page-aligned selection policy over the sealed
                         // full pages only (the core picker rejects a partial
                         // tail). The slot's shared `kv` store keeps tracking all
@@ -5346,9 +5849,9 @@ fn run_loop(
                             match ctl.layerwise_policy(ctl.fed_tokens(slot).unwrap_or(0)) {
                                 Ok(p) => p,
                                 Err(e) => {
-                                    if let Some(p) = pressure_owner {
+                                    if let Some(p) = output_owner {
                                         if let Some(k) = kvmem.as_mut() {
-                                            k.restore_layerwise_pressure(slot, p);
+                                            k.restore_layerwise_output_pressure(slot, p);
                                         }
                                     }
                                     rig.model.kvmem = kvmem;
@@ -5357,7 +5860,13 @@ fn run_loop(
                                     break 'serve;
                                 }
                             };
-                        let built = crate::layerwise_driver::engine_carrier(
+                        // A'-1: AR decode rides engine_carrier_rows (OutputPressure,
+                        // native mass tracking) with width=1 / query=None / prefill=None
+                        // ⇒ always scorer Query selection (mirrors MTP verify). The
+                        // page-aligned PrefillPressure mid-page freeze that lost needles
+                        // is gone; the OutputPressure window advances accepted_end
+                        // natively (fed→fed+1) but does not drive selection (prefill=None).
+                        let built = crate::layerwise_driver::engine_carrier_rows(
                             &mut rig.gpu,
                             ctl,
                             &lw_policy,
@@ -5369,7 +5878,13 @@ fn run_loop(
                             rig.model.config.head_dim,
                             rig.cap_tokens as u32,
                             "qwen35",
-                            pressure_owner.as_ref(),
+                            1,
+                            None,
+                            output_owner
+                                .as_mut()
+                                .expect("admissible layerwise AR step has an output owner"),
+                            None,
+                            force_query,
                         );
                         match built {
                             Ok(Some(mut carrier)) => {
@@ -5383,26 +5898,52 @@ fn run_loop(
                                     any_dflash_rows,
                                     Some(&mut carrier),
                                 );
-                                // Keep-set contribution (design §3.10a): read the
-                                // previous resident pool while the carrier still
-                                // borrows ctl, then combine with this step's
-                                // restored pages (Query union / Pressure truncate).
-                                let is_pressure = carrier.is_pressure();
+                                // Keep-set contribution (design §3.10a, A'-1): read the
+                                // previous resident pool while the carrier still borrows
+                                // ctl, then REPLACE with this step's restored pages. AR
+                                // decode is always scorer Query (OutputPressure, prefill=None),
+                                // so the keep-set is replaced every step — the scorer's
+                                // restored view re-admits cold-recalled needle pages, and a
+                                // growing union would diverge per-layer extents (bug #8).
+                                let head_plane = ctl.head_plane_enabled();
                                 let prev_keep: Vec<Vec<u64>> = ctl
                                     .layerwise_keep_set(slot)
                                     .map(|s| s.to_vec())
                                     .unwrap_or_default();
-                                let keep_res = carrier.restored_keep_set().map(|restored| {
+                                let restored_res = carrier.restored_keep_set();
+                                // G5: the first FA ordinal's restored canonical ids
+                                // for the FirstLayer head aux binding, captured before
+                                // `free` ends the carrier borrow. `None` on a restore
+                                // error (surfaced through `keep_res` below). Cloned out
+                                // so `restored_res` still moves into `keep_res` (owned Err).
+                                let aux_first: Option<Vec<u64>> =
+                                    restored_res.as_ref().ok().and_then(|r| r.first().cloned());
+                                let keep_res = restored_res.map(|restored| {
+                                    // A'-1: AR decode is always scorer Query (prefill=None
+                                    // ⇒ no Pressure refinement), so REPLACE the keep-set
+                                    // every step (fresh current-Q re-selection, consistent
+                                    // per-layer extent) exactly like the MTP verify regime
+                                    // (bug #8). UNION with a non-empty prior diverges the
+                                    // per-layer resident counts and trips the catalog
+                                    // geometry guard; the scorer's restored view already
+                                    // re-admits cold-recalled needle pages each step, so a
+                                    // growing union is redundant. Always-Query also satisfies
+                                    // the continuation fix (current question re-scored).
                                     crate::layerwise_driver::combine_keep_set(
-                                        &prev_keep, &restored, is_pressure, n_fa,
+                                        &prev_keep, &restored, true, n_fa,
                                     )
                                 });
-                                // Accept the captured mass into the detached owner
-                                // (no-op when the rows() schedule was empty). The
-                                // &mut owner is independent of the carrier's ctl
-                                // borrow, so this runs before free.
-                                let accept_res = match pressure_owner.as_mut() {
-                                    Some(p) => carrier.accept_pressure(p),
+                                // Accept the captured native mass into the detached
+                                // OUTPUT-scope owner at the confirmed AR prefix (accepted=1:
+                                // the single decode row is always accepted). Advances the
+                                // window's accepted_end to fed+1 for the next step's begin.
+                                // The &mut owner is independent of the carrier's ctl borrow,
+                                // so this runs before free. AR publishes immediately (no
+                                // MTP-style deferred pending_output: the prefix is known).
+                                let accept_res = match output_owner.as_mut() {
+                                    Some(p) => carrier
+                                        .accept_output_pressure(p, session_id + 1, begin, 1)
+                                        .map(|_| false),
                                     None => Ok(false),
                                 };
                                 // Release the carrier exactly once (its GPU
@@ -5410,11 +5951,29 @@ fn run_loop(
                                 // ending its borrow of `kvmem`/`lw_policy` before
                                 // the mutable counter bump / keep-set / restore.
                                 let free_res = carrier.free(&mut rig.gpu);
+                                // G5: FirstLayer head aux binding (pure-host, after the
+                                // carrier borrow ends). `head_plane` ⇒ Layerwise + MTP ⇒
+                                // FirstLayer under ②. `Ok(None)` when the head plane is
+                                // inactive (AR-only) or the restore errored (handled below).
+                                let aux_res = if head_plane {
+                                    aux_first
+                                        .as_deref()
+                                        .map(|first| {
+                                            crate::layerwise_mtp::bind_first_layer_auxiliary(
+                                                first,
+                                                begin,
+                                                crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u64,
+                                            )
+                                        })
+                                        .transpose()
+                                } else {
+                                    Ok(None)
+                                };
                                 // Return the detached owner on EVERY path so the
                                 // session-lifetime pressure state persists.
-                                if let Some(p) = pressure_owner {
+                                if let Some(p) = output_owner {
                                     if let Some(k) = kvmem.as_mut() {
-                                        k.restore_layerwise_pressure(slot, p);
+                                        k.restore_layerwise_output_pressure(slot, p);
                                     }
                                 }
                                 if let Some(e) = accept_res.err().or_else(|| free_res.err()) {
@@ -5432,9 +5991,21 @@ fn run_loop(
                                         break 'serve;
                                     }
                                 };
+                                let aux_sel = match aux_res {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        rig.model.kvmem = kvmem;
+                                        fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                                        poison = Some(e);
+                                        break 'serve;
+                                    }
+                                };
                                 if let Some(k) = kvmem.as_mut() {
                                     k.advance_layerwise_seq(slot);
                                     k.set_layerwise_keep_set(slot, new_keep);
+                                    if let Some(s) = aux_sel {
+                                        k.set_aux_selection(slot, s);
+                                    }
                                 }
                                 rig.model.kvmem = kvmem;
                                 fwd
@@ -5442,9 +6013,9 @@ fn run_loop(
                             // No sealed history page yet (fed < 128): restore the
                             // controller + owner and run Legacy; no transaction.
                             Ok(None) => {
-                                if let Some(p) = pressure_owner {
+                                if let Some(p) = output_owner {
                                     if let Some(k) = kvmem.as_mut() {
-                                        k.restore_layerwise_pressure(slot, p);
+                                        k.restore_layerwise_output_pressure(slot, p);
                                     }
                                 }
                                 rig.model.kvmem = kvmem;
@@ -5460,9 +6031,9 @@ fn run_loop(
                                 )
                             }
                             Err(e) => {
-                                if let Some(p) = pressure_owner {
+                                if let Some(p) = output_owner {
                                     if let Some(k) = kvmem.as_mut() {
-                                        k.restore_layerwise_pressure(slot, p);
+                                        k.restore_layerwise_output_pressure(slot, p);
                                     }
                                 }
                                 rig.model.kvmem = kvmem;
@@ -5472,16 +6043,252 @@ fn run_loop(
                             }
                         }
                     }
-                    None => rig.model.forward_step(
-                        &mut rig.gpu,
-                        &batch,
-                        &mut rig.pool,
-                        &mut graph,
-                        &lm_head_skip,
-                        any_verify,
-                        any_dflash_rows,
-                        None,
-                    ),
+                    None => {
+                        // P4.1② (design §A.6 / §B D1.4②): AR admission rejects
+                        // `any_verify`, so a Layerwise MTP verify span lands here.
+                        // Admit it before falling back to Legacy: multi-row trunk
+                        // accepted-only write-through + drop-evict + restore over
+                        // the verify batch (Path B), through the OUTPUT-scope owner
+                        // (partial acceptance). The accepted prefix is published
+                        // post-sampling in `mtp_verify_accept_step`, not here.
+                        if let Some((slot, session_id, width)) = layerwise_mtp_verify_admissible(
+                            &rig, &batch, &slots, &work, any_verify, any_dflash_rows,
+                        ) {
+                            let mut kvmem = rig.model.kvmem.take();
+                            let n_fa = rig
+                                .model
+                                .config
+                                .layer_types
+                                .iter()
+                                .filter(|t| **t == LayerType::FullAttention)
+                                .count();
+                            let fa_layers: Vec<u32> = (0..n_fa as u32).collect();
+                            // Ensure + DETACH the persistent OUTPUT-scope owner
+                            // (the MTP-verify sibling of the AR prefill owner). A
+                            // verify span accepts a PREFIX of its rows, which the
+                            // all-or-nothing prefill owner cannot express. Taken
+                            // out so `begin_scope`/`prepare_scope`/`accept` use
+                            // `&mut OutputPressure` independently of the carrier's
+                            // `&ctl` borrow; restored on EVERY exit path.
+                            let mut output_owner = None;
+                            // [P4.1② fix] consume the per-request Query gate in the
+                            // mutable window (before the immutable ctl borrow).
+                            let mut force_query = false;
+                            if let Some(k) = kvmem.as_mut() {
+                                let incarnation =
+                                    k.layerwise_counters(slot).map(|(inc, _)| inc).unwrap_or(0);
+                                if let Err(e) = k.ensure_layerwise_output_pressure(
+                                    slot, session_id, incarnation, &fa_layers,
+                                ) {
+                                    rig.model.kvmem = kvmem;
+                                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                                    poison = Some(e);
+                                    break 'serve;
+                                }
+                                output_owner = k.take_layerwise_output_pressure(slot);
+                                force_query = k.take_layerwise_query_due(slot);
+                            }
+                            let ctl = kvmem
+                                .as_ref()
+                                .expect("admissible layerwise verify has a controller");
+                            // Native consumed-row frontier the output window opens
+                            // at (== the verify span's first position); the accepted
+                            // prefix advances it by `result.advance` post-sampling.
+                            let begin = ctl.fed_tokens(slot).unwrap_or(0) as u64;
+                            let request = session_id + 1;
+                            let lw_policy =
+                                match ctl.layerwise_policy(ctl.fed_tokens(slot).unwrap_or(0)) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        if let Some(p) = output_owner {
+                                            if let Some(k) = kvmem.as_mut() {
+                                                k.restore_layerwise_output_pressure(slot, p);
+                                            }
+                                        }
+                                        rig.model.kvmem = kvmem;
+                                        fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                                        poison = Some(e);
+                                        break 'serve;
+                                    }
+                                };
+                            let built = crate::layerwise_driver::engine_carrier_rows(
+                                &mut rig.gpu,
+                                ctl,
+                                &lw_policy,
+                                slot,
+                                session_id,
+                                n_fa,
+                                rig.model.config.n_heads,
+                                rig.model.config.n_kv_heads,
+                                rig.model.config.head_dim,
+                                rig.cap_tokens as u32,
+                                "qwen35",
+                                width,
+                                None,
+                                output_owner
+                                    .as_mut()
+                                    .expect("admissible layerwise verify has an output owner"),
+                                None,
+                                force_query,
+                            );
+                            match built {
+                                Ok(Some(mut carrier)) => {
+                                    let fwd = rig.model.forward_step(
+                                        &mut rig.gpu,
+                                        &batch,
+                                        &mut rig.pool,
+                                        &mut graph,
+                                        &lm_head_skip,
+                                        any_verify,
+                                        any_dflash_rows,
+                                        Some(&mut carrier),
+                                    );
+                                    let head_plane = ctl.head_plane_enabled();
+                                    let restored_res = carrier.restored_keep_set();
+                                    // G5: the first FA ordinal's restored canonical ids
+                                    // for the FirstLayer head aux binding, captured before
+                                    // `free` ends the carrier borrow. `None` on a restore
+                                    // error (surfaced through `keep_res` below). Cloned out
+                                    // so `restored_res` still moves into `keep_res` (owned Err).
+                                    let aux_first: Option<Vec<u64>> =
+                                        restored_res.as_ref().ok().and_then(|r| r.first().cloned());
+                                    // Keep-set (design §3.10a, ninfer REPLACE): the
+                                    // MTP composite verify regime forces REPLACE
+                                    // (pressure = true, empty prev). The trunk+aux
+                                    // planes select asymmetric page ids, so a growing
+                                    // union diverges the per-layer resident counts and
+                                    // trips the catalog's cross-layer extent invariant
+                                    // (bug #8). The restored view already admits the
+                                    // scorer's full re-selection (cold recall included).
+                                    let keep_res = restored_res.map(|restored| {
+                                        crate::layerwise_driver::combine_keep_set(
+                                            &[], &restored, true, n_fa,
+                                        )
+                                    });
+                                    // Extract the OWNED acceptance snapshot before
+                                    // freeing the carrier: the accepted prefix
+                                    // (`result.advance`) is known only post-sampling,
+                                    // so the publish runs in `mtp_verify_accept_step`
+                                    // (after `feed_rows`), outside this scoped take.
+                                    let snap_res = carrier.extract_output_acceptance(request, begin);
+                                    let free_res = carrier.free(&mut rig.gpu);
+                                    // G5: FirstLayer head aux binding (pure-host, after the
+                                    // carrier borrow ends). `head_plane` ⇒ Layerwise + MTP ⇒
+                                    // FirstLayer under ②. The head consume (post-accept) and
+                                    // the next span's draft take this binding. `Ok(None)` when
+                                    // the head plane is inactive or the restore errored.
+                                    let aux_res = if head_plane {
+                                        aux_first
+                                            .as_deref()
+                                            .map(|first| {
+                                                crate::layerwise_mtp::bind_first_layer_auxiliary(
+                                                    first,
+                                                    begin,
+                                                    crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS
+                                                        as u64,
+                                                )
+                                            })
+                                            .transpose()
+                                    } else {
+                                        Ok(None)
+                                    };
+                                    if let Some(p) = output_owner {
+                                        if let Some(k) = kvmem.as_mut() {
+                                            k.restore_layerwise_output_pressure(slot, p);
+                                        }
+                                    }
+                                    if let Some(e) = free_res.err() {
+                                        rig.model.kvmem = kvmem;
+                                        fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                                        poison = Some(e);
+                                        break 'serve;
+                                    }
+                                    let new_keep = match keep_res {
+                                        Ok(k) => k,
+                                        Err(e) => {
+                                            rig.model.kvmem = kvmem;
+                                            fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                                            poison = Some(e);
+                                            break 'serve;
+                                        }
+                                    };
+                                    let snap = match snap_res {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            rig.model.kvmem = kvmem;
+                                            fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                                            poison = Some(e);
+                                            break 'serve;
+                                        }
+                                    };
+                                    let aux_sel = match aux_res {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            rig.model.kvmem = kvmem;
+                                            fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                                            poison = Some(e);
+                                            break 'serve;
+                                        }
+                                    };
+                                    if let Some(k) = kvmem.as_mut() {
+                                        k.advance_layerwise_seq(slot);
+                                        k.set_layerwise_keep_set(slot, new_keep);
+                                        if let Some(s) = snap {
+                                            k.set_layerwise_pending_output(slot, s);
+                                        }
+                                        if let Some(s) = aux_sel {
+                                            k.set_aux_selection(slot, s);
+                                        }
+                                    }
+                                    rig.model.kvmem = kvmem;
+                                    fwd
+                                }
+                                // No sealed history page yet (fed < 128): restore
+                                // the owner + controller and run Legacy; the verify
+                                // still commits via `feed_rows`, no output publish.
+                                Ok(None) => {
+                                    if let Some(p) = output_owner {
+                                        if let Some(k) = kvmem.as_mut() {
+                                            k.restore_layerwise_output_pressure(slot, p);
+                                        }
+                                    }
+                                    rig.model.kvmem = kvmem;
+                                    rig.model.forward_step(
+                                        &mut rig.gpu,
+                                        &batch,
+                                        &mut rig.pool,
+                                        &mut graph,
+                                        &lm_head_skip,
+                                        any_verify,
+                                        any_dflash_rows,
+                                        None,
+                                    )
+                                }
+                                Err(e) => {
+                                    if let Some(p) = output_owner {
+                                        if let Some(k) = kvmem.as_mut() {
+                                            k.restore_layerwise_output_pressure(slot, p);
+                                        }
+                                    }
+                                    rig.model.kvmem = kvmem;
+                                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                                    poison = Some(e);
+                                    break 'serve;
+                                }
+                            }
+                        } else {
+                            rig.model.forward_step(
+                                &mut rig.gpu,
+                                &batch,
+                                &mut rig.pool,
+                                &mut graph,
+                                &lm_head_skip,
+                                any_verify,
+                                any_dflash_rows,
+                                None,
+                            )
+                        }
+                    }
                 }
             };
             #[cfg(not(feature = "kvmem"))]

@@ -1686,6 +1686,7 @@ mod ffi {
             s: *const HkOutputSnapshot,
             position: u64,
         ) -> c_int;
+        pub fn hk_output_pressure_sync_prefill(p: *mut HkOutputPressure, position: u64) -> c_int;
         pub fn hk_output_pressure_select(
             p: *const HkOutputPressure,
             catalog: *const HkMemoryCatalog,
@@ -3053,6 +3054,21 @@ impl OutputPressure {
         let p = self.ptr.as_ptr();
         let s = snap.ptr.as_ptr();
         checked(|| unsafe { ffi::hk_output_pressure_restore(p, s, position); })
+    }
+
+    /// Reposition the persistent output window's accepted feedback to the
+    /// validated native consumed frontier `position` after an unsampled
+    /// continuation prefill (ninfer `accept_prefill` semantics). hipfire keeps one
+    /// output window per session (`begin_scope` idempotent, never finished), so the
+    /// raw [`Self::accept_prefill`]'s `prepared_ == false` guard cannot fire
+    /// mid-window; this routes through the core `restore` primitive instead,
+    /// advancing `accepted_end` to `position`, clearing the prepared verifier and
+    /// preserving the accumulated scores + pending mass. Idempotent: a no-op when
+    /// `accepted_end >= position` (steady-state decode lockstep), so the within-turn
+    /// / Legacy / AR-only paths stay byte-neutral.
+    pub fn sync_prefill(&mut self, position: u64) -> Result<()> {
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe { ffi::hk_output_pressure_sync_prefill(p, position); })
     }
 
     /// Combined keep-set selection: seeds from the prefill snapshot fallback and

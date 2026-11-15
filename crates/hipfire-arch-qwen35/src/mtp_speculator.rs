@@ -959,6 +959,7 @@ pub fn new_qwen35_mtp_lane_state(
         max_n,
         max_n,
         MtpKvMode::Q8,
+        /* head_max_seq: Legacy sequential speculator stays full-resident */ None,
     )
     .map_err(|e| format!("alloc MtpSpecState: {e}"))?;
     if let Some(cvs) = head.weights.compressed_vocab_size {
