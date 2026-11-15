@@ -2359,7 +2359,12 @@ pub fn engine_carrier_rows<'a>(
     let n_slots = selected_pages + 2;
     let full_pages = (fed / LAYERWISE_BLOCK_TOKENS) as u64;
     let archive_bytes = (full_pages + 2) * record_bytes;
-    let budget_blocks = ctl.budget_blocks() as u32;
+    // P2.2a fenced-import admission: the first Layerwise selection after a
+    // restored checkpoint may carry a narrowed one-shot budget (ninfer
+    // `selection_budget`). Ordinary steps read the configured resident budget.
+    let budget_blocks = ctl
+        .take_layerwise_import_blocks(slot)
+        .unwrap_or_else(|| ctl.budget_blocks() as u32);
 
     // ── Output window (ninfer native Output cadence) ─────────────────────────
     // The window frontier is the native consumed frontier `fed`, not the

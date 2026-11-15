@@ -8749,6 +8749,35 @@ fn admit(
                 // 1. Host fork: validates the FULL provenance (geometry +
                 // fingerprint + token proof) before any mutation.
                 let frontier = ctl.fork_prefix_into(slot.0, ckpt_id, &req.prompt_tokens)?;
+                // 1b. P2.2a fenced-import admission (ninfer `prepare_import_start`):
+                // the restored exact prefix is measured against the layerwise
+                // window capacity B+R. A pressure import arms a one-shot
+                // selection budget for the first Layerwise step. Narrowing the
+                // prefix would need a DeltaNet checkpoint at the narrowed
+                // frontier, which P4.3 does not capture — fail closed to cold.
+                if ctl.strategy().is_layerwise() {
+                    let start = ctl
+                        .import_window(
+                            req.prompt_tokens.len() as u64,
+                            req.max_tokens as u64,
+                            frontier,
+                        )
+                        .map_err(|e| format!("kvmem reuse: import admission: {e}"))?;
+                    if start.pressure() {
+                        if start.restore_tokens < frontier as u64 {
+                            return Err(format!(
+                                "kvmem reuse: import pressure narrows {} -> {} tokens                                  without a narrowed DeltaNet checkpoint",
+                                frontier, start.restore_tokens
+                            ));
+                        }
+                        ctl.set_layerwise_import_blocks(
+                            slot.0,
+                            (start.selection_budget / crate::kvmem_ctl::KV_BLOCK_TOKENS as u64)
+                                as u32,
+                        )
+                        .map_err(|e| format!("kvmem reuse: import budget: {e}"))?;
+                    }
+                }
                 let gpu_pages = ctl
                     .prefix_checkpoint(ckpt_id)
                     .map(|c| c.gpu_pages.clone())
