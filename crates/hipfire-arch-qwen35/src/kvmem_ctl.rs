@@ -56,6 +56,7 @@ use rdna_compute::slot_pool::{SlotId, SlotPool};
 use rdna_compute::{Gpu, GpuTensor};
 
 use crate::kvmem_taps::KvMemTaps;
+use crate::kvmem_prefix::{layout_fingerprint, PrefixCatalog, PrefixCheckpoint, PREFIX_PAGE_TOKENS};
 use crate::layerwise_driver::{layerwise_backend, layerwise_capabilities, OutputAcceptanceSnapshot};
 use crate::layerwise_layout::LayerwiseMtpQ8Layout;
 use crate::layerwise_mtp::{auxiliary_removed_tokens, auxiliary_visible_tokens, AuxiliarySelection};
@@ -864,6 +865,11 @@ pub struct KvMemCtl {
     /// layer rows, so trunk selection still scores only `0..n_fa_layers`. Equals
     /// `n_fa_layers` under Legacy / AR-only ⇒ the default query is byte-neutral.
     n_record_layers: usize,
+    /// P4.3: engine-wide frozen-prefix catalog (KVMem-native sharing). Empty
+    /// unless the serve engine freezes a prefix (`HIPFIRE_KVMEM_PREFIX_PIN`
+    /// on); an empty catalog allocates nothing and no default path reads it,
+    /// so the Legacy serve stays byte-neutral.
+    prefix_catalog: PrefixCatalog,
 }
 
 impl KvMemCtl {
@@ -1163,6 +1169,10 @@ impl KvMemCtl {
             head_plane,
             aux_ordinal: geom.n_fa_layers as u32,
             n_record_layers,
+            // P4.3: bounded frozen-prefix catalog; empty until the engine
+            // freezes a prefix (PREFIX_PIN on). The bound is the retention
+            // count ceiling (H5 exposes the env knob).
+            prefix_catalog: PrefixCatalog::new(4),
         })
     }
 
@@ -1237,12 +1247,29 @@ impl KvMemCtl {
         // A fresh session bumps the layerwise incarnation so re-bootstrapped
         // canonical stamps never alias the previous session's (design §3.9g).
         let lw_incarnation = self.slots[slot].lw_incarnation + 1;
-        self.slots[slot] = SlotState {
+        self.slots[slot] = self.fresh_slot_state(raw, kv, 0, 0, lw_incarnation);
+        Ok(())
+    }
+
+    /// Build a fresh session's slot state around the given stores. Shared by
+    /// [`Self::reset_slot`] (cold session, fed 0) and [`Self::fork_prefix_into`]
+    /// (P4.3 reused prefix, fed = frontier) so a reused prefix never inherits
+    /// stale selection / pressure / head state — the field initialization is
+    /// identical by construction.
+    fn fresh_slot_state(
+        &self,
+        raw: RawStore,
+        kv: KvStore,
+        fed: u32,
+        turn_start: u32,
+        lw_incarnation: u64,
+    ) -> SlotState {
+        SlotState {
             raw,
             kv,
             last_select_full: 0,
-            fed: 0,
-            turn_start: 0,
+            fed,
+            turn_start,
             first_decode_done: false,
             q_ring: vec![
                 0f32;
@@ -1271,8 +1298,220 @@ impl KvMemCtl {
             // incarnation. Legacy / AR-only: both stay None (byte-neutral).
             lw_head: None,
             lw_aux_selection: None,
-        };
+        }
+    }
+
+    // ── P4.3 KVMem-native prefix sharing (host model) ─────────────────────
+    //
+    // ninfer-aligned: freeze an IMMUTABLE canonical archive at a page-aligned
+    // frontier, then reuse it across sessions via provenance-validated forks.
+    // The GPU page PIN (seal + cache refs + share_published_pages) and the
+    // DeltaNet checkpoint restore are engine-side (serve admit); these methods
+    // own the host store half. Every path is additive: with PREFIX_PIN off the
+    // engine never calls them and the catalog stays empty (byte-neutral).
+
+    /// Freeze slot `slot`'s prefix `[0, frontier)` into an immutable canonical
+    /// archive and catalog it. `frontier` must be page-aligned and `<= fed`;
+    /// `prefix_tokens` is the FULL token proof (must equal the fed prefix).
+    /// Returns `(checkpoint id, displaced entries, deduped)` — the engine must
+    /// release the displaced entries' GPU cache refs, and on `deduped` it must
+    /// NOT take new refs (the existing entry already pins the same pages).
+    /// Fail-closed before any mutation of the slot (the fork seals the source's
+    /// packed records but never changes their bytes; the source keeps appending
+    /// to fresh blocks).
+    pub fn freeze_prefix(
+        &mut self,
+        slot: usize,
+        frontier: u32,
+        prefix_tokens: &[u32],
+    ) -> Result<(u64, Vec<PrefixCheckpoint>, bool), String> {
+        let st = self
+            .slots
+            .get(slot)
+            .ok_or_else(|| format!("kvmem: freeze_prefix slot {slot} out of range"))?;
+        if frontier == 0 || frontier % PREFIX_PAGE_TOKENS != 0 {
+            return Err(format!(
+                "kvmem freeze_prefix: frontier {frontier} must be a positive multiple of \
+                 {PREFIX_PAGE_TOKENS} (GPU sharing is page-granular)"
+            ));
+        }
+        if frontier > st.fed {
+            return Err(format!(
+                "kvmem freeze_prefix: frontier {frontier} exceeds fed {}",
+                st.fed
+            ));
+        }
+        if prefix_tokens.len() != frontier as usize {
+            return Err(format!(
+                "kvmem freeze_prefix: token proof len {} != frontier {frontier}",
+                prefix_tokens.len()
+            ));
+        }
+        let layout_id = layout_fingerprint(&self.raw_cfg);
+        let fingerprint = hipfire_runtime::checkpoint_pool::prefix_fingerprint(prefix_tokens);
+        // Dedup BEFORE forking/sealing: an identical frontier+proof already
+        // pins the same pages; a second archive would double the cache refs.
+        if let Some(existing) = self.prefix_catalog.find_exact(frontier, fingerprint) {
+            return Ok((existing, Vec::new(), true));
+        }
+        // Canonical archive: packed records become sealed shared sources;
+        // mean-K stays private to the archive; the branch is truncated to the
+        // frontier (core fork_prefix contract). The source store keeps its
+        // own mutable statistics for blocks beyond the frontier.
+        let canonical = st
+            .raw
+            .fork_prefix(frontier)
+            .map_err(|e| format!("kvmem freeze_prefix fork: {e}"))?;
+        let mean_tail = st
+            .raw
+            .mean_checkpoint(frontier)
+            .map_err(|e| format!("kvmem freeze_prefix mean checkpoint: {e}"))?;
+        let id = self.prefix_catalog.mint_id();
+        let entry = PrefixCheckpoint::new(
+            id,
+            frontier,
+            prefix_tokens.to_vec(),
+            mean_tail,
+            st.lw_incarnation,
+            layout_id,
+            canonical,
+        );
+        let (inserted, displaced) = self
+            .prefix_catalog
+            .insert_displacing(entry)
+            .map_err(|e| format!("kvmem freeze_prefix catalog: {e}"))?;
+        Ok((inserted.unwrap_or(id), displaced, false))
+    }
+
+    /// Look up the longest cataloged prefix fully proven by `prompt`.
+    /// Returns the checkpoint id (engine then validates + forks).
+    pub fn prefix_lookup(&mut self, prompt: &[u32]) -> Option<u64> {
+        self.prefix_catalog
+            .lookup(prompt, layout_fingerprint(&self.raw_cfg))
+    }
+
+    /// Read a cataloged checkpoint (engine attaches GPU pages / reads the
+    /// frontier + mean_tail for the DeltaNet restore pairing).
+    pub fn prefix_checkpoint(&self, id: u64) -> Option<&PrefixCheckpoint> {
+        self.prefix_catalog.get(id)
+    }
+
+    /// Mutable access (engine attaches `gpu_pages` after sealing + cache refs).
+    pub fn prefix_checkpoint_mut(&mut self, id: u64) -> Option<&mut PrefixCheckpoint> {
+        self.prefix_catalog.get_mut(id)
+    }
+
+    /// Remove a checkpoint, returning it so the engine can release its GPU
+    /// cache refs (session close / explicit release).
+    pub fn release_prefix(&mut self, id: u64) -> Option<PrefixCheckpoint> {
+        self.prefix_catalog.remove(id)
+    }
+
+    /// Pop the LRU checkpoint (admission pressure reclaim); the engine
+    /// releases its GPU cache refs. `None` when the catalog is empty.
+    pub fn pop_lru_prefix(&mut self) -> Option<PrefixCheckpoint> {
+        self.prefix_catalog.pop_lru()
+    }
+
+    /// P4.3 fed coordination: truncate slot `slot`'s host store to a
+    /// BLOCK-ALIGNED `frontier`. hipfire feeds mean-K as running sums only
+    /// (`add_mean_f32` keeps no raw rows), so a mid-block partial tail cannot
+    /// be reconstructed — the sum is irreversible. Block-aligned truncation
+    /// drops whole blocks and keeps every retained mean exact; a mid-block
+    /// reuse point refuses here and falls back to the cold rebuild (the
+    /// freeze granularity is page-aligned anyway, so restorable checkpoints
+    /// only ever exist at block-aligned frontiers).
+    /// The caller MUST have already restored the DeltaNet recurrent state to
+    /// the same frontier (the host store cannot rewind recurrent state — a
+    /// truncated KV paired with a stale DN state silently corrupts the
+    /// suffix). Legacy-only: Layerwise canonical views refuse truncation
+    /// until H4 wires the archive provenance.
+    pub fn truncate_slot(&mut self, slot: usize, frontier: u32) -> Result<(), String> {
+        if self.strategy.is_layerwise() {
+            return Err(
+                "kvmem truncate_slot: Layerwise canonical views refuse truncation (H4)"
+                    .to_string(),
+            );
+        }
+        if frontier % KV_BLOCK_TOKENS as u32 != 0 {
+            return Err(format!(
+                "kvmem truncate_slot: frontier {frontier} is not block-aligned \
+                 (sum-only mean-K cannot reconstruct a partial tail)"
+            ));
+        }
+        let st = self
+            .slots
+            .get_mut(slot)
+            .ok_or_else(|| format!("kvmem: truncate_slot slot {slot} out of range"))?;
+        if frontier > st.fed {
+            return Err(format!(
+                "kvmem truncate_slot: frontier {frontier} exceeds fed {}",
+                st.fed
+            ));
+        }
+        if frontier == st.fed {
+            return Ok(());
+        }
+        st.raw
+            .truncate_to(frontier)
+            .map_err(|e| format!("kvmem truncate_slot raw: {e}"))?;
+        st.kv
+            .truncate_to(frontier)
+            .map_err(|e| format!("kvmem truncate_slot kv: {e}"))?;
+        st.fed = frontier;
+        // The truncated store is a new selection baseline: force a fresh
+        // decision and drop the previous request's Q span.
+        st.last_select_full = 0;
+        st.first_decode_done = false;
+        st.q_ring_len = 0;
+        st.q_ring_cursor = 0;
         Ok(())
+    }
+
+    /// Reuse checkpoint `id` into `dst_slot`: validate the FULL provenance
+    /// (geometry + fingerprint + token proof) BEFORE any mutation, then fork
+    /// the canonical archive into a fresh branch (shared sealed packed KV,
+    /// branch-private mean-K), restore the partial-tail mean sum, and rebuild
+    /// the slot state at `fed = frontier` (incarnation bumped, all selection /
+    /// pressure / head state cleared — identical to a cold reset except the
+    /// reused prefix). Returns the frontier the suffix prefill starts from.
+    pub fn fork_prefix_into(
+        &mut self,
+        dst_slot: usize,
+        id: u64,
+        prompt: &[u32],
+    ) -> Result<u32, String> {
+        if dst_slot >= self.slots.len() {
+            return Err(format!("kvmem: fork_prefix_into slot {dst_slot} out of range"));
+        }
+        let ckpt = self
+            .prefix_catalog
+            .get(id)
+            .ok_or_else(|| format!("kvmem fork_prefix_into: checkpoint {id} not found"))?;
+        ckpt.validate_reuse(prompt, layout_fingerprint(&self.raw_cfg))
+            .map_err(|e| format!("kvmem fork_prefix_into: {e}"))?;
+        let frontier = ckpt.frontier;
+        let branch = ckpt
+            .canonical()
+            .fork_prefix(frontier)
+            .map_err(|e| format!("kvmem fork_prefix_into fork: {e}"))?;
+        if let Some(tail) = ckpt.mean_tail.as_ref() {
+            branch
+                .restore_mean_checkpoint(frontier, tail)
+                .map_err(|e| format!("kvmem fork_prefix_into mean restore: {e}"))?;
+        }
+        let kv = KvStore::new(&self.kv_cfg).map_err(|e| format!("kvmem store: {e}"))?;
+        kv.register_append(frontier)
+            .map_err(|e| format!("kvmem fork_prefix_into append: {e}"))?;
+        if let Some((_, keep)) = self.watermark {
+            kv.set_runtime_select_budget((keep * KV_BLOCK_TOKENS) as u32)
+                .map_err(|e| format!("kvmem watermark select budget: {e}"))?;
+        }
+        // A reused prefix is a NEW session: bump the incarnation so its
+        // canonical stamps never alias the source's (design §3.9g).
+        let lw_incarnation = self.slots[dst_slot].lw_incarnation + 1;
+        self.slots[dst_slot] = self.fresh_slot_state(branch, kv, frontier, frontier, lw_incarnation);
+        Ok(frontier)
     }
 
     /// Record that a request begins on `slot` (cold prefill or a
@@ -2529,7 +2768,25 @@ impl KvMemCtl {
                         }
                     } else if !bt.is_spilled(lp) {
                         match bt.physical(lp) {
-                            Some(phys) => spill.push((lp, phys)),
+                            Some(phys) => {
+                                // P4.3 prefix PIN: a page the pool refuses to
+                                // evict (shared-prefix cache refs, or any other
+                                // non-exclusive lease) is PIN resident — force
+                                // keep instead of spilling. `stage_out_page`
+                                // would fail closed on it anyway; keeping it
+                                // here turns that hard error into the intended
+                                // residency. With no pinned pages every page
+                                // is exclusively table-owned ⇒ byte-neutral.
+                                let evictable = pool
+                                    .page_pool()
+                                    .map(|pp| pp.page_evictable(phys))
+                                    .unwrap_or(true);
+                                if evictable {
+                                    spill.push((lp, phys));
+                                } else {
+                                    keep[lp] = true;
+                                }
+                            }
                             None => {
                                 return Err(format!(
                                     "kvmem slot {s}: logical page {lp} is neither \
@@ -4584,6 +4841,226 @@ mod tests {
                 .expect("legacy ctl");
         assert!(legacy.accept_head_append(0, 0, bt).is_err(), "Legacy");
 
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    // ── P4.3 KVMem-native prefix sharing (host model) ─────────────────────
+
+    /// Fill slot `slot` with `blocks` full blocks of deterministic mean-K +
+    /// packed K/V and advance `fed` (host-only; no GPU).
+    fn prefix_fill(ctl: &mut KvMemCtl, slot: usize, blocks: u32, seed: u32) {
+        let bt = KV_BLOCK_TOKENS as u32;
+        let k_width = ctl.raw_cfg.n_embd_k as usize;
+        let row_bytes = ctl.raw_cfg.k_gpu_row_bytes as usize;
+        for b in 0..blocks {
+            let pos0 = b * bt;
+            for il in 0..ctl.raw_cfg.n_layer {
+                let mut mean = Vec::with_capacity(bt as usize * k_width);
+                for t in 0..bt as usize {
+                    for d in 0..k_width {
+                        mean.push((seed as usize * 100003 + b as usize * 1009 + t * k_width + d
+                            + il as usize * 7) as f32);
+                    }
+                }
+                ctl.slots[slot].raw.write_layer_mean_k(pos0, bt, il, &mean).expect("mean k");
+                let mut rows = vec![0u8; bt as usize * row_bytes];
+                for (i, byte) in rows.iter_mut().enumerate() {
+                    *byte = ((seed as usize + b as usize + il as usize + i) % 251) as u8;
+                }
+                ctl.slots[slot].raw.write_layer_k_gpu(pos0, bt, il, &rows).expect("packed k");
+                ctl.slots[slot].raw.write_layer_v_gpu(pos0, bt, il, &rows).expect("packed v");
+            }
+        }
+        ctl.test_set_fed(slot, blocks * bt).expect("set fed");
+    }
+
+    fn prefix_tokens(n: usize, seed: u32) -> Vec<u32> {
+        (0..n as u32).map(|i| i.wrapping_mul(2654435761).wrapping_add(seed)).collect()
+    }
+
+    /// Host-only: freeze → cross-slot fork round-trips the prefix byte-exact
+    /// (packed shared, mean-K private), the branch starts at fed = frontier
+    /// with a bumped incarnation, and the source slot is untouched.
+    #[test]
+    fn prefix_freeze_fork_roundtrip() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let mut ctl =
+            KvMemCtl::new_with_strategy(2, &plan(), &geom(), RecallStrategy::Legacy)
+                .expect("ctl");
+        prefix_fill(&mut ctl, 0, 2, 1);
+        let toks = prefix_tokens(256, 1);
+        let (id, displaced, deduped) = ctl.freeze_prefix(0, 256, &toks).expect("freeze");
+        assert!(displaced.is_empty());
+        assert!(!deduped);
+        assert_eq!(ctl.prefix_checkpoint(id).expect("ckpt").frontier, 256);
+
+        // Reuse into slot 1 with a longer prompt (suffix to prefill).
+        let mut prompt = toks.clone();
+        prompt.extend_from_slice(&[7, 8, 9]);
+        let frontier = ctl.fork_prefix_into(1, id, &prompt).expect("fork");
+        assert_eq!(frontier, 256);
+        assert_eq!(ctl.fed_tokens(1), Some(256));
+        assert_eq!(ctl.slots[1].turn_start, 256);
+        assert_eq!(ctl.slots[1].lw_incarnation, ctl.slots[0].lw_incarnation + 1);
+
+        // Packed payload byte-exact through the shared sources.
+        let bt = KV_BLOCK_TOKENS as u32;
+        let row_bytes = ctl.raw_cfg.k_gpu_row_bytes as usize;
+        for il in 0..ctl.raw_cfg.n_layer {
+            let mut src = vec![0u8; bt as usize * row_bytes];
+            let mut dst = vec![0u8; bt as usize * row_bytes];
+            assert!(ctl.slots[0].raw.copy_k_gpu(1, il, &mut src, bt));
+            assert!(ctl.slots[1].raw.copy_k_gpu(1, il, &mut dst, bt));
+            assert_eq!(src, dst, "shared packed K block 1 layer {il}");
+            assert!(ctl.slots[0].raw.copy_v_gpu(1, il, &mut src, bt));
+            assert!(ctl.slots[1].raw.copy_v_gpu(1, il, &mut dst, bt));
+            assert_eq!(src, dst, "shared packed V block 1 layer {il}");
+        }
+        // Mean-K matches at fork, then diverges privately.
+        let k_width = ctl.raw_cfg.n_embd_k as usize;
+        let mut m0 = vec![0f32; k_width];
+        let mut m1 = vec![0f32; k_width];
+        ctl.slots[0].raw.mean_k(0, 0, &mut m0);
+        ctl.slots[1].raw.mean_k(0, 0, &mut m1);
+        assert_eq!(m0, m1, "mean-K equal at fork");
+        let overwrite = vec![42f32; bt as usize * k_width];
+        ctl.slots[1].raw.write_layer_mean_k(0, bt, 0, &overwrite).expect("branch mean");
+        ctl.slots[1].raw.mean_k(0, 0, &mut m1);
+        assert!(m1.iter().all(|&v| v == 42.0));
+        ctl.slots[0].raw.mean_k(0, 0, &mut m0);
+        assert!(m0.iter().any(|&v| v != 42.0), "source mean-K must stay private");
+        // Source fed untouched.
+        assert_eq!(ctl.fed_tokens(0), Some(256));
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// Host-only: freeze validates frontier alignment / fed bound / proof
+    /// length BEFORE any mutation; fork validates the FULL provenance.
+    #[test]
+    fn prefix_freeze_fork_fail_closed() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let mut ctl =
+            KvMemCtl::new_with_strategy(2, &plan(), &geom(), RecallStrategy::Legacy)
+                .expect("ctl");
+        prefix_fill(&mut ctl, 0, 2, 2);
+        let toks = prefix_tokens(256, 2);
+        assert!(ctl.freeze_prefix(0, 0, &toks[..0]).is_err(), "zero frontier");
+        assert!(ctl.freeze_prefix(0, 100, &toks[..100]).is_err(), "unaligned");
+        assert!(ctl.freeze_prefix(0, 384, &toks).is_err(), "frontier > fed");
+        assert!(ctl.freeze_prefix(0, 128, &toks).is_err(), "proof len != frontier");
+        assert!(ctl.freeze_prefix(99, 128, &toks[..128]).is_err(), "bad slot");
+        // Nothing cataloged by the failed attempts.
+        assert!(ctl.prefix_lookup(&toks).is_none());
+
+        let (id, _, _) = ctl.freeze_prefix(0, 256, &toks).expect("freeze");
+        // Bad provenance: flipped token / short prompt / unknown id / bad slot.
+        let mut bad = toks.clone();
+        bad[100] ^= 1;
+        assert!(ctl.fork_prefix_into(1, id, &bad).is_err(), "token proof");
+        assert!(ctl.fork_prefix_into(1, id, &toks[..128]).is_err(), "short prompt");
+        assert!(ctl.fork_prefix_into(1, id + 100, &toks).is_err(), "unknown ckpt");
+        assert!(ctl.fork_prefix_into(99, id, &toks).is_err(), "bad slot");
+        // The refused forks left slot 1 cold.
+        assert_eq!(ctl.fed_tokens(1), Some(0));
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// Host-only: an identical frontier+proof dedups (same id, no second
+    /// archive, deduped flag set so the engine never doubles GPU cache refs).
+    #[test]
+    fn prefix_freeze_dedup() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let mut ctl =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
+                .expect("ctl");
+        prefix_fill(&mut ctl, 0, 1, 3);
+        let toks = prefix_tokens(128, 3);
+        let (id1, _, dup1) = ctl.freeze_prefix(0, 128, &toks).expect("freeze 1");
+        let (id2, displaced, dup2) = ctl.freeze_prefix(0, 128, &toks).expect("freeze 2");
+        assert!(!dup1);
+        assert!(dup2);
+        assert_eq!(id1, id2);
+        assert!(displaced.is_empty());
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// Host-only: the bounded catalog evicts LRU entries and hands them back
+    /// for GPU cache-ref release; lookup picks the longest proven prefix.
+    #[test]
+    fn prefix_catalog_eviction_and_lookup() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let mut ctl =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
+                .expect("ctl");
+        // Five DISTINCT 128-token prefixes (different proofs) into a bound-4
+        // catalog: the fifth freeze displaces the first.
+        let mut ids = Vec::new();
+        for seed in 0..5u32 {
+            ctl.reset_slot(0).expect("reset");
+            prefix_fill(&mut ctl, 0, 1, 10 + seed);
+            let toks = prefix_tokens(128, 10 + seed);
+            let (id, displaced, dup) = ctl.freeze_prefix(0, 128, &toks).expect("freeze");
+            assert!(!dup);
+            if seed < 4 {
+                assert!(displaced.is_empty(), "no eviction before the bound");
+            } else {
+                assert_eq!(displaced.len(), 1);
+                assert_eq!(displaced[0].id, ids[0], "LRU victim is the first entry");
+            }
+            ids.push(id);
+        }
+        assert!(ctl.prefix_checkpoint(ids[0]).is_none(), "evicted");
+        assert!(ctl.prefix_checkpoint(ids[4]).is_some());
+        // Lookup proves the newest prefix; a foreign prompt misses.
+        let toks = prefix_tokens(128, 14);
+        assert_eq!(ctl.prefix_lookup(&toks), Some(ids[4]));
+        assert_eq!(ctl.prefix_lookup(&prefix_tokens(128, 99)), None);
+        // Explicit release hands the entry back.
+        let released = ctl.release_prefix(ids[4]).expect("release");
+        assert_eq!(released.frontier, 128);
+        assert!(ctl.prefix_lookup(&toks).is_none());
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// Host-only: truncate_slot rewinds the host store to a BLOCK-ALIGNED
+    /// frontier (whole blocks dropped, retained means exact); a mid-block
+    /// frontier refuses (sum-only mean-K cannot reconstruct a partial tail).
+    /// Layerwise refuses (H4).
+    #[test]
+    fn prefix_truncate_slot_block_aligned() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let mut ctl =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
+                .expect("ctl");
+        prefix_fill(&mut ctl, 0, 2, 5);
+        let bt = KV_BLOCK_TOKENS as u32;
+        // Mid-block frontier refuses (partial tail irreconstructible).
+        assert!(ctl.truncate_slot(0, bt + 64).is_err(), "mid-block refuses");
+        assert_eq!(ctl.fed_tokens(0), Some(2 * bt), "refusal leaves fed intact");
+        // Block-aligned truncation drops block 1, keeps block 0's mean exact.
+        ctl.truncate_slot(0, bt).expect("truncate");
+        assert_eq!(ctl.fed_tokens(0), Some(bt));
+        let k_width = ctl.raw_cfg.n_embd_k as usize;
+        assert_eq!(ctl.slots[0].raw.mean_k_tokens(0, 0), bt);
+        let mut mean = vec![0f32; k_width];
+        ctl.slots[0].raw.mean_k(0, 0, &mut mean);
+        // prefix_fill seed 5, block 0, layer 0: value = 5*100003 + t*k_width + d.
+        let expect: f32 = (0..bt as usize)
+            .map(|t| (5 * 100003 + t * k_width) as f32)
+            .sum::<f32>()
+            / bt as f32;
+        assert!((mean[0] - expect).abs() < 1e-3, "retained mean: {} vs {expect}", mean[0]);
+        // The block repository rewound too.
+        assert_eq!(ctl.slots[0].kv.total_tokens(), bt);
+        // Idempotent at the same frontier; over-frontier refuses.
+        ctl.truncate_slot(0, bt).expect("noop truncate");
+        assert!(ctl.truncate_slot(0, bt + 1).is_err(), "frontier > fed");
+        // Layerwise refuses truncation (canonical views, H4).
+        let mut lw =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("lw ctl");
+        prefix_fill(&mut lw, 0, 1, 6);
+        assert!(lw.truncate_slot(0, bt).is_err(), "Layerwise refuses");
         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
     }
 }

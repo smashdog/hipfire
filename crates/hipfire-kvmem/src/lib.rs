@@ -128,6 +128,11 @@ struct HkRawStore {
 }
 
 #[repr(C)]
+struct HkPackedSnapshot {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
 struct HkKvStore {
     _private: [u8; 0],
 }
@@ -1054,6 +1059,42 @@ mod ffi {
             len: usize,
         );
 
+        // P4.3 KVMem-native prefix fork / packed exchange.
+        pub fn hk_raw_store_fork_prefix(st: *mut HkRawStore, token_pos: u32) -> *mut HkRawStore;
+        pub fn hk_raw_store_fork_mean_prefix(
+            st: *const HkRawStore,
+            token_pos: u32,
+        ) -> *mut HkRawStore;
+        pub fn hk_raw_store_export_packed(
+            st: *mut HkRawStore,
+            selections: *const PackedSelection,
+            n_selections: usize,
+            metadata_limit: usize,
+        ) -> *mut HkPackedSnapshot;
+        pub fn hk_raw_store_import_packed(
+            st: *mut HkRawStore,
+            snapshot: *mut HkPackedSnapshot,
+            metadata_limit: usize,
+        );
+        pub fn hk_packed_snapshot_destroy(snap: *mut HkPackedSnapshot);
+        pub fn hk_packed_snapshot_entry_count(snap: *const HkPackedSnapshot) -> usize;
+        pub fn hk_packed_snapshot_metadata_bytes(snap: *const HkPackedSnapshot) -> usize;
+
+        // P4.3 prefix reuse anchors (core prefix_checkpoint).
+        pub fn hk_prefix_anchor(
+            base: u64,
+            lcp: u64,
+            query: u64,
+            indivisible: *const PrefixRange,
+            n_groups: usize,
+        ) -> u64;
+        pub fn hk_prefix_restore_limit(
+            lcp: u64,
+            live: u64,
+            eval_end: u64,
+            needs_logits: c_int,
+        ) -> u64;
+
         pub fn hk_kv_store_create(cfg: *const KvStoreConfig) -> *mut HkKvStore;
         pub fn hk_kv_store_destroy(ks: *mut HkKvStore);
         pub fn hk_kv_store_register_append(ks: *mut HkKvStore, n_new_tokens: u32);
@@ -1968,6 +2009,113 @@ impl RawStore {
             ffi::hk_raw_store_restore_mean_checkpoint(p, token_pos, state.as_ptr(), state.len())
         })
     }
+
+    /// P4.3: fork a branch sharing the prefix's sealed packed GPU sources (raw
+    /// rows + mutable statistics stay private to the branch). Caller drains
+    /// native writers first. The returned store is independently owned.
+    pub fn fork_prefix(&self, token_pos: u32) -> Result<RawStore> {
+        clear_error();
+        let ptr = unsafe { ffi::hk_raw_store_fork_prefix(self.ptr.as_ptr(), token_pos) };
+        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
+    }
+
+    /// P4.3: fork a branch copying ONLY the mean-K index (no raw/packed KV); the
+    /// branch's payload lives in its separately shared page archive.
+    pub fn fork_mean_prefix(&self, token_pos: u32) -> Result<RawStore> {
+        clear_error();
+        let ptr = unsafe { ffi::hk_raw_store_fork_mean_prefix(self.ptr.as_ptr(), token_pos) };
+        NonNull::new(ptr).map(|ptr| Self { ptr }).ok_or_else(err_from_last)
+    }
+
+    /// P4.3: export the selected packed records into an immutable snapshot.
+    pub fn export_packed(
+        &self,
+        selections: &[PackedSelection],
+        metadata_limit: usize,
+    ) -> Result<PackedSnapshot> {
+        clear_error();
+        let ptr = unsafe {
+            ffi::hk_raw_store_export_packed(
+                self.ptr.as_ptr(),
+                selections.as_ptr(),
+                selections.len(),
+                metadata_limit,
+            )
+        };
+        NonNull::new(ptr)
+            .map(|ptr| PackedSnapshot { ptr })
+            .ok_or_else(err_from_last)
+    }
+
+    /// P4.3: atomically replace ALL packed bindings from a snapshot (consumes it).
+    pub fn import_packed(&self, snapshot: PackedSnapshot, metadata_limit: usize) -> Result<()> {
+        let p = self.ptr.as_ptr();
+        let snap = snapshot.ptr.as_ptr();
+        // The shim moves out of the snapshot; forget the Rust owner so Drop does
+        // not double-free the consumed handle.
+        std::mem::forget(snapshot);
+        checked(|| unsafe { ffi::hk_raw_store_import_packed(p, snap, metadata_limit) })
+    }
+}
+
+/// P4.3 packed-record selection descriptor (mirrors `hk_packed_selection`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PackedSelection {
+    pub block: u32,
+    pub layer: u32,
+    pub valid_tokens: u32,
+}
+
+/// P4.3 immutable packed-record snapshot (owns `hk_packed_snapshot`).
+pub struct PackedSnapshot {
+    ptr: NonNull<HkPackedSnapshot>,
+}
+
+impl PackedSnapshot {
+    pub fn entry_count(&self) -> usize {
+        unsafe { ffi::hk_packed_snapshot_entry_count(self.ptr.as_ptr()) }
+    }
+    pub fn metadata_bytes(&self) -> usize {
+        unsafe { ffi::hk_packed_snapshot_metadata_bytes(self.ptr.as_ptr()) }
+    }
+}
+
+impl Drop for PackedSnapshot {
+    fn drop(&mut self) {
+        unsafe { ffi::hk_packed_snapshot_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+/// P4.3 indivisible input group (mirrors `hk_prefix_range` / `kvmem::PrefixRange`):
+/// a reusable-prefix anchor must not split `[begin, end)`. Vision token spans
+/// are the typical groups.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct PrefixRange {
+    pub begin: u64,
+    pub end: u64,
+}
+
+/// P4.3 reusable-prefix anchor (core `kvmem::prefix_anchor`): clamp the observed
+/// LCP into `[base, query]` and floor it to input-group boundaries. Errors when
+/// `query < base`, a group is invalid, or a group would be split below `base`.
+pub fn prefix_anchor(base: u64, lcp: u64, query: u64, indivisible: &[PrefixRange]) -> Result<u64> {
+    clear_error();
+    let anchor = unsafe {
+        ffi::hk_prefix_anchor(base, lcp, query, indivisible.as_ptr(), indivisible.len())
+    };
+    if anchor == u64::MAX {
+        Err(err_from_last())
+    } else {
+        Ok(anchor)
+    }
+}
+
+/// P4.3 restorable frontier (core `kvmem::prefix_restore_limit`):
+/// `min(lcp, live, eval_end - needs_logits)`. Pure arithmetic, never fails.
+pub fn prefix_restore_limit(lcp: u64, live: u64, eval_end: u64, needs_logits: bool) -> u64 {
+    unsafe { ffi::hk_prefix_restore_limit(lcp, live, eval_end, c_int::from(needs_logits)) }
 }
 
 impl Drop for RawStore {
@@ -1975,6 +2123,7 @@ impl Drop for RawStore {
         unsafe { ffi::hk_raw_store_destroy(self.ptr.as_ptr()) };
     }
 }
+
 
 /// Block repository + working-set selection for one engine sequence.
 pub struct KvStore {
