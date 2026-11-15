@@ -1317,12 +1317,17 @@ impl KvMemCtl {
         output_tokens: u64,
         frontier: u32,
     ) -> Result<ImportStart, String> {
+        // ninfer `state.visible_tokens` is the native extent at request start;
+        // hipfire's Layerwise driver materializes a compact view of at most the
+        // resident budget B, while the logical history may be longer.
+        let visible = (frontier as u64).min((self.budget_blocks as u64) * KV_BLOCK_TOKENS as u64);
         layerwise_import_admission(
             prompt_end,
             output_tokens,
             self.window_capacity_tokens(),
             self.gen_reserve,
             frontier,
+            visible,
         )
     }
 
@@ -1491,6 +1496,20 @@ impl KvMemCtl {
         let hit = self
             .prefix_catalog
             .lookup(prompt, layout_fingerprint(&self.raw_cfg));
+        if hit.is_some() {
+            self.prefix_hits_total += 1;
+        } else {
+            self.prefix_misses_total += 1;
+        }
+        hit
+    }
+
+    /// Look up the longest cataloged prefix fully proven by `prompt` whose
+    /// frontier is at most `max_frontier` (import narrowing fallback).
+    pub fn prefix_lookup_capped(&mut self, prompt: &[u32], max_frontier: u32) -> Option<u64> {
+        let hit = self
+            .prefix_catalog
+            .lookup_at_most(prompt, layout_fingerprint(&self.raw_cfg), max_frontier);
         if hit.is_some() {
             self.prefix_hits_total += 1;
         } else {
@@ -3545,6 +3564,7 @@ pub fn layerwise_import_admission(
     capacity_tokens: u64,
     gen_reserve: u64,
     frontier: u32,
+    visible_tokens: u64,
 ) -> Result<ImportStart, String> {
     let envelope = WindowEnvelope {
         prompt_end,
@@ -3562,7 +3582,7 @@ pub fn layerwise_import_admission(
     };
     let plan = WindowPlan::new(&envelope, capacity_tokens)
         .map_err(|e| format!("kvmem import window: {e}"))?;
-    plan.import_plan(WindowState { history: frontier as u64, visible_tokens: frontier as u64 })
+    plan.import_plan(WindowState { history: frontier as u64, visible_tokens })
         .map_err(|e| format!("kvmem import plan: {e}"))
 }
 
@@ -5248,24 +5268,25 @@ mod tests {
     #[test]
     fn import_admission_maps_ninfer_window_semantics() {
         // Non-pressure: the exact prefix starts inside the window.
-        let ok = layerwise_import_admission(1024, 64, 4096 + 1024, 1024, 1024).expect("import");
+        let ok = layerwise_import_admission(1024, 64, 4096 + 1024, 1024, 1024, 1024).expect("import");
         assert!(!ok.pressure());
         assert_eq!(ok.budget_tokens, 4096);
         assert_eq!(ok.restore_tokens, 1024);
         assert_eq!(ok.selection_budget, 0, "exact import keeps ordinary selection");
 
-        // Prefill-probe overflow: visible extent exceeds the prefill boundary.
-        let probe = layerwise_import_admission(4096, 64, 1024 + 1024, 1024, 2048).expect("import");
+        // Prefill-probe overflow: a small generation reserve puts the prefill
+        // boundary below the compact visible extent.
+        let probe = layerwise_import_admission(4096, 64, 1024 + 128, 128, 2048, 1024).expect("import");
         assert!(probe.prefill_probe_overflow, "{probe:?}");
         assert!(probe.pressure());
         assert_eq!(probe.budget_tokens, 1024);
         assert_eq!(probe.restore_tokens, 1024, "narrows the imported extent");
 
         // Terminal reserve overflow also narrows the exact prefix.
-        let term = layerwise_import_admission(2048, 512, 1024 + 1024, 1024, 2048).expect("import");
+        let term = layerwise_import_admission(2048, 512, 1024 + 128, 128, 2048, 1024).expect("import");
         assert!(term.terminal_reserve_overflow, "{term:?}");
-        assert_eq!(term.budget_tokens, 1024);
-        assert_eq!(term.restore_tokens, 1024);
+        assert_eq!(term.budget_tokens, 512);
+        assert_eq!(term.restore_tokens, 512);
         assert!(term.restore_tokens < 2048, "this is the narrowing case");
     }
 
