@@ -4882,6 +4882,10 @@ fn run_loop(
                 if let Some(pp) = rig.pool.page_pool() {
                     st.note_pool_pages(pp.free_pages(), pp.n_pages());
                 }
+                #[cfg(feature = "kvmem")]
+                if let Some(kvmem) = rig.model.kvmem.as_ref() {
+                    st.note_kvmem(kvmem.stats());
+                }
                 st.note_swap(&rig.swap);
             }
             // Expire timed-out waiters → typed queue timeout rejection. The

@@ -539,6 +539,115 @@ impl Metrics {
                 "Prompt tokens reused from the multi-slot cross-session prefix cache.",
                 s.reused_tokens as u64,
             );
+
+            // KVMem host-offload snapshot (one aggregate over every slot's
+            // host stores). Refreshed from the live controller each engine
+            // step; a non-KVMem engine leaves `enabled` false and exports
+            // nothing, so the series never aliases the swap tier.
+            if s.kvmem.enabled {
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_enabled",
+                    "1 when the multi-slot engine runs the KVMem host-offload controller.",
+                    1.0,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_layerwise",
+                    "1 when the KVMem controller runs the Layerwise per-layer recall strategy.",
+                    flag(s.kvmem.layerwise),
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_host_bytes",
+                    "KVMem host storage charged bytes (live + sealed payload + metadata).",
+                    s.kvmem.host_charged_bytes as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_disk_bytes",
+                    "KVMem host storage spilled to the disk tier.",
+                    s.kvmem.disk_bytes as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_payload_bytes",
+                    "Packed KV payload bytes held by the per-slot KVMem host stores.",
+                    s.kvmem.payload_bytes as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_blocks",
+                    "Logical KV blocks across every slot's KVMem policy store.",
+                    s.kvmem.blocks as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_tokens",
+                    "Tokens represented across every slot's KVMem policy store.",
+                    s.kvmem.tokens as f64,
+                );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_spill_pages_total",
+                    "Full pages spilled from GPU to the KVMem host store since start.",
+                    s.kvmem.spill_pages,
+                );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_restore_pages_total",
+                    "Full pages restored from the KVMem host store to GPU since start.",
+                    s.kvmem.restore_pages,
+                );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_spill_bytes_total",
+                    "Packed KV bytes spilled from GPU to the KVMem host store since start.",
+                    s.kvmem.spill_bytes,
+                );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_restore_bytes_total",
+                    "Packed KV bytes restored from the KVMem host store to GPU since start.",
+                    s.kvmem.restore_bytes,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_prefix_entries",
+                    "Frozen prefix checkpoints in the KVMem catalog.",
+                    s.kvmem.prefix_entries as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_prefix_pinned_pages",
+                    "GPU pages pinned resident by frozen KVMem prefix checkpoints.",
+                    s.kvmem.prefix_pinned_pages as f64,
+                );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_prefix_freezes_total",
+                    "Prefix checkpoints newly frozen into the KVMem catalog.",
+                    s.kvmem.prefix_freezes,
+                );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_prefix_hits_total",
+                    "KVMem prefix lookups served from the catalog.",
+                    s.kvmem.prefix_hits,
+                );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_prefix_misses_total",
+                    "KVMem prefix lookups that found no provable checkpoint.",
+                    s.kvmem.prefix_misses,
+                );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_prefix_evictions_total",
+                    "Frozen prefix checkpoints displaced by the LRU bound or admission reclaim.",
+                    s.kvmem.prefix_evictions,
+                );
+            }
         }
 
         // Multi-slot swap tier, from the last daemon `done` (or the CLI seed
@@ -943,6 +1052,48 @@ mod tests {
         ] {
             assert!(out.contains(sample), "{sample}: {out}");
         }
+        // KVMem series stay absent when the daemon snapshot has no controller
+        // (old wire object: the field defaults to `enabled: false`).
+        assert!(!out.contains("hipfire_kvmem"), "{out}");
+        let kvwire = serde_json::json!({
+            "total_slots": 1, "active_slots": 1,
+            "kvmem": {
+                "enabled": true, "layerwise": true,
+                "host_charged_bytes": 2048, "disk_bytes": 1024,
+                "payload_bytes": 4096, "blocks": 8, "tokens": 1024,
+                "spill_pages": 3, "restore_pages": 2,
+                "spill_bytes": 6144, "restore_bytes": 4096,
+                "prefix_entries": 2, "prefix_pinned_pages": 16,
+                "prefix_freezes": 5, "prefix_hits": 4,
+                "prefix_misses": 6, "prefix_evictions": 1,
+            },
+        });
+        let kvmeta = ServeMeta {
+            engine_stats: Some(serde_json::from_value(kvwire).unwrap()),
+            ..ServeMeta::new("t".to_owned())
+        };
+        let out = m.render(&kvmeta, 0, 16);
+        for sample in [
+            "hipfire_kvmem_enabled 1\n",
+            "hipfire_kvmem_layerwise 1\n",
+            "hipfire_kvmem_host_bytes 2048\n",
+            "hipfire_kvmem_disk_bytes 1024\n",
+            "hipfire_kvmem_payload_bytes 4096\n",
+            "hipfire_kvmem_blocks 8\n",
+            "hipfire_kvmem_tokens 1024\n",
+            "hipfire_kvmem_spill_pages_total 3\n",
+            "hipfire_kvmem_restore_pages_total 2\n",
+            "hipfire_kvmem_spill_bytes_total 6144\n",
+            "hipfire_kvmem_restore_bytes_total 4096\n",
+            "hipfire_kvmem_prefix_entries 2\n",
+            "hipfire_kvmem_prefix_pinned_pages 16\n",
+            "hipfire_kvmem_prefix_freezes_total 5\n",
+            "hipfire_kvmem_prefix_hits_total 4\n",
+            "hipfire_kvmem_prefix_misses_total 6\n",
+            "hipfire_kvmem_prefix_evictions_total 1\n",
+        ] {
+            assert!(out.contains(sample), "{sample}: {out}");
+        }
         // Standard route: no snapshot, no series (not zeros).
         let standard = m.render(&ServeMeta::new("t".to_owned()), 0, 16);
         for name in [
@@ -950,6 +1101,7 @@ mod tests {
             "hipfire_slots_",
             "hipfire_evictions",
             "hipfire_prefix_",
+            "hipfire_kvmem",
         ] {
             assert!(!standard.contains(name), "{name}: {standard}");
         }
