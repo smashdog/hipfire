@@ -1841,6 +1841,26 @@ impl KvMemCtl {
     /// the current sealed history defensively. No-op when out of range. Legacy
     /// never calls it (the keep-set stays empty).
     pub fn set_layerwise_keep_set(&mut self, slot: usize, keep: Vec<Vec<u64>>) {
+        // D3-A S3 attribution trace (opt-in): the per-layer keep-set is the
+        // refinement input that decides which pages each FA layer attends.
+        if env_flag("HIPFIRE_KVMEM_TRACE_KEEP") {
+            let mut line = String::new();
+            for (i, ids) in keep.iter().enumerate() {
+                line.push_str(&format!(" L{i}:"));
+                for (j, id) in ids.iter().enumerate() {
+                    if j > 0 {
+                        line.push(',');
+                    }
+                    line.push_str(&id.to_string());
+                }
+            }
+            eprintln!(
+                "[kvmem-keep] slot {slot} ordinals={} per_layer={}{}",
+                keep.len(),
+                keep.first().map(|v| v.len()).unwrap_or(0),
+                line
+            );
+        }
         if let Some(st) = self.slots.get_mut(slot) {
             st.lw_keep = keep;
         }
