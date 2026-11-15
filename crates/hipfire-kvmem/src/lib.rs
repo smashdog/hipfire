@@ -1846,6 +1846,47 @@ mod ffi {
             out: *mut usize,
             out_capacity: usize,
         ) -> usize;
+
+        // ── content cache policy ──
+        pub fn hk_cache_owner_resolve(
+            hints: *const CacheOwnerHints,
+            out: *mut c_char,
+            out_capacity: usize,
+        ) -> c_int;
+        pub fn hk_content_rank_candidates(
+            input: *const ContentCandidate,
+            n: usize,
+            new_user_query: c_int,
+            max_candidates: usize,
+            out: *mut ContentCandidate,
+            out_capacity: usize,
+        ) -> usize;
+        pub fn hk_content_snapshot_covers(
+            incoming: *const u64,
+            incoming_count: usize,
+            previous: *const u64,
+            previous_count: usize,
+        ) -> c_int;
+        pub fn hk_content_publication(
+            slots: *const ContentSlot,
+            n: usize,
+            max_entries: usize,
+            incoming_identity: u64,
+            reason: *mut c_int,
+        ) -> c_int;
+        pub fn hk_content_eviction(slots: *const ContentSlot, n: usize) -> c_int;
+        pub fn hk_content_group_publication(
+            slots: *const ContentSlot,
+            n: usize,
+            max_entries: usize,
+            max_groups: usize,
+            incoming_group: u64,
+            out_slot: *mut usize,
+            out_reason: *mut c_int,
+            retired_out: *mut usize,
+            retired_capacity: usize,
+            out_retired_count: *mut usize,
+        ) -> c_int;
     }
 }
 
@@ -4511,4 +4552,238 @@ pub fn retain_checkpoint_coverage(
     }
     out.truncate(written.min(out.len()));
     Ok(out)
+}
+
+// ── content cache policy: safe wrappers ──
+
+#[repr(C)]
+struct CacheOwnerHints {
+    conversation: *const c_char,
+    prompt: *const c_char,
+    sdk_prompt: *const c_char,
+    legacy_session: *const c_char,
+}
+
+/// Adapter-supplied candidate metadata (native eligibility is the caller's
+/// proof; this struct carries only the ranking inputs).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContentCandidate {
+    pub slot: u64,
+    pub frontier: u64,
+    pub cold_bytes: u64,
+    pub last_used: u64,
+    pub continuation: c_int,
+}
+
+/// Directory slot metadata; `identity == 0` means an empty/unsealed slot.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContentSlot {
+    pub occupied: c_int,
+    pub pinned: c_int,
+    pub last_used: u64,
+    pub identity: u64,
+    pub group: u64,
+}
+
+/// Mirrors `kvmem::ContentPublicationReason` (append-only ordinals).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PublicationReason {
+    Inserted = 0,
+    Replaced = 1,
+    Deduplicated = 2,
+    Disabled = 3,
+    AllPinned = 4,
+    MetadataLimit = 5,
+    Incomplete = 6,
+}
+
+impl PublicationReason {
+    pub fn from_ordinal(v: i32) -> Option<Self> {
+        match v {
+            0 => Some(Self::Inserted),
+            1 => Some(Self::Replaced),
+            2 => Some(Self::Deduplicated),
+            3 => Some(Self::Disabled),
+            4 => Some(Self::AllPinned),
+            5 => Some(Self::MetadataLimit),
+            6 => Some(Self::Incomplete),
+            _ => None,
+        }
+    }
+}
+
+fn cstring(value: Option<&str>) -> Result<Option<CString>> {
+    value
+        .map(|v| CString::new(v).map_err(|e| KvMemError(format!("cache owner: {e}"))))
+        .transpose()
+}
+
+/// Resolve the cache owner exactly like the core: conversation wins, the two
+/// prompt keys must agree, an empty prompt key is ignored, and a legacy
+/// session label is accepted only up to 256 bytes.
+pub fn resolve_cache_owner(
+    conversation: Option<&str>,
+    prompt: Option<&str>,
+    sdk_prompt: Option<&str>,
+    legacy_session: Option<&str>,
+) -> Result<Option<String>> {
+    let c = cstring(conversation)?;
+    let p = cstring(prompt)?;
+    let s = cstring(sdk_prompt)?;
+    let l = cstring(legacy_session)?;
+    let hints = CacheOwnerHints {
+        conversation: c.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
+        prompt: p.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
+        sdk_prompt: s.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
+        legacy_session: l.as_ref().map_or(ptr::null(), |v| v.as_ptr()),
+    };
+    let mut buf = vec![0i8; 300];
+    clear_error();
+    match unsafe { ffi::hk_cache_owner_resolve(&hints, buf.as_mut_ptr(), buf.len()) } {
+        1 => {
+            let s = unsafe { CStr::from_ptr(buf.as_ptr()) };
+            Ok(Some(s.to_string_lossy().into_owned()))
+        }
+        0 => Ok(None),
+        _ => Err(err_from_last()),
+    }
+}
+
+/// Rank candidates (filter unproven zeros, continuation-only unless a new user
+/// query, then frontier desc / cold_bytes asc / last_used desc / slot asc).
+pub fn rank_content_candidates(
+    candidates: &[ContentCandidate],
+    new_user_query: bool,
+    max_candidates: usize,
+) -> Result<Vec<ContentCandidate>> {
+    clear_error();
+    let n = unsafe {
+        ffi::hk_content_rank_candidates(
+            candidates.as_ptr(),
+            candidates.len(),
+            new_user_query as c_int,
+            max_candidates,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if n == usize::MAX {
+        return Err(err_from_last());
+    }
+    let mut out = vec![ContentCandidate::default(); n];
+    let written = unsafe {
+        ffi::hk_content_rank_candidates(
+            candidates.as_ptr(),
+            candidates.len(),
+            new_user_query as c_int,
+            max_candidates,
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    };
+    if written == usize::MAX {
+        return Err(err_from_last());
+    }
+    out.truncate(written.min(out.len()));
+    Ok(out)
+}
+
+/// True when `incoming` covers every previous origin (nonempty, no zero IDs).
+pub fn content_snapshot_covers(incoming: &[u64], previous: &[u64]) -> bool {
+    unsafe { ffi::hk_content_snapshot_covers(incoming.as_ptr(), incoming.len(), previous.as_ptr(), previous.len()) == 1 }
+}
+
+/// Choose the directory slot for one publication. `None` means publish nothing
+/// (the reason explains why); a returned index equal to `slots.len()` appends.
+pub fn select_content_publication(
+    slots: &[ContentSlot],
+    max_entries: usize,
+    incoming_identity: Option<u64>,
+) -> Result<(Option<usize>, PublicationReason)> {
+    let mut reason = 0i32;
+    clear_error();
+    let slot = unsafe {
+        ffi::hk_content_publication(
+            slots.as_ptr(),
+            slots.len(),
+            max_entries,
+            incoming_identity.unwrap_or(0),
+            &mut reason,
+        )
+    };
+    if let Some(e) = last_error() {
+        return Err(KvMemError(e));
+    }
+    let slot = if slot < 0 { None } else { Some(slot as usize) };
+    let reason = PublicationReason::from_ordinal(reason)
+        .ok_or_else(|| KvMemError(format!("unknown publication reason {reason}")))?;
+    Ok((slot, reason))
+}
+
+/// Eviction victim (redundant group versions first, then LRU); `None` when
+/// nothing is evictable.
+pub fn select_content_eviction(slots: &[ContentSlot]) -> Result<Option<usize>> {
+    clear_error();
+    let v = unsafe { ffi::hk_content_eviction(slots.as_ptr(), slots.len()) };
+    if let Some(e) = last_error() {
+        return Err(KvMemError(e));
+    }
+    Ok(if v < 0 { None } else { Some(v as usize) })
+}
+
+/// Group-aware publication: chosen slot (or `slots.len()` = append), reason and
+/// the retired slots that must be released.
+pub fn plan_content_group_publication(
+    slots: &[ContentSlot],
+    max_entries: usize,
+    max_groups: usize,
+    incoming_group: u64,
+) -> Result<(Option<usize>, PublicationReason, Vec<usize>)> {
+    let mut slot = usize::MAX;
+    let mut reason = 0i32;
+    let mut count = 0usize;
+    clear_error();
+    let rc = unsafe {
+        ffi::hk_content_group_publication(
+            slots.as_ptr(),
+            slots.len(),
+            max_entries,
+            max_groups,
+            incoming_group,
+            &mut slot,
+            &mut reason,
+            ptr::null_mut(),
+            0,
+            &mut count,
+        )
+    };
+    if rc != 0 {
+        return Err(err_from_last());
+    }
+    let mut retired = vec![0usize; count];
+    let rc = unsafe {
+        ffi::hk_content_group_publication(
+            slots.as_ptr(),
+            slots.len(),
+            max_entries,
+            max_groups,
+            incoming_group,
+            &mut slot,
+            &mut reason,
+            retired.as_mut_ptr(),
+            retired.len(),
+            &mut count,
+        )
+    };
+    if rc != 0 {
+        return Err(err_from_last());
+    }
+    retired.truncate(count.min(retired.len()));
+    let slot = if slot == usize::MAX { None } else { Some(slot) };
+    let reason = PublicationReason::from_ordinal(reason)
+        .ok_or_else(|| KvMemError(format!("unknown publication reason {reason}")))?;
+    Ok((slot, reason, retired))
 }
