@@ -54,6 +54,7 @@ use rdna_compute::layerwise_pool::{mtp_auxiliary_capacity, mtp_head_pool, Layerw
 use rdna_compute::page_pool::SPILLED_PAGE;
 use rdna_compute::slot_pool::{SlotId, SlotPool};
 use rdna_compute::{Gpu, GpuTensor};
+use saddle_core::kv::KvMode;
 
 use crate::kvmem_taps::KvMemTaps;
 use crate::kvmem_prefix::{layout_fingerprint, PrefixCatalog, PrefixCheckpoint, PREFIX_PAGE_TOKENS};
@@ -513,6 +514,10 @@ pub struct KvMemGeometry {
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
+    /// P4.4: the KV tier this controller's geometry resolves to. The layerwise
+    /// layout adapter registers a per-tier format identity from it (format
+    /// isolation); Legacy carries it for the same admission/identity purpose.
+    pub kv_mode: KvMode,
     /// K arena bytes per position (packed Q8 row of one KV head set).
     pub per_pos_bytes: usize,
     /// V arena bytes per position.
@@ -794,6 +799,8 @@ pub struct KvMemCtl {
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    /// P4.4: KV tier (per-tier layerwise format identity + admission).
+    kv_mode: KvMode,
     q_width: usize,
     k_page_bytes: usize,
     v_page_bytes: usize,
@@ -1137,6 +1144,7 @@ impl KvMemCtl {
             n_heads: geom.n_heads,
             n_kv_heads: geom.n_kv_heads,
             head_dim: geom.head_dim,
+            kv_mode: geom.kv_mode,
             q_width,
             k_page_bytes: KV_BLOCK_TOKENS * geom.per_pos_bytes,
             v_page_bytes: KV_BLOCK_TOKENS * geom.per_pos_v_bytes,
@@ -1174,6 +1182,12 @@ impl KvMemCtl {
             // count ceiling (H5 exposes the env knob).
             prefix_catalog: PrefixCatalog::new(4),
         })
+    }
+
+    /// P4.4: the KV tier this controller resolves to (per-tier layerwise format
+    /// identity + admission). The layout adapter and backend identity read it.
+    pub fn kv_mode(&self) -> KvMode {
+        self.kv_mode
     }
 
     /// Resolved recall execution model (`HIPFIRE_KVMEM_RECALL_STRATEGY`).
@@ -2166,14 +2180,14 @@ impl KvMemCtl {
         }
         let frontier = full_pages * bt;
         // Composite Main+aux descriptor; the head plans ONLY the aux ordinal.
-        let mtp = LayerwiseMtpQ8Layout::resolve(self.n_fa_layers, self.n_kv_heads, self.head_dim)
+        let mtp = LayerwiseMtpQ8Layout::resolve(self.kv_mode, self.n_fa_layers, self.n_kv_heads, self.head_dim)
             .map_err(|e| format!("kvmem head plan: mtp layout: {e}"))?;
         let layout = mtp
             .payload_layout()
             .map_err(|e| format!("kvmem head plan: manifest: {e}"))?;
         let record_bytes = layout.record_bytes();
         let descriptor = MemoryDescriptor::new(
-            &layerwise_backend(model),
+            &layerwise_backend(model, self.kv_mode),
             &layout,
             &layerwise_capabilities(max_position),
         )
@@ -3398,6 +3412,7 @@ mod tests {
             n_heads: 4,
             n_kv_heads: 2,
             head_dim: 64,
+            kv_mode: KvMode::Q8,
             per_pos_bytes: 136,
             per_pos_v_bytes: 136,
             max_rows: 512,

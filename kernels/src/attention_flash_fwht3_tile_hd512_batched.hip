@@ -116,6 +116,12 @@ __global__ void attention_flash_fwht3_tile_hd512_batched(
     // Phase A: Q·K (3-bit K, two 24-bit packed words per lane).
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
+        // KVMem residency (P4.4): a spilled page holds no K bytes. Mask the
+        // score; Phase D skips the V load for the same pages. Wave-uniform.
+        if (!kv_page_present(desc, t)) {
+            if (tid == 0) scores[t_local] = -INFINITY;
+            continue;
+        }
         const bool out_of_window = sliding && (t < t_lo);
         float partial = 0.0f;
         if (!out_of_window) {
@@ -190,6 +196,7 @@ __global__ void attention_flash_fwht3_tile_hd512_batched(
         for (int t_local = 0; t_local < tile_len; t_local++) {
             float w = scores[t_local];
             int t = tile_start + t_local;
+            if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
             const int v_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
             const unsigned char* vb = v_cache + (size_t)v_slot * v_row_stride;
             #pragma unroll

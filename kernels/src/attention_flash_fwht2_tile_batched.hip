@@ -110,6 +110,12 @@ __global__ void attention_flash_fwht2_tile_batched(
 
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
+        // KVMem residency (P4.4): a spilled page holds no K bytes. Mask the
+        // score; Phase D skips the V load for the same pages. Wave-uniform.
+        if (!kv_page_present(desc, t)) {
+            if (tid == 0) scores[t_local] = -INFINITY;
+            continue;
+        }
 #ifdef HIPFIRE_KV_SLOT_PAGED
         const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, k_bytes_per_pos) + k_head_off;
 #else
@@ -167,6 +173,7 @@ __global__ void attention_flash_fwht2_tile_batched(
         for (int t_local = 0; t_local < tile_len; t_local++) {
             float w = scores[t_local];
             int t = tile_start + t_local;
+            if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
 #ifdef HIPFIRE_KV_SLOT_PAGED
             const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_row_stride);
 #else
@@ -203,6 +210,7 @@ __global__ void attention_flash_fwht2_tile_batched(
         for (int t_local = 0; t_local < tile_len; t_local++) {
             float w = scores[t_local];
             int t = tile_start + t_local;
+            if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
 #ifdef HIPFIRE_KV_SLOT_PAGED
             const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_bytes_per_pos) + v_head_off;
 #else

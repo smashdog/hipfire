@@ -43,6 +43,7 @@ use hipfire_kvmem::{
 use rdna_compute::kvmem_page_mass::PageMassQuery;
 use rdna_compute::kvmem_page_score::{PageQueryScalar, PageScoreQuery};
 use rdna_compute::kv_slots::KvSlotDesc;
+use saddle_core::kv::KvMode;
 use rdna_compute::layerwise_pool::{LayerwisePagePool, PackedArenaLayout};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
@@ -2178,12 +2179,14 @@ pub fn bootstrap_layerwise_rows(
     })
 }
 
-/// Production backend identity for the hipfire Q8 packed layerwise archive
+/// Production backend identity for the hipfire packed layerwise archive
 /// (design §3.9g). Tags the sealed records' provenance; the core treats it as an
 /// opaque admission key (must match across a transaction's export/restore).
-pub fn layerwise_backend(model: &str) -> BackendIdentity {
+/// P4.4: the tag is per-KV-tier ([`packed_format_tag`]) so records sealed under
+/// one tier can never seed another (ninfer format-isolation pattern).
+pub fn layerwise_backend(model: &str, kv_mode: KvMode) -> BackendIdentity {
     BackendIdentity {
-        backend: Q8_PACKED_FORMAT.to_string(),
+        backend: crate::layerwise_layout::packed_format_tag(kv_mode).to_string(),
         revision: env!("CARGO_PKG_VERSION").to_string(),
         model: model.to_string(),
         state_schema: "state-v1".to_string(),
@@ -2267,7 +2270,7 @@ pub fn engine_carrier_rows<'a>(
     }
     let (keys, _slot_policy) = stores;
     let fa_layers: Vec<u32> = (0..n_fa_layers as u32).collect();
-    let q8 = LayerwiseQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim, &fa_layers)
+    let q8 = LayerwiseQ8Layout::resolve(ctl.kv_mode(), n_fa_layers, n_kv_heads, head_dim, &fa_layers)
         .map_err(|e| format!("layerwise engine rows: q8 layout: {e}"))?;
     // P4.1② G4 (f1): under Layerwise + MTP the canonical archive is the COMPOSITE
     // Main+aux manifest (n_fa + 1 layers) so every sealed trunk record co-archives
@@ -2276,7 +2279,7 @@ pub fn engine_carrier_rows<'a>(
     // Legacy / AR-only keep the standalone trunk manifest (byte-neutral).
     let mtp = if ctl.head_plane_enabled() {
         Some(
-            LayerwiseMtpQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim)
+            LayerwiseMtpQ8Layout::resolve(ctl.kv_mode(), n_fa_layers, n_kv_heads, head_dim)
                 .map_err(|e| format!("layerwise engine rows: mtp layout: {e}"))?,
         )
     } else {
@@ -2391,7 +2394,7 @@ pub fn engine_carrier_rows<'a>(
                 .payload_layout()
                 .map_err(|e| format!("layerwise engine rows: manifest: {e}"))?;
             let descriptor = MemoryDescriptor::new(
-                &layerwise_backend(model),
+                &layerwise_backend(model, ctl.kv_mode()),
                 &layout,
                 &layerwise_capabilities(max_position),
             )
@@ -2441,7 +2444,7 @@ pub fn engine_carrier_rows<'a>(
         keys,
         policy,
         &q8,
-        layerwise_backend(model),
+        layerwise_backend(model, ctl.kv_mode()),
         layerwise_capabilities(max_position),
         bootstrap,
         n_slots,
@@ -2508,9 +2511,9 @@ pub fn engine_carrier_head<'a>(
     }
     let (keys, _slot_policy) = stores;
     let fa_layers: Vec<u32> = (0..n_fa_layers as u32).collect();
-    let q8 = LayerwiseQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim, &fa_layers)
+    let q8 = LayerwiseQ8Layout::resolve(ctl.kv_mode(), n_fa_layers, n_kv_heads, head_dim, &fa_layers)
         .map_err(|e| format!("layerwise head carrier: q8 layout: {e}"))?;
-    let mtp = LayerwiseMtpQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim)
+    let mtp = LayerwiseMtpQ8Layout::resolve(ctl.kv_mode(), n_fa_layers, n_kv_heads, head_dim)
         .map_err(|e| format!("layerwise head carrier: mtp layout: {e}"))?;
     let record_bytes = mtp
         .payload_layout()
@@ -2556,7 +2559,7 @@ pub fn engine_carrier_head<'a>(
         keys,
         policy,
         &q8,
-        layerwise_backend(model),
+        layerwise_backend(model, ctl.kv_mode()),
         layerwise_capabilities(max_position),
         bootstrap,
         n_slots,
@@ -3819,7 +3822,7 @@ impl<'a> LayerwiseDriver<'a> {
         // head draft carrier needs for `restore_head_plane`.
         self.set_composite_export(mtp, max_position)?;
         // The head's bounded single-layer arena (the aux plane, ordinal 0).
-        let head_q8 = LayerwiseQ8Layout::resolve(1, n_kv_heads, head_dim, &[0])
+        let head_q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, 1, n_kv_heads, head_dim, &[0])
             .map_err(|e| format!("layerwise head: head q8 layout: {e}"))?;
         let mut arena = LayerwiseArena::new(gpu, &head_q8, head_n_slots)?;
         // Reserve the draft-scratch suffix slot up front (the `+1` block in the
@@ -4370,7 +4373,7 @@ mod tests {
         let mut gpu = Gpu::init().expect("gpu");
         // 2 fa layers, 4 KV heads × head_dim 256 → Q8 stride 1088 (the layout
         // adapter's host fixture). 3 composite slots ≈ 1.6 MiB arena.
-        let q8 = LayerwiseQ8Layout::resolve(2, 4, 256, &[0, 1]).expect("q8 layout");
+        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 4, 256, &[0, 1]).expect("q8 layout");
         let n_slots = 3usize;
         let mut arena = LayerwiseArena::new(&mut gpu, &q8, n_slots).expect("arena");
         let layout = *arena.layout();
@@ -4489,7 +4492,7 @@ mod tests {
         }
     }
     fn fx_layout() -> LayerwiseQ8Layout {
-        LayerwiseQ8Layout::resolve(FX_LAYERS as usize, FX_KV_HEADS, FX_HEAD_DIM, &[0, 1]).unwrap()
+        LayerwiseQ8Layout::resolve(KvMode::Q8, FX_LAYERS as usize, FX_KV_HEADS, FX_HEAD_DIM, &[0, 1]).unwrap()
     }
     fn fx_backend() -> BackendIdentity {
         BackendIdentity {
@@ -4728,7 +4731,7 @@ mod tests {
         use crate::layerwise_layout::LayerwiseMtpQ8Layout;
         let mut gpu = Gpu::init().expect("gpu");
         // Composite Main+aux: FX_LAYERS trunk planes + ONE head aux plane (ordinal n_fa).
-        let mtp = LayerwiseMtpQ8Layout::resolve(FX_LAYERS as usize, FX_KV_HEADS, FX_HEAD_DIM)
+        let mtp = LayerwiseMtpQ8Layout::resolve(KvMode::Q8, FX_LAYERS as usize, FX_KV_HEADS, FX_HEAD_DIM)
             .expect("mtp layout");
         let aux = mtp.head_layer();
         assert_eq!(aux, FX_LAYERS);
@@ -4791,7 +4794,7 @@ mod tests {
 
         // Bounded head arena: ONE layer (the aux plane), separate from the trunk arena.
         let head_q8 =
-            LayerwiseQ8Layout::resolve(1, FX_KV_HEADS, FX_HEAD_DIM, &[0]).expect("head q8");
+            LayerwiseQ8Layout::resolve(KvMode::Q8, 1, FX_KV_HEADS, FX_HEAD_DIM, &[0]).expect("head q8");
         let archive = Storage::new_ram(16 << 20).expect("archive storage");
         let mut records: HashMap<u64, HostRecord> = HashMap::new();
         let mut slab = gpu.hip.transfer_buffer(FX_LAYER_BYTES as usize).expect("slab");
@@ -4860,7 +4863,7 @@ mod tests {
     #[ignore]
     fn driver_head_plane_attach_restore_integration() {
         let mut gpu = Gpu::init().expect("gpu");
-        let mtp = LayerwiseMtpQ8Layout::resolve(FX_LAYERS as usize, FX_KV_HEADS, FX_HEAD_DIM)
+        let mtp = LayerwiseMtpQ8Layout::resolve(KvMode::Q8, FX_LAYERS as usize, FX_KV_HEADS, FX_HEAD_DIM)
             .expect("mtp layout");
         let aux = mtp.head_layer();
         let composite_record = mtp.payload_layout().expect("composite manifest").record_bytes();
@@ -5749,7 +5752,7 @@ mod tests {
         const SEQ: i32 = (NP * BT) as i32; // 384
         const MAXTILES: usize = (SEQ as usize + BT - 1) / BT; // 3
 
-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
+        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
         assert_eq!(q8.k_stride(), SEG);
         assert_eq!(q8.v_stride(), SEG);
 
@@ -5972,7 +5975,7 @@ mod tests {
         const NL: usize = 2;
         const NSLOTS: usize = 4;
         const MAXP: usize = 4;
-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
+        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
         let arena = LayerwiseArena::new(&mut gpu, &q8, NSLOTS).expect("arena");
         let staging = LayerwiseDescStaging::new(&mut gpu, NL, MAXP).expect("staging");
         assert_eq!(staging.n_layers(), NL);
@@ -6481,7 +6484,7 @@ mod tests {
         }
 
         // ── statistics + packed store: both canonical pages, both layers ──
-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
+        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
         assert_eq!(q8.k_stride(), SEG);
         assert_eq!(q8.v_stride(), SEG);
         let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
@@ -6784,7 +6787,7 @@ mod tests {
         }
 
         // ── statistics + packed store: both canonical pages, both layers ──
-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
+        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
         let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
         let budget = || MemoryBudget {
             selected_tokens: BT as u64,
@@ -7107,7 +7110,7 @@ mod tests {
         }
 
         // ── statistics + packed store: both canonical pages, both layers ──
-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
+        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
         let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
         let budget = || MemoryBudget {
             selected_tokens: BT as u64,
@@ -7484,7 +7487,7 @@ mod tests {
 
         // Production geometry: 2 FA layers, DENSE ordinals [0, 1] (the engine's
         // `fa_layers`, matching KvMemCtl's `raw_cfg.n_layer == n_fa_layers`).
-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
+        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
         let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
 
         // Micro dense model shared by both cases (real HFQ4 projections + FFN).
@@ -7615,7 +7618,7 @@ mod tests {
                 &keys,
                 &policy,
                 &q8,
-                layerwise_backend("qwen35"),
+                layerwise_backend("qwen35", KvMode::Q8),
                 layerwise_capabilities(CTX as u32),
                 bootstrap,
                 n_slots,
@@ -7830,7 +7833,7 @@ mod tests {
             return;
         }
 
-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
+        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
         let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
         let full_pages = 3u32;
         let budget_blocks = 1u32; // one-page resident budget ⇒ history overflows
@@ -7937,7 +7940,7 @@ mod tests {
         assert_eq!(mass_rows1, vec![0u32], "first sample admits the single decode row");
         let mass1 = MassCapture::new(NL, frontier, local_begin1, 1, mass_rows1);
         let mut carrier1 = LayerwiseQuery::build_with_pressure(
-            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35"),
+            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35", KvMode::Q8),
             layerwise_capabilities(CTX as u32), bootstrap1, n_slots, archive_bytes,
             None, Some(mass1), None,
         )
@@ -8019,7 +8022,7 @@ mod tests {
 
         // Resident-only selection over a catalog whose resident == the keep-set.
         let descriptor2 = MemoryDescriptor::new(
-            &layerwise_backend("qwen35"), &q8.payload_layout().expect("manifest2"),
+            &layerwise_backend("qwen35", KvMode::Q8), &q8.payload_layout().expect("manifest2"),
             &layerwise_capabilities(CTX as u32),
         )
         .expect("descriptor2");
@@ -8050,7 +8053,7 @@ mod tests {
         let budgets2: Vec<MemoryBudget> = bootstrap2.specs.iter().map(|s| s.budget).collect();
         let step2 = PressureStep::new(selected2.clone(), budgets2).expect("pressure step");
         let mut carrier2 = LayerwiseQuery::build_with_pressure(
-            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35"),
+            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35", KvMode::Q8),
             layerwise_capabilities(CTX as u32), bootstrap2, n_slots, archive_bytes,
             Some(step2), Some(mass2), None,
         )
@@ -8121,7 +8124,7 @@ mod tests {
             return;
         }
 
-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
+        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
         let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
         let full_pages = 3u32;
         let budget_blocks = 1u32; // one-page resident budget
@@ -8232,7 +8235,7 @@ mod tests {
         let n_slots = 1 + 2; // selected_pages(1) + suffix + headroom
         let archive_bytes = (full_pages as u64 + 2) * record_bytes;
         let mut carrier = LayerwiseQuery::build_with_pressure(
-            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35"),
+            &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35", KvMode::Q8),
             layerwise_capabilities(CTX as u32), bootstrap, n_slots, archive_bytes,
             None, Some(mass), None,
         )
@@ -8324,6 +8327,7 @@ mod tests {
             n_heads: NH,
             n_kv_heads: KVH,
             head_dim: HD,
+            kv_mode: KvMode::Q8,
             per_pos_bytes: SEG,
             per_pos_v_bytes: SEG,
             max_rows: 512,
@@ -8335,7 +8339,7 @@ mod tests {
 
         // Populate the slot's statistics store directly (the &self core writes),
         // mirroring the ① fixture: 3 sealed pages, mean-K sign trick selects one.
-        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
+        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, NL, KVH, HD, &[0, 1]).expect("q8 layout");
         let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
         {
             let (keys, _kv) = ctl.layerwise_stores(0).expect("slot stores");

@@ -1222,12 +1222,24 @@ impl Rig {
             .ok()
             .is_some_and(|v| v == "1" || v == "on" || v == "true");
         if kvmem_on {
-            if !matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Q8) {
-                return Err(format!(
-                    "HIPFIRE_KVMEM requires q8 KV (resolved {kv_mode:?}); the \
-                     spill/restore path moves packed Q8 rows and the paged \
-                     attention kernels are Q8-only"
-                ));
+            // P4.4: KVMem admits every KV tier whose paged batched attention
+            // kernel carries the kv_page_present residency mask (ninfer
+            // multi-format admission pattern). Q8 + the 8 non-Q8 tiers are
+            // masked (flat f16/bf16, rotated asym/fwht, fp8 as a q8 TU variant);
+            // spill/restore is byte-opaque and mean-K is F32 pre-RoPE, so the
+            // host path is tier-generic. Per-tier head_dim / hardware constraints
+            // fail closed downstream in SlotKvTierPlan::resolve / kernel admission.
+            match kv_mode {
+                hipfire_runtime::kv_mode::KvMode::Q8
+                | hipfire_runtime::kv_mode::KvMode::Bf16
+                | hipfire_runtime::kv_mode::KvMode::F16
+                | hipfire_runtime::kv_mode::KvMode::Asym2
+                | hipfire_runtime::kv_mode::KvMode::Asym3
+                | hipfire_runtime::kv_mode::KvMode::Asym4
+                | hipfire_runtime::kv_mode::KvMode::Fwht2
+                | hipfire_runtime::kv_mode::KvMode::Fwht3
+                | hipfire_runtime::kv_mode::KvMode::Fwht4
+                | hipfire_runtime::kv_mode::KvMode::Fp8 => {}
             }
             if cfg.is_vl && vl_sequential {
                 return Err(
@@ -2082,6 +2094,7 @@ impl Rig {
                     n_heads: config.n_heads,
                     n_kv_heads: config.n_kv_heads,
                     head_dim: config.head_dim,
+                    kv_mode,
                     per_pos_bytes,
                     per_pos_v_bytes,
                     max_rows: max_batch,

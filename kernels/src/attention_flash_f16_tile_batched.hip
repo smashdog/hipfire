@@ -139,6 +139,12 @@ __global__ void attention_flash_f16_tile_batched(
             if (tid == 0) scores[t_local] = -INFINITY;
             continue;                      // t is wave-uniform; all lanes skip together
         }
+        // KVMem residency (P4.4): a spilled page holds no K bytes. Mask like the
+        // window case; Phase D skips the V load for the same pages. Wave-uniform.
+        if (!kv_page_present(desc, t)) {
+            if (tid == 0) scores[t_local] = -INFINITY;
+            continue;
+        }
         const unsigned short* kb = (const unsigned short*)
             (k_cache + kv_offset_for_k(desc, t, per_pos_bytes)) + head_base + d0;
         float partial = 0.0f;
@@ -181,6 +187,9 @@ __global__ void attention_flash_f16_tile_batched(
     for (int t_local = 0; t_local < tile_len; t_local++) {
         const float w = scores[t_local];
         const int t = tile_start + t_local;
+        // KVMem residency (P4.4): skip the V load for spilled pages (weight is 0
+        // anyway, but the freed arena bytes may be reused — never read them).
+        if (!kv_page_present(desc, t)) continue;
         const unsigned short* vb = (const unsigned short*)
             (v_cache + kv_offset_for_v(desc, t, per_pos_bytes)) + head_base + d0;
         for (int i = 0; i < dpt; i++) {
