@@ -502,15 +502,17 @@ fn layer_kv_write_attend(
             row_slot,
             ctx_len,
         } => {
-            // Composite-arena KV write + paged GQA-shared decode. Identical
-            // kernel class to the Arena arm's `paged_decode` route (and to
-            // Path A/C's `kv_attention_paged`), but addressed through the
-            // carrier's per-layer block table: `positions` is the COMPACTED
-            // causal bound (`[extent-1]`, places the current token at the
-            // suffix page offset 0), `descs`/`row_slot` resolve the restored
-            // stripe + suffix, and `ctx_len` is the page-rounded upper bound.
-            // The legacy `pbs.positions` (real decode position) drove RoPE
-            // upstream and is deliberately NOT used here.
+            // Composite-arena KV write + paged attention (width-aware: single-row
+            // GQA decode tile for AR, multi-row WMMA verifier for an MTP verify
+            // span). Identical kernel class to the Arena arm's `paged_decode` /
+            // `paged_verify` routes (and to Path A/C's `kv_attention_paged`), but
+            // addressed through the carrier's per-layer block table: `positions`
+            // holds the COMPACTED per-row causal bounds (`[extent - width + i]`,
+            // placing the span's rows at the suffix page offsets), `descs`/
+            // `row_slot` resolve the restored stripe + suffix, and `ctx_len` is
+            // the page-rounded upper bound. The legacy `pbs.positions` (real
+            // decode position) drove RoPE upstream and is deliberately NOT used
+            // here.
             kv_write_slots(
                 gpu,
                 kv,
@@ -525,6 +527,20 @@ fn layer_kv_write_attend(
                 descs,
                 row_slot,
             )?;
+            // P4.1② G1: width-aware route selection over the SAME compacted-arena
+            // block table. n == 1 (AR decode) keeps the single-row paged GQA
+            // decode tile byte-identically. n > 1 (MTP verify span) rides the
+            // multi-row split-K WMMA verifier (`attention_verify_wmma_q8_gfx1100_paged`,
+            // the Arena arm's `paged_verify` kernel class) addressed through the
+            // carrier's per-layer descs/row_slot; the width-param staging supplies
+            // per-row compacted causal bounds `[seq_len - width + i]`. If the
+            // verifier's envelope rejects the shape (Ok(false)), the shared
+            // batched-masked ladder below attends the compacted arena over n rows.
+            let (paged_verify, paged_decode) = if n > 1 {
+                (Some(*ctx_len), None)
+            } else {
+                (None, Some(*ctx_len))
+            };
             tier_attend_slots(
                 gpu,
                 kv,
@@ -544,8 +560,8 @@ fn layer_kv_write_attend(
                 row_slot,
                 /*single_slot=*/ None,
                 /*multi_slot_tiles=*/ None,
-                /*paged_verify=*/ None,
-                /*paged_decode=*/ Some(*ctx_len),
+                paged_verify,
+                paged_decode,
             )
         }
         LayerKvAddr::Vmm(layer) => vmm::vmm_kv_write_attend(gpu, config, layer, pbs, n),
@@ -673,9 +689,11 @@ fn layerwise_fa_slots(
     lq: &mut crate::layerwise_driver::LayerwiseQuery<'_>,
 ) -> HipResult<()> {
     use hipfire_kvmem::NativeCurrentLayerQuery;
-    // Admission guarantees single-row decode (n == 1); the scorer reads one
-    // post-norm/pre-RoPE Q tile, exactly as Path A/C's `layerwise_fa_attend`.
-    debug_assert_eq!(n, 1, "layerwise slots decode is single-row");
+    // P4.1② G1: admission guarantees the live row count equals the carrier's
+    // evaluation-span width — 1 for AR decode, n for an MTP verify span. The
+    // scorer reads `n` post-norm/pre-RoPE Q tiles (one per active row), exactly
+    // as Path A/C's `layerwise_fa_attend`. width == 1 is byte-identical to AR.
+    debug_assert_eq!(n, lq.staging.width(), "layerwise slots rows == staging width");
 
     // Composite arena views (owned non-owning aliases; per-query constant, the
     // arena owns the allocation). K base = arena base; V base = shifted one K
@@ -692,14 +710,15 @@ fn layerwise_fa_slots(
     let views = lq.layer_views(fa).map_err(|e| HipError::new(0, &e))?;
 
     // The Q tile the scorer reads: post-norm/pre-RoPE `pbs.fa_q_batch`, laid out
-    // `[n_heads, head_dim]` F32 (one decode row). BYTE strides, token axis
-    // outermost; attention_scale 0 → 1/sqrt(head_dim). Mirrors Path A/C.
+    // `[n, n_heads, head_dim]` F32 (n active rows: 1 = AR, n = MTP verify span).
+    // BYTE strides, token axis outermost; attention_scale 0 → 1/sqrt(head_dim).
+    // Mirrors Path A/C. width == 1 reads the single row byte-identically.
     let qw = config.n_heads * config.head_dim;
     let native_q = NativeCurrentLayerQuery {
         data: pbs.fa_q_batch.buf.as_ptr() as *const std::ffi::c_void,
-        bytes: qw * 4,
+        bytes: qw * 4 * n,
         layer: fa as u32,
-        rows: 1,
+        rows: n as u32,
         query_heads: config.n_heads as u32,
         kv_heads: config.n_kv_heads as u32,
         head_dim: config.head_dim as u32,
@@ -752,7 +771,7 @@ fn layerwise_fa_slots(
         use rdna_compute::kvmem_page_mass::{PageMassQuery, PageMassScalar};
         let mass_q = PageMassQuery {
             data: pbs.fa_q_batch.buf.as_ptr() as *const std::ffi::c_void,
-            rows: 1,
+            rows: n as u32,
             query_heads: config.n_heads as u32,
             kv_heads: config.n_kv_heads as u32,
             head_dim: config.head_dim as u32,
@@ -5672,17 +5691,38 @@ pub fn forward_batch_slots_opts(
     // path also falls through).
     #[cfg(all(feature = "deltanet", feature = "kvmem"))]
     let layerwise_handled = if let Some(lq) = layerwise.as_deref_mut() {
-        let admissible = paged_decode.is_some()
+        // P4.1② G1: two admissible Layerwise shapes, both single-slot text-only
+        // q8 paged. (a) AR single-row decode (D4b-3): n == 1, unspec, the paged
+        // GQA decode tile engaged. (b) MTP multi-row verify span (②): n == width
+        // > 1, spec-captured. The width-param staging (①-F1) supplies per-row
+        // compacted causal bounds `[seq_len - width + i]`; the verify span rides
+        // Path B `run_layers_slots` (width-aware) for BOTH dense and MoE — the
+        // reference single-row sibling is not width-aware. Verify admission is
+        // deliberately INDEPENDENT of the legacy `paged_verify` WMMA envelope
+        // (which caps n at 4..=32 past a per-token ctx crossover): the Layerwise
+        // attend arm selects the multi-row WMMA verifier when admitted and falls
+        // back to the batched-masked ladder over the compacted arena otherwise,
+        // so short-context / small-width verify spans still ride Layerwise.
+        // Any other shape with a `Some` handle fails closed here, ahead of any
+        // attention — never a silent legacy fallback.
+        let text_only = !use_mrope && !use_ext;
+        let ar_admissible = paged_decode.is_some()
             && n == 1
             && active_slots == 1
-            && !use_mrope
-            && !use_ext
+            && text_only
             && spec_capture.is_none();
-        if !admissible {
+        let verify_admissible = n > 1
+            && active_slots == 1
+            && text_only
+            && spec_capture.is_some()
+            && pool.is_paged()
+            && kv.is_q8();
+        if !ar_admissible && !verify_admissible {
             return Err(HipError::new(
                 0,
-                "layerwise decode requires single-row q8 paged decode \
-                 (single slot, text-only, unspec); other shapes are not wired (D4b-3)",
+                "layerwise forward requires single-row q8 paged AR decode or a \
+                 single-slot multi-row MTP verify span (text-only); other shapes \
+                 are not wired (D4b-3 / P4.1② G1)",
             ));
         }
         let slot_idx = batch
@@ -5690,8 +5730,44 @@ pub fn forward_batch_slots_opts(
             .iter()
             .position(|&m| m > 0)
             .expect("active_slots == 1 implies exactly one active slot");
-        if config.num_experts == 0 {
-            // Dense: reference-shaped single-row sibling (Path A/C).
+        if verify_admissible {
+            // MTP verify span: Path B slots ladder with the carrier threaded,
+            // width-aware (`layerwise_fa_slots` fires restore_layer per FA layer
+            // over the n-row compacted working set, then attends through the
+            // multi-row WMMA verifier — see `layer_kv_write_attend`). The spec
+            // capture rides along so the verify tape records this span. The
+            // legacy Arena addr is still built — its `desc_staging.row_slot_dev`
+            // feeds the stats tap — but each FA layer's KV write/attend uses the
+            // composite `LayerKvAddr::Layerwise`.
+            run_layers_slots(
+                gpu,
+                weights,
+                config,
+                batch,
+                &*dn_states,
+                |kv_layer_idx| LayerKvAddr::Arena {
+                    k_cache: &k_arenas[kv_layer_idx],
+                    v_cache: &v_arenas[kv_layer_idx],
+                    desc_staging,
+                    single_slot,
+                    n_tiles,
+                    paged_verify,
+                    paged_decode,
+                },
+                kv,
+                pbs,
+                s,
+                q8_wmma_arch,
+                n,
+                physical_cap,
+                max_ctx_len,
+                use_mrope,
+                layer_end,
+                spec_capture.as_deref_mut(),
+                Some(lq),
+            )?;
+        } else if config.num_experts == 0 {
+            // Dense AR: reference-shaped single-row sibling (Path A/C).
             paged_decode_layerwise(
                 gpu,
                 weights,
@@ -5707,7 +5783,7 @@ pub fn forward_batch_slots_opts(
                 layer_end,
             )?;
         } else {
-            // MoE: slots ladder with the carrier threaded (Path B). The legacy
+            // MoE AR: slots ladder with the carrier threaded (Path B). The legacy
             // Arena addr is still built — its `desc_staging.row_slot_dev` feeds
             // the stats tap — but each FA layer's KV write/attend uses the
             // composite `LayerKvAddr::Layerwise` (see `layerwise_fa_slots`).

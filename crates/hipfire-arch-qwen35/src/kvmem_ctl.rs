@@ -44,14 +44,21 @@
 use std::path::PathBuf;
 
 use hipfire_kvmem::{
-    mean_key_retrieval_scores, page_softmax_scores, GqaAggregation, KvStore, KvStoreConfig,
-    PrefillOptions, PrefillPressure, RawStore, RawStoreConfig, SessionIdentity, Storage,
+    mean_key_retrieval_scores, page_softmax_scores, BlockCopies, BlockDescriptor, ExecutionView,
+    GqaAggregation, KvStore, KvStoreConfig, LayerMemorySnapshot, LayerPlan, LayerSelection,
+    MemoryBudget, MemoryCatalog, MemoryDescriptor, MemorySnapshot, MemoryStamp, OutputOptions,
+    OutputPressure, OutputScope, PrefillOptions, PrefillPressure, RawStore, RawStoreConfig,
+    SessionIdentity, Storage,
 };
+use rdna_compute::layerwise_pool::{mtp_auxiliary_capacity, mtp_head_pool, LayerwisePagePool};
 use rdna_compute::page_pool::SPILLED_PAGE;
 use rdna_compute::slot_pool::{SlotId, SlotPool};
 use rdna_compute::{Gpu, GpuTensor};
 
 use crate::kvmem_taps::KvMemTaps;
+use crate::layerwise_driver::{layerwise_backend, layerwise_capabilities, OutputAcceptanceSnapshot};
+use crate::layerwise_layout::LayerwiseMtpQ8Layout;
+use crate::layerwise_mtp::{auxiliary_removed_tokens, auxiliary_visible_tokens, AuxiliarySelection};
 
 /// KVMem blocks are 128 tokens — the engine's page size (`PAGE_TOKENS`).
 pub const KV_BLOCK_TOKENS: usize = 128;
@@ -511,6 +518,15 @@ pub struct KvMemGeometry {
     pub per_pos_v_bytes: usize,
     /// Tap buffer row capacity (`PrefillBatchScratch::max_batch`).
     pub max_rows: usize,
+    /// P4.1② G3: this model runs the independent native MTP head (the engine's
+    /// `mtp_head.is_some() && mtp_k > 0` enablement). Under Layerwise this turns
+    /// the host co-archive into the COMPOSITE `kvmem-main-mtp-pages-v4` record
+    /// (`n_fa_layers + 1` ordinals, the head aux plane at ordinal `n_fa_layers`)
+    /// and activates the per-slot head-plane state. Under Legacy it is carried
+    /// unread (the head keeps the historical full-resident KvCache path), so the
+    /// default serve stays byte-neutral. The trunk GPU paged arena is UNCHANGED
+    /// (`n_fa_layers`); only the host record gains the appended aux layer.
+    pub mtp_head: bool,
 }
 
 struct SlotState {
@@ -564,6 +580,17 @@ struct SlotState {
     /// `select` (no cold recall). Replaces the pure re-bootstrap "persist NO
     /// snapshots" model: the production path now calls `accept`.
     lw_pressure: Option<PrefillPressure>,
+    /// Session-lifetime OUTPUT-scope attention-mass pressure owner (P4.1②,
+    /// design §A.6). The MTP-verify sibling of `lw_pressure`: a verify span
+    /// accepts a PREFIX of its rows (partial acceptance), which the all-or-nothing
+    /// `PrefillPressure` cannot express (core layerwise_pressure.cpp:79).
+    /// Constructed lazily on the first admitted Layerwise MTP verify of a session
+    /// ([`KvMemCtl::ensure_layerwise_output_pressure`]); `None` under Legacy /
+    /// AR-only sessions (never created — byte-neutral) and after
+    /// [`KvMemCtl::reset_slot`]. NonThinking semantic scope (every verify row is
+    /// body output), mirroring the ① partial-accept fixture. Coexists with
+    /// `lw_pressure`: the output `select` seeds from the prefill snapshot.
+    lw_output_pressure: Option<OutputPressure>,
     /// Persistent PER-LAYER resident keep-set (decision A, design §3.10a):
     /// `lw_keep[ordinal]` is the canonical block ids chosen for FA ordinal
     /// `ordinal` by the previous step's `pressure.select` (Pressure step) or the
@@ -575,6 +602,172 @@ struct SlotState {
     /// each FA layer keep its own mass-ranked pages). Empty before the first
     /// selection / under Legacy; an absent ordinal entry reads as `[]`.
     lw_keep: Vec<Vec<u64>>,
+    /// [P4.1② fix] per-request scorer-Query gate (ninfer per-request Query
+    /// semantics). Set by `begin_request` when a continuation reuses the prefix;
+    /// consumed (take) by the orchestration at the request's first Layerwise
+    /// decode/verify step to force a scorer Query so the CURRENT question
+    /// re-scores the resident pool (Pressure alone freezes the previous turn's
+    /// selection and reuses its stale compact-tail binding, corrupting recall).
+    /// Cleared on reset_slot; false under Legacy (never read there).
+    lw_query_due: bool,
+    /// Pending output-scope acceptance snapshot for the in-flight MTP verify
+    /// (P4.1②, design §A.6). The orchestration extracts it from the verify carrier
+    /// after the forward (mass captured) and stores it here BEFORE freeing the
+    /// carrier and restoring the controller; `mtp_verify_accept_step` takes it
+    /// after `feed_rows` and publishes it at the scheduler-confirmed prefix
+    /// (`result.advance`), which is known only post-sampling. `None` under Legacy /
+    /// AR-only / between verify steps (byte-neutral); cleared on `reset_slot`. The
+    /// snapshot is owned, so it survives the scoped controller take that the
+    /// carrier's `&KvMemCtl` borrow requires.
+    lw_pending_output: Option<OutputAcceptanceSnapshot>,
+    /// P4.1② G3: the MTP head's independent aux-plane resident map (design §A.8).
+    /// Constructed lazily on the first admitted Layerwise MTP verify
+    /// ([`KvMemCtl::ensure_head_plane`]); `None` under Legacy / AR-only (never
+    /// created — byte-neutral) and after [`KvMemCtl::reset_slot`]. The head
+    /// follows the target's first-layer selection (FirstLayer); this map + the
+    /// aux `LayerWorkingSetPlan` + removed-token accounting ARE its independent
+    /// "pressure" (no mass owner). Taken/restored around the scoped verify
+    /// carrier exactly like the trunk pressure owners.
+    lw_head: Option<HeadPlaneState>,
+    /// P4.1② G3: the per-Query FirstLayer auxiliary-selection binding (① primitive
+    /// [`AuxiliarySelection`]). Bind-once per verify span: the restore-hook binds
+    /// the head history from the target's FIRST FA layer's restored ids (G5,
+    /// NL:9985-9990), the boundary rebuild consumes it, then the next span
+    /// replaces it. `None` under Legacy / AR-only / between verifies (byte-neutral);
+    /// cleared on `reset_slot`. Transient like `lw_pending_output`, NOT
+    /// session-lifetime like `lw_head`.
+    lw_aux_selection: Option<AuxiliarySelection>,
+}
+
+/// P4.1② G3: the MTP head's INDEPENDENT aux-plane resident map (design §A.8),
+/// the per-slot mirror of ninfer `KvmemLayerViews`' auxiliary fields
+/// (ninfer-layerwise-recall.patch NL:12215-12220). The head does NOT mass-score:
+/// under FirstLayer it follows the target's first-FA-layer selection, so its
+/// "pressure" is this resident map + an independent `LayerWorkingSetPlan`
+/// (computed via `MemoryCatalog::plan_layer` for the aux ordinal, quota =
+/// `kvmem_window_tokens`) + removed-token accounting — NOT a
+/// `PrefillPressure`/`OutputPressure` owner. Session-lifetime (evolves across
+/// verifies, dropped on `reset_slot`); `None` under Legacy / AR-only so the
+/// default path allocates nothing (byte-neutral).
+///
+/// Field types mirror ninfer EXACTLY: `auxiliary_pages` is `u32` canonical block
+/// ids (NL:12217, widened to `u64` only at the `plan_layer` resident boundary,
+/// NL:10575), `auxiliary_view_version` is `u64` (NL:12218), and
+/// `auxiliary_removed_tokens` is `u32` (NL:12219). The head pool's block geometry
+/// is `KV_BLOCK_TOKENS` (128), vs ninfer's 64.
+#[derive(Debug, Clone, Default)]
+pub struct HeadPlaneState {
+    /// The head's resident canonical block ids, chronological (ninfer
+    /// `auxiliary_pages`). Drives the aux `plan_layer` resident list and the
+    /// head stripe restore-before-attend. Empty before the first selection.
+    auxiliary_pages: Vec<u32>,
+    /// Head view version, bumped per admitted head selection (ninfer
+    /// `auxiliary_view_version`); drives the synthesized aux `MemoryStamp`
+    /// ([`KvMemCtl::plan_head_plane`] reads it at the aux stamp boundary, NL:10576).
+    auxiliary_view_version: u64,
+    /// Tokens dropped from the head history by drop-evict since the last
+    /// boundary rebuild (ninfer `auxiliary_removed_tokens`); the RoPE shift for
+    /// the head's restored rows (NL:5848/10328).
+    auxiliary_removed_tokens: u32,
+}
+
+impl HeadPlaneState {
+    /// P4.1② G4 (f2): the head's restored compact page ids (chronological) — the
+    /// aux resident list the head `plan_layer` consumes and the write-through
+    /// source. Read by the draft phase to build the next selection.
+    pub fn auxiliary_pages(&self) -> &[u32] {
+        &self.auxiliary_pages
+    }
+    /// P4.1② G4 (f2): the RoPE shift for the head's restored rows
+    /// (`frontier - visible_tokens`, ninfer NL:5848/10328). The draft phase adds
+    /// this to each row's global RoPE position.
+    pub fn removed_tokens(&self) -> u32 {
+        self.auxiliary_removed_tokens
+    }
+    /// ninfer `KvmemLayerViews::validate` aux invariant (NL:12267-12270):
+    /// `visible_tokens(auxiliary_pages, frontier) + auxiliary_removed_tokens ==
+    /// frontier`. The visible-token reduction is the ① `auxiliary_visible_tokens`
+    /// mirror (block geometry `KV_BLOCK_TOKENS`). Fail-closed: a non-chronological
+    /// map or an extent that does not reconstruct the frontier is an error, so a
+    /// corrupted head history can never be attended.
+    fn validate(&self, frontier: u64) -> Result<u64, String> {
+        let visible =
+            auxiliary_visible_tokens(&self.auxiliary_pages, frontier, KV_BLOCK_TOKENS as u64)?;
+        let extent = visible + self.auxiliary_removed_tokens as u64;
+        if extent != frontier {
+            return Err(format!(
+                "native MTP head view does not reconstruct the accepted frontier \
+                 (visible {visible} + removed {} != {frontier})",
+                self.auxiliary_removed_tokens
+            ));
+        }
+        Ok(extent)
+    }
+
+    /// P4.1② G4 (f2-D): publish the accepted canonical append to the head's
+    /// resident map — the hipfire analog of ninfer `accepted_auxiliary_append`
+    /// (NL:12309-12314) + its `append` helper (NL:12341-12347, block geometry
+    /// `KV_BLOCK_TOKENS` instead of ninfer's 64). After the consume pass seals the
+    /// accepted head rows `[begin, end)` into the composite aux plane, the new
+    /// canonical pages join the resident selection map and the RoPE shift is
+    /// recomputed as `end - visible_tokens(next, end)`. The view version is
+    /// UNCHANGED (only a stripe restore bumps it, NL:10611); this is a selection
+    /// state advance, not a restore. The map persists across drafts as SELECTION
+    /// state only — the head arena is freshly restored every step (device-truth),
+    /// exactly like the trunk keep-set ([`combine_keep_set`]).
+    ///
+    /// P4.1② G6 (§3.9g): the canonical logical frame is the PAGE-ROUNDED accepted
+    /// frontier (`frontier / bt * bt`), matching [`Self::accept_head_restore`] and
+    /// the trunk keep-set. The partial tail (`frontier % bt` tokens) rides the
+    /// PHYSICAL SUFFIX STRIPE (`crate::layerwise_driver::HeadSuffix`) — it is NOT a
+    /// canonical aux block,
+    /// so ninfer's partial-page anchor guard (NL:12343-12344) does not apply: the
+    /// suffix stripe is always resident and is the compact-shift anchor. This is
+    /// the faithful adaptation of ninfer `accepted_auxiliary_append` to hipfire's
+    /// paged suffix representation — the partial page's DATA is still sealed +
+    /// attended via the suffix; only its bookkeeping differs from ninfer's
+    /// contiguous canonical map. The RoPE shift is recomputed against the
+    /// page-rounded `end` frame so it stays consistent with the next restore.
+    ///
+    /// Fail-closed on `end < begin`, a non-chronological map, or an extent that
+    /// does not reconstruct the page-rounded `end` frame — so a corrupted head
+    /// history can never be attended. Pure host logic; Legacy / AR-only never call
+    /// it.
+    fn append_accepted(&mut self, begin: u64, end: u64) -> Result<(), String> {
+        let bt = KV_BLOCK_TOKENS as u64;
+        if end < begin {
+            return Err(format!(
+                "native MTP head append: invalid range [{begin}, {end})"
+            ));
+        }
+        let begin_frame = begin / bt * bt;
+        let end_frame = end / bt * bt;
+        // Validate the existing map is a chronological accepted view up to the
+        // page-rounded `begin` (ninfer `append`'s `visible_tokens(pages, begin)`
+        // guard, adapted to the canonical frame).
+        auxiliary_visible_tokens(&self.auxiliary_pages, begin_frame, bt)?;
+        // Append the newly-sealed FULL pages `[begin/bt, end/bt)`. The old suffix
+        // page (`begin/bt`) becomes canonical once the append fills it; the new
+        // partial suffix page (`end/bt` when `end % bt != 0`) stays the suffix
+        // stripe and is never pushed (it is not a canonical block).
+        let mut id = begin / bt;
+        while id < end / bt {
+            let page = u32::try_from(id)
+                .map_err(|_| format!("native MTP head append: page {id} overflow u32"))?;
+            if self.auxiliary_pages.last() != Some(&page) {
+                self.auxiliary_pages.push(page);
+            }
+            id += 1;
+        }
+        let visible = auxiliary_visible_tokens(&self.auxiliary_pages, end_frame, bt)?;
+        let removed = end_frame.checked_sub(visible).ok_or_else(|| {
+            format!("native MTP head append: visible {visible} exceeds frontier {end_frame}")
+        })?;
+        self.auxiliary_removed_tokens = u32::try_from(removed)
+            .map_err(|_| format!("native MTP head append: removed {removed} overflow u32"))?;
+        self.validate(end_frame)?;
+        Ok(())
+    }
 }
 
 /// Per-slot residency plan for one step.
@@ -654,6 +847,23 @@ pub struct KvMemCtl {
     q_span: Vec<f32>,
     /// Per-layer present row count for the page-softmax view (`query_span > 1`).
     q_layer_rows: Vec<u32>,
+    /// P4.1② G3: true iff Layerwise AND the model runs the native MTP head
+    /// (`geom.mtp_head`). Gates the composite host record (`n_fa_layers + 1`
+    /// ordinals) and every head-plane path. False under Legacy / AR-only, so the
+    /// default serve keeps the historical `n_fa_layers` record byte-neutral.
+    head_plane: bool,
+    /// P4.1② G3: the head aux plane's ordinal in the composite host record
+    /// (`= n_fa_layers`, the appended LAST ordinal; ninfer
+    /// `model = layer_types.size()`, NL:10577). Only meaningful when `head_plane`;
+    /// the trunk GPU paged arena stays `n_fa_layers` and never addresses it.
+    aux_ordinal: u32,
+    /// P4.1② G3: the composite host record's layer count (`n_fa_layers + 1` when
+    /// `head_plane`, else `n_fa_layers`). The trunk retrieval query must pass THIS
+    /// (not `n_fa_layers`) to satisfy the core's `query.layers == n_layer` geometry
+    /// check; the appended aux ordinal is skipped by zeroing its token count /
+    /// layer rows, so trunk selection still scores only `0..n_fa_layers`. Equals
+    /// `n_fa_layers` under Legacy / AR-only ⇒ the default query is byte-neutral.
+    n_record_layers: usize,
 }
 
 impl KvMemCtl {
@@ -670,10 +880,11 @@ impl KvMemCtl {
     /// process config. The config is a START-TIME SNAPSHOT
     /// (`hipfire_config::active_or_local_process_config` is a `OnceLock`), so a
     /// test that `set_var`s `HIPFIRE_KVMEM_RECALL_STRATEGY` after the first
-    /// config read is an order-dependent coin flip — inject here instead
-    /// (mirrors `HfqFile::open_with_reap_plan`). [`Self::new`] resolves the env
-    /// once and delegates, so the production path is unchanged.
-    fn new_with_strategy(
+    /// config read would be an order-dependent coin flip; injecting the strategy
+    /// avoids that. `pub(crate)` so the cross-module P4.1② G1 driver fixture can
+    /// construct a Layerwise controller deterministically (the env-snapshot
+    /// `new` cannot). Visibility-only widening — no production behaviour change.
+    pub(crate) fn new_with_strategy(
         n_slots: usize,
         plan: &KvMemPlan,
         geom: &KvMemGeometry,
@@ -684,8 +895,20 @@ impl KvMemCtl {
         }
         let k_width = geom.n_kv_heads * geom.head_dim;
         let q_width = geom.n_heads * geom.head_dim;
+        // P4.1② G3 (design §A.8): under Layerwise + native MTP the host co-archive
+        // is the COMPOSITE `kvmem-main-mtp-pages-v4` record — the trunk's
+        // `n_fa_layers` ordinals PLUS one appended head aux plane at ordinal
+        // `n_fa_layers` (ninfer `model = layer_types.size()`). The core raw store
+        // lays each layer out as an INDEPENDENT per-block allocation
+        // (raw_kv_store.cpp:154/404), so appending the aux ordinal leaves every
+        // trunk layer's bytes untouched (the trunk write/restore loops address
+        // `0..n_fa_layers` only). Legacy / AR-only keep `n_fa_layers` exactly, so
+        // the default record is byte-neutral. The trunk GPU paged arena is
+        // UNCHANGED; only this host record gains the aux layer.
+        let head_plane = strategy.is_layerwise() && geom.mtp_head;
+        let n_record_layers = if head_plane { geom.n_fa_layers + 1 } else { geom.n_fa_layers };
         let raw_cfg = RawStoreConfig {
-            n_layer: geom.n_fa_layers as u32,
+            n_layer: n_record_layers as u32,
             n_embd_k: k_width as u32,
             n_embd_v: k_width as u32,
             block_tokens: KV_BLOCK_TOKENS as u32,
@@ -813,7 +1036,7 @@ impl KvMemCtl {
 
         let mut slots = Vec::with_capacity(n_slots);
         let ring_cap = if query_span > 1 {
-            geom.n_fa_layers * query_span * q_width
+            n_record_layers * query_span * q_width
         } else {
             0
         };
@@ -832,7 +1055,12 @@ impl KvMemCtl {
                 lw_incarnation: 0,
                 lw_seq: 0,
                 lw_pressure: None,
+                lw_output_pressure: None,
                 lw_keep: Vec::new(),
+                lw_query_due: false,
+                lw_pending_output: None,
+                lw_head: None,
+                lw_aux_selection: None,
             });
         }
 
@@ -911,9 +1139,18 @@ impl KvMemCtl {
             wt_k: vec![0u8; if strategy.is_layerwise() { geom.max_rows * geom.per_pos_bytes } else { 0 }],
             wt_v: vec![0u8; if strategy.is_layerwise() { geom.max_rows * geom.per_pos_v_bytes } else { 0 }],
             staging: vec![0f32; geom.max_rows * k_width],
-            sums: vec![0f32; geom.n_fa_layers * q_width],
+            sums: vec![0f32; n_record_layers * q_width],
             q_row: vec![0f32; q_width],
-            counts: vec![1u32; geom.n_fa_layers],
+            // Trunk ordinals carry one tapped Q row each; the appended head aux
+            // ordinal (head_plane only) is zeroed so the core retrieval scorer
+            // skips it — trunk selection scores `0..n_fa_layers` exactly as before.
+            counts: {
+                let mut c = vec![1u32; n_record_layers];
+                if head_plane {
+                    c[geom.n_fa_layers] = 0;
+                }
+                c
+            },
             xfer_slab: None,
             batch_xfer: batch_xfer_flag(),
             strategy,
@@ -922,7 +1159,10 @@ impl KvMemCtl {
             watermark,
             query_span,
             q_span: vec![0f32; ring_cap],
-            q_layer_rows: vec![0u32; if query_span > 1 { geom.n_fa_layers } else { 0 }],
+            q_layer_rows: vec![0u32; if query_span > 1 { n_record_layers } else { 0 }],
+            head_plane,
+            aux_ordinal: geom.n_fa_layers as u32,
+            n_record_layers,
         })
     }
 
@@ -1021,7 +1261,16 @@ impl KvMemCtl {
             // owner under the bumped incarnation, so accepted mass / selected
             // pages never alias the previous session. Legacy: both stay empty.
             lw_pressure: None,
+            lw_output_pressure: None,
             lw_keep: Vec::new(),
+            lw_query_due: false,
+            lw_pending_output: None,
+            // P4.1② G3: a fresh session drops the head resident map and its
+            // per-Query binding, mirroring the trunk pressure owners. The next
+            // admitted MTP verify lazily reconstructs the map under the bumped
+            // incarnation. Legacy / AR-only: both stay None (byte-neutral).
+            lw_head: None,
+            lw_aux_selection: None,
         };
         Ok(())
     }
@@ -1040,6 +1289,12 @@ impl KvMemCtl {
         // A new turn's question must not inherit the previous turn's Q span.
         st.q_ring_len = 0;
         st.q_ring_cursor = 0;
+        // [P4.1② fix] arm the per-request scorer Query: the first Layerwise
+        // decode/verify step of this continuation must re-score the resident pool
+        // with the current question (ninfer per-request Query), not refine the
+        // frozen previous-turn keep-set by Pressure (which reuses a stale
+        // compact-tail binding and corrupts cross-turn recall).
+        st.lw_query_due = true;
         Ok(st.fed)
     }
 
@@ -1061,6 +1316,38 @@ impl KvMemCtl {
         if let Some(st) = self.slots.get_mut(slot) {
             st.lw_seq += 1;
         }
+    }
+
+    /// [P4.1② fix] Consume slot `slot`'s per-request scorer-Query gate. Returns
+    /// true exactly once per continuation request (armed by `begin_request`),
+    /// then clears it so subsequent decode/verify steps of the same request
+    /// refine by Pressure. The orchestration calls this in its mutable window
+    /// before borrowing the controller for the carrier and passes the result as
+    /// `force_query`. No-op (false) when out of range / under Legacy.
+    pub fn take_layerwise_query_due(&mut self, slot: usize) -> bool {
+        match self.slots.get_mut(slot) {
+            Some(st) => std::mem::replace(&mut st.lw_query_due, false),
+            None => false,
+        }
+    }
+
+    /// Test-only: seed slot `slot`'s consumed frontier (`fed`) without the GPU
+    /// statistics-feed machinery (`feed_rows` needs live model taps). The P4.1②
+    /// G1 `engine_carrier_rows` GPU fixture populates the slot's statistics store
+    /// directly through [`Self::layerwise_stores`] and uses this to set the host
+    /// length the bootstrap reads. Never compiled into production (zero impact
+    /// on the Legacy byte-neutral spine).
+    #[cfg(test)]
+    pub(crate) fn test_set_fed(&mut self, slot: usize, fed: u32) -> Result<(), String> {
+        let st = self
+            .slots
+            .get_mut(slot)
+            .ok_or_else(|| format!("kvmem: test_set_fed slot {slot} out of range"))?;
+        st.kv
+            .register_append(fed)
+            .map_err(|e| format!("kvmem: test_set_fed append: {e}"))?;
+        st.fed = fed;
+        Ok(())
     }
 
     /// Lazily construct slot `slot`'s session-lifetime prefill pressure owner
@@ -1172,6 +1459,622 @@ impl KvMemCtl {
         if let Some(st) = self.slots.get_mut(slot) {
             st.lw_pressure = Some(pressure);
         }
+    }
+
+    /// Construct slot `slot`'s persistent OUTPUT-scope pressure owner (P4.1②,
+    /// design §A.6) if absent — the MTP-verify sibling of
+    /// [`Self::ensure_layerwise_pressure`]. A verify span accepts a PREFIX of its
+    /// rows (partial acceptance), which the all-or-nothing prefill owner cannot
+    /// express (core layerwise_pressure.cpp:79). NonThinking semantic scope (every
+    /// verify row is body output), interval=1 (sample every body row), ninfer
+    /// decay/commit defaults — mirroring the ① partial-accept fixture. Admission
+    /// is the same finite fail-closed ceiling as the prefill owner (③-E4). The
+    /// caller gates on Layerwise + MTP, so the owner is never built on the AR-only
+    /// / Legacy path (byte-neutral). Idempotent: an existing owner is retained.
+    pub fn ensure_layerwise_output_pressure(
+        &mut self,
+        slot: usize,
+        session_id: u64,
+        incarnation: u64,
+        fa_layers: &[u32],
+    ) -> Result<(), String> {
+        resolve_pressure_admission(
+            self.strategy,
+            self.n_fa_layers,
+            self.budget_blocks,
+            &self.layerwise_quotas,
+        )?;
+        let st = self.slots.get_mut(slot).ok_or_else(|| {
+            format!("kvmem: ensure_layerwise_output_pressure slot {slot} out of range")
+        })?;
+        if st.lw_output_pressure.is_some() {
+            return Ok(());
+        }
+        let session = SessionIdentity { id: session_id + 1, incarnation: incarnation + 1 };
+        let prefill_opts = PrefillOptions {
+            block_tokens: KV_BLOCK_TOKENS as u32,
+            select_tokens: (self.budget_blocks * KV_BLOCK_TOKENS) as u64,
+            reserve_tokens: KV_BLOCK_TOKENS as u64,
+            interval: 1024,
+            stride: 32,
+            half_life: 8192.0,
+        };
+        let output_opts = OutputOptions {
+            scope: OutputScope::NonThinking as u32,
+            interval: 1,
+            decay: 0.5,
+            commit_max_bytes: 16_777_216,
+        };
+        let pressure =
+            OutputPressure::new_external(session, fa_layers, &prefill_opts, &output_opts)
+                .map_err(|e| format!("kvmem: layerwise output pressure create: {e}"))?;
+        st.lw_output_pressure = Some(pressure);
+        Ok(())
+    }
+
+    /// Immutable borrow of slot `slot`'s output-pressure owner (`None` under
+    /// Legacy / AR-only, before the first admitted verify, or out of range). The
+    /// driver borrows it for `select`/`snapshot`; the orchestration owns it for
+    /// `begin_scope`/`prepare_scope`/`accept`.
+    pub fn layerwise_output_pressure(&self, slot: usize) -> Option<&OutputPressure> {
+        self.slots.get(slot).and_then(|st| st.lw_output_pressure.as_ref())
+    }
+
+    /// Mutable borrow of slot `slot`'s output-pressure owner for
+    /// `begin_scope`/`prepare_scope`/`accept`/`restore` (`None` under Legacy /
+    /// AR-only, before construction, or out of range). The caller must have called
+    /// [`Self::ensure_layerwise_output_pressure`] first this session.
+    pub fn layerwise_output_pressure_mut(&mut self, slot: usize) -> Option<&mut OutputPressure> {
+        self.slots.get_mut(slot).and_then(|st| st.lw_output_pressure.as_mut())
+    }
+
+    /// Move slot `slot`'s output-pressure owner OUT of the controller (P4.1②
+    /// borrow resolution, mirrors [`Self::take_layerwise_pressure`]). The scoped
+    /// serve orchestration takes the owner before building the verify carrier
+    /// (which borrows the slot's `&RawStore`/`&KvStore`), so
+    /// `begin_scope`/`prepare_scope`/`accept` can use `&mut OutputPressure`
+    /// independently of those borrows; [`Self::restore_layerwise_output_pressure`]
+    /// puts it back after the forward. `None` under Legacy / AR-only, before
+    /// construction, or out of range. The slot keeps its keep-set / counters /
+    /// prefill owner; only the output owner is detached.
+    pub fn take_layerwise_output_pressure(&mut self, slot: usize) -> Option<OutputPressure> {
+        self.slots.get_mut(slot).and_then(|st| st.lw_output_pressure.take())
+    }
+
+    /// Return a previously [`Self::take_layerwise_output_pressure`]-detached
+    /// owner to slot `slot` (P4.1②). No-op when out of range. The orchestration
+    /// calls this exactly once after the verify forward, before restoring the
+    /// `KvMemCtl` into the rig, so the session-lifetime owner persists to the next
+    /// verify step.
+    pub fn restore_layerwise_output_pressure(&mut self, slot: usize, pressure: OutputPressure) {
+        if let Some(st) = self.slots.get_mut(slot) {
+            st.lw_output_pressure = Some(pressure);
+        }
+    }
+
+    /// Store slot `slot`'s pending output-scope acceptance snapshot (P4.1②,
+    /// design §A.6). The orchestration calls this after the verify forward extracts
+    /// the carrier's captured mass ([`crate::layerwise_driver::LayerwiseQuery::extract_output_acceptance`]),
+    /// BEFORE freeing the carrier and restoring the controller, so the partial
+    /// acceptance survives to the post-sampling publish in `mtp_verify_accept_step`.
+    /// No-op when out of range. Legacy / AR-only never call it (byte-neutral).
+    pub fn set_layerwise_pending_output(&mut self, slot: usize, snap: OutputAcceptanceSnapshot) {
+        if let Some(st) = self.slots.get_mut(slot) {
+            st.lw_pending_output = Some(snap);
+        }
+    }
+
+    /// Move slot `slot`'s pending output-scope acceptance snapshot OUT of the
+    /// controller (P4.1②). `mtp_verify_accept_step` calls this after `feed_rows`
+    /// (the host store advanced by the same `result.advance`) and publishes it via
+    /// [`crate::layerwise_driver::publish_output_acceptance`] at the confirmed
+    /// prefix. `None` under Legacy / AR-only / when no verify is in flight / out of
+    /// range, so the publish is a no-op on every non-Layerwise-MTP path.
+    pub fn take_layerwise_pending_output(&mut self, slot: usize) -> Option<OutputAcceptanceSnapshot> {
+        self.slots.get_mut(slot).and_then(|st| st.lw_pending_output.take())
+    }
+
+    /// P4.1② G3: whether the composite head aux plane is active (Layerwise AND
+    /// native MTP). The orchestration gates every head-plane path on this; under
+    /// Legacy / AR-only it is false and the head keeps the historical
+    /// full-resident KvCache path (byte-neutral).
+    pub fn head_plane_enabled(&self) -> bool {
+        self.head_plane
+    }
+
+    /// P4.1② G3: the head aux plane's ordinal in the composite host record
+    /// (`= n_fa_layers`, the appended LAST ordinal). The head aux-plane
+    /// write-through gathers the head's `k_gpu[0]`/`v_gpu[0]` into this ordinal;
+    /// the trunk GPU paged arena (`0..n_fa_layers`) never addresses it. Only
+    /// meaningful when [`Self::head_plane_enabled`].
+    pub fn aux_ordinal(&self) -> u32 {
+        self.aux_ordinal
+    }
+
+    /// P4.1② G3: lazily construct slot `slot`'s session-lifetime head resident
+    /// map (design §A.8), the head-plane sibling of
+    /// [`Self::ensure_layerwise_pressure`]. Idempotent within a session: once
+    /// built it is reused for every admitted MTP verify until
+    /// [`Self::reset_slot`] drops it. Layerwise + MTP only: under Legacy / AR-only
+    /// this returns `Err` (fail-closed — the map is never created, keeping the
+    /// default path byte-neutral). The head does NOT mass-score, so there is no
+    /// admission ceiling here (unlike the trunk pressure owners); the map starts
+    /// empty and the first FirstLayer binding (G5) populates it.
+    pub fn ensure_head_plane(&mut self, slot: usize) -> Result<(), String> {
+        if !self.head_plane {
+            return Err(
+                "kvmem: head plane requires layerwise recall and native MTP".to_string(),
+            );
+        }
+        let st = self
+            .slots
+            .get_mut(slot)
+            .ok_or_else(|| format!("kvmem: ensure_head_plane slot {slot} out of range"))?;
+        if st.lw_head.is_none() {
+            st.lw_head = Some(HeadPlaneState::default());
+        }
+        Ok(())
+    }
+
+    /// Immutable borrow of slot `slot`'s head resident map (`None` under Legacy /
+    /// AR-only, before the first admitted verify, or out of range). The driver
+    /// reads `auxiliary_pages` / `auxiliary_removed_tokens` to build the aux
+    /// `LayerWorkingSetPlan` and the RoPE shift.
+    pub fn head_plane(&self, slot: usize) -> Option<&HeadPlaneState> {
+        self.slots.get(slot).and_then(|st| st.lw_head.as_ref())
+    }
+
+    /// Mutable borrow of slot `slot`'s head resident map for the post-restore
+    /// update (`auxiliary_pages` / `auxiliary_view_version` /
+    /// `auxiliary_removed_tokens`, ninfer NL:10609-10612). The caller must have
+    /// called [`Self::ensure_head_plane`] first this session.
+    pub fn head_plane_mut(&mut self, slot: usize) -> Option<&mut HeadPlaneState> {
+        self.slots.get_mut(slot).and_then(|st| st.lw_head.as_mut())
+    }
+
+    /// Move slot `slot`'s head resident map OUT of the controller (P4.1② G3
+    /// borrow resolution, mirrors [`Self::take_layerwise_pressure`]). The scoped
+    /// serve orchestration takes the map before building the verify carrier
+    /// (which borrows the slot's `&RawStore`/`&KvStore`), so the aux plan /
+    /// boundary rebuild can use `&mut HeadPlaneState` independently of those
+    /// borrows; [`Self::restore_head_plane`] puts it back after the forward.
+    /// `None` under Legacy / AR-only, before construction, or out of range.
+    pub fn take_head_plane(&mut self, slot: usize) -> Option<HeadPlaneState> {
+        self.slots.get_mut(slot).and_then(|st| st.lw_head.take())
+    }
+
+    /// Return a previously [`Self::take_head_plane`]-detached map to slot `slot`
+    /// (P4.1② G3). No-op when out of range. The orchestration calls this exactly
+    /// once after the verify forward, before restoring the `KvMemCtl` into the
+    /// rig, so the session-lifetime map persists to the next verify step.
+    pub fn restore_head_plane(&mut self, slot: usize, head: HeadPlaneState) {
+        if let Some(st) = self.slots.get_mut(slot) {
+            st.lw_head = Some(head);
+        }
+    }
+
+    /// P4.1② G3: validate slot `slot`'s head resident map against the accepted
+    /// `frontier` (ninfer `KvmemLayerViews::validate`, NL:12267-12270). Returns
+    /// the reconstructed aux extent, or `Err` if the map is absent / does not
+    /// reconstruct the frontier. The boundary rebuild (G4) calls this before
+    /// attending the head stripe, so a corrupted head history fails closed.
+    pub fn validate_head_plane(&self, slot: usize, frontier: u64) -> Result<u64, String> {
+        let head = self
+            .head_plane(slot)
+            .ok_or_else(|| format!("kvmem: validate_head_plane slot {slot} has no head map"))?;
+        head.validate(frontier)
+    }
+
+    /// P4.1② G3: store slot `slot`'s per-Query FirstLayer auxiliary-selection
+    /// binding (① primitive). The restore-hook (G5) creates a fresh
+    /// [`AuxiliarySelection`] per verify span and binds the head history from the
+    /// target's first FA layer's restored ids; the boundary rebuild consumes it
+    /// via [`Self::take_aux_selection`]. No-op when out of range. Legacy / AR-only
+    /// never call it (byte-neutral).
+    pub fn set_aux_selection(&mut self, slot: usize, sel: AuxiliarySelection) {
+        if let Some(st) = self.slots.get_mut(slot) {
+            st.lw_aux_selection = Some(sel);
+        }
+    }
+
+    /// Move slot `slot`'s per-Query auxiliary-selection binding OUT of the
+    /// controller (P4.1② G3, mirrors [`Self::take_layerwise_pending_output`]).
+    /// `None` under Legacy / AR-only / when no verify is in flight / out of range,
+    /// so the boundary rebuild is a no-op on every non-Layerwise-MTP path.
+    pub fn take_aux_selection(&mut self, slot: usize) -> Option<AuxiliarySelection> {
+        self.slots.get_mut(slot).and_then(|st| st.lw_aux_selection.take())
+    }
+
+    /// P4.1② G3b: host-side seal of the head auxiliary plane. Seals this feed's
+    /// gathered packed Q8 K/V rows into the slot's COMPOSITE host record at the
+    /// aux ordinal (`aux_ordinal`, the appended `n_fa`-th layer), mirroring the
+    /// trunk `write_through_archive` seal but for the single head plane. Split
+    /// from the GPU gather so the seal + readback round-trip is host-testable.
+    ///
+    /// Fail-closed unless the head plane is active (Layerwise + MTP): Legacy /
+    /// AR-only never co-archive the head, keeping the default byte-neutral.
+    /// `k_rows`/`v_rows` are the contiguous packed rows for `[pos0, pos0+n_rows)`
+    /// (`n_rows * per_pos_bytes` / `n_rows * per_pos_v_bytes` bytes).
+    fn seal_head_plane(
+        &mut self,
+        slot: usize,
+        pos0: usize,
+        n_rows: usize,
+        k_rows: &[u8],
+        v_rows: &[u8],
+    ) -> Result<(), String> {
+        if !self.head_plane {
+            return Err(
+                "kvmem head write-through: head plane inactive (requires Layerwise + MTP)"
+                    .to_string(),
+            );
+        }
+        if slot >= self.slots.len() {
+            return Err(format!("kvmem head write-through: slot {slot} out of range"));
+        }
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let aux = self.aux_ordinal;
+        let raw = &mut self.slots[slot].raw;
+        raw.write_layer_k_gpu(pos0 as u32, n_rows as u32, aux, k_rows)
+            .map_err(|e| format!("kvmem head write-through K seal (aux {aux}): {e}"))?;
+        raw.write_layer_v_gpu(pos0 as u32, n_rows as u32, aux, v_rows)
+            .map_err(|e| format!("kvmem head write-through V seal (aux {aux}): {e}"))?;
+        Ok(())
+    }
+
+    /// P4.1② G3b: head auxiliary-plane write-through (GPU gather + seal). Gather
+    /// this feed's packed Q8 K/V rows out of the head's single-layer GPU cache
+    /// and seal them into the composite host record at the aux ordinal, so EVERY
+    /// accepted head token's payload survives for drop-evict + stripe
+    /// restore-before-attend (design §A.8 Q1). Mirrors the trunk
+    /// `write_through_archive`, but the head cache is position-major CONTIGUOUS
+    /// (a plain `KvCache`, no block table): the fed range is ONE contiguous
+    /// gather per plane at `src_pos0 * row_bytes`.
+    ///
+    /// `src_pos0` is the fed range's start position WITHIN the head tensor. The
+    /// full-resident head `KvCache` (G3b) is addressed at the global frontier
+    /// (`src_pos0 == pos0`); the bounded head pool (G3c, window + 64 scratch)
+    /// slides, so its caller passes the pool-local offset. The head tensor's
+    /// per-position byte stride MUST equal the trunk geometry (`per_pos_bytes` /
+    /// `per_pos_v_bytes`) — the head shares the trunk KV geometry.
+    ///
+    /// Only called when `head_plane_enabled()`; fails closed otherwise (before
+    /// any GPU work), keeping Legacy / AR-only byte-neutral.
+    pub fn head_write_through_archive(
+        &mut self,
+        gpu: &Gpu,
+        head_k: &GpuTensor,
+        head_v: &GpuTensor,
+        slot: usize,
+        pos0: usize,
+        n_rows: usize,
+        src_pos0: usize,
+    ) -> Result<(), String> {
+        if !self.head_plane {
+            return Err(
+                "kvmem head write-through: head plane inactive (requires Layerwise + MTP)"
+                    .to_string(),
+            );
+        }
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let krow = self.k_page_bytes / KV_BLOCK_TOKENS;
+        let vrow = self.v_page_bytes / KV_BLOCK_TOKENS;
+        // The feed must fit the tap row capacity (the trunk staging bound); the
+        // head gather allocates its own contiguous buffers below.
+        if n_rows * krow > self.wt_k.len() || n_rows * vrow > self.wt_v.len() {
+            return Err(format!(
+                "kvmem head write-through: feed of {n_rows} rows exceeds the staging \
+                 capacity ({} K / {} V bytes)",
+                self.wt_k.len(),
+                self.wt_v.len()
+            ));
+        }
+        // The head cache is contiguous position-major: one D2H per plane into a
+        // freshly sized buffer (the head is a single layer, so unlike the trunk
+        // it needs no shared zero-alloc staging arena).
+        let mut k_rows = vec![0u8; n_rows * krow];
+        let mut v_rows = vec![0u8; n_rows * vrow];
+        gpu.hip
+            .memcpy_dtoh_at(&mut k_rows, &head_k.buf, src_pos0 * krow)
+            .map_err(|e| format!("kvmem head write-through K gather: {e:?}"))?;
+        gpu.hip
+            .memcpy_dtoh_at(&mut v_rows, &head_v.buf, src_pos0 * vrow)
+            .map_err(|e| format!("kvmem head write-through V gather: {e:?}"))?;
+        self.seal_head_plane(slot, pos0, n_rows, &k_rows, &v_rows)
+    }
+
+    /// P4.1② G3c: the MTP head's BOUNDED token capacity (design §A.8 Q1, the
+    /// hipfire analog of ninfer `layerwise_mtp_auxiliary_capacity`): the trunk
+    /// layerwise working-set window (`window_tokens`) PLUS ONE native draft-scratch
+    /// block (`KV_BLOCK_TOKENS`). Under Layerwise the head is bounded to the trunk
+    /// window — accepted head history beyond it is co-archived to the composite
+    /// record's aux plane and restored-before-attend (G4), never full-resident.
+    /// Fail-closed off the Layerwise+MTP path and on a non-page-aligned / zero
+    /// window (the ① [`mtp_auxiliary_capacity`] guard), keeping Legacy byte-neutral.
+    pub fn head_pool_capacity(&self, window_tokens: usize) -> Result<usize, String> {
+        if !self.head_plane {
+            return Err(
+                "kvmem head pool: head plane inactive (requires Layerwise + MTP)".to_string()
+            );
+        }
+        mtp_auxiliary_capacity(window_tokens, KV_BLOCK_TOKENS)
+    }
+
+    /// P4.1② f2 (E): the bounded head KV token capacity for LIVE allocation, or
+    /// `None` off the Layerwise+MTP path. The window is the trunk layerwise
+    /// working-set window (`budget_blocks * KV_BLOCK_TOKENS`, the same source the
+    /// G4 head carrier uses); the capacity adds one native draft-scratch block
+    /// ([`Self::head_pool_capacity`]). Legacy / AR-only (`head_plane` false) return
+    /// `None` ⇒ the caller keeps the full-resident head cache (byte-neutral). A
+    /// non-page-aligned / zero window fails closed to `None` rather than bounding
+    /// to a bad geometry.
+    pub fn head_bounded_capacity(&self) -> Option<usize> {
+        if !self.head_plane {
+            return None;
+        }
+        let window = self.budget_blocks().checked_mul(KV_BLOCK_TOKENS)?;
+        self.head_pool_capacity(window).ok()
+    }
+
+    /// P4.1② f2 (E): the head prefill COMPACT-write shift at `frontier` — the
+    /// hipfire analog of ninfer `removed_tokens` / `cache_position_shift`
+    /// (NL:8442): `max(0, frontier - window)`. The bounded head staging cache
+    /// writes prompt K/V at `global - shift` (COMPACT) while RoPE stays GLOBAL
+    /// (`rope_shift = shift`). Returns `0` off the Layerwise+MTP path (`head_plane`
+    /// false) ⇒ compact == global, byte-neutral. The resident head cache is only
+    /// per-chunk archive staging under Layerwise (the G4 carrier is the attention
+    /// source), so each chunk re-stages independently — no slide.
+    pub fn head_prefill_shift(&self, frontier: usize) -> usize {
+        if !self.head_plane {
+            return 0;
+        }
+        let window = self.budget_blocks().saturating_mul(KV_BLOCK_TOKENS);
+        frontier.saturating_sub(window)
+    }
+
+    /// P4.1② G3c: build the MTP head's bounded composite-slot pool geometry (①
+    /// [`mtp_head_pool`]): ONE fa layer (the head aux plane), `window_tokens` of
+    /// accepted history + one draft-scratch block, `window_tokens / KV_BLOCK_TOKENS
+    /// + 1` slots. The head owns this pool INDEPENDENTLY of the trunk (ninfer's
+    /// independent resident map + `LayerWorkingSetPlan`, quota = window). The K/V
+    /// strides are the shared trunk/head Q8 geometry (`per_pos_bytes`). Pure host
+    /// geometry — the caller (serve) allocates the bounded head KV from it,
+    /// replacing the historical full-resident head `KvCache`. Fail-closed off the
+    /// Layerwise+MTP path; Legacy / AR-only allocate nothing (byte-neutral).
+    pub fn head_pool(&self, window_tokens: usize) -> Result<LayerwisePagePool, String> {
+        if !self.head_plane {
+            return Err(
+                "kvmem head pool: head plane inactive (requires Layerwise + MTP)".to_string()
+            );
+        }
+        mtp_head_pool(
+            window_tokens,
+            KV_BLOCK_TOKENS,
+            self.k_page_bytes / KV_BLOCK_TOKENS,
+            self.v_page_bytes / KV_BLOCK_TOKENS,
+        )
+    }
+
+    /// P4.1② G3c: the MTP head's INDEPENDENT `LayerWorkingSetPlan` (design §A.8
+    /// Q1), the hipfire analog of ninfer's `aux_catalog.plan_layer` (NL:10578-10584).
+    /// The head does NOT mass-score: it follows the target's first FA layer's
+    /// restored ids (FirstLayer, bound by G5) and plans its OWN aux-plane residency
+    /// against an independent quota (`window_tokens`). Pure host data — no GPU, no
+    /// state machine — so the plan is computable before the verify carrier borrows
+    /// the slot's stores.
+    ///
+    /// Builds a SINGLE-layer (aux ordinal `n_fa`) [`MemoryCatalog`] over the
+    /// COMPOSITE Main+aux descriptor ([`LayerwiseMtpQ8Layout`], `Q8_MAIN_MTP_FORMAT`),
+    /// exactly mirroring ninfer's `LayerwiseMemoryCatalog(archive.descriptor,
+    /// {{model, aux}})`: the canonical frame is the sealed full pages of the accepted
+    /// head history, the resident list is the head's own map
+    /// ([`HeadPlaneState::auxiliary_pages`], widened `u32`→`u64` at this boundary,
+    /// NL:10575), and the stamp's `view_version` is the head's independent
+    /// `auxiliary_view_version` (NL:10576). The selection budget is ninfer's
+    /// `{window, 0, window, retained}` — `host_payload_bytes` is the full composite
+    /// record envelope (`full_pages * record_bytes`), the exact value the core
+    /// `plan_working_set` charges (`host_records * layout.record_bytes`).
+    ///
+    /// `selected` are the FirstLayer-bound target page ids (a subset of the sealed
+    /// history); `fed` is the accepted head frontier (the canonical frame is its
+    /// full-page boundary `fed / 128 * 128`, the partial tail is the suffix §3.9g);
+    /// `session_id` is the engine session (mapped 1-based like the trunk bootstrap).
+    /// `head` is the DETACHED resident map (G3 borrow resolution: the orchestration
+    /// `take_head_plane`s it before building the carrier that borrows the slot's
+    /// `&RawStore`, so this `&self` plan coexists with this borrow); the caller
+    /// gates existence via `take_head_plane` → `Some`. Fail-closed off the
+    /// Layerwise+MTP path, on a non-page-aligned / zero window, or with no sealed
+    /// full page — Legacy / AR-only never plan the head (byte-neutral). Returns the
+    /// core [`LayerPlan`] the G4 stripe restore executes; the post-restore map
+    /// update (NL:10609-10612) is G4's concern.
+    #[allow(clippy::too_many_arguments)]
+    pub fn plan_head_plane(
+        &self,
+        slot: usize,
+        head: &HeadPlaneState,
+        selected: &[u64],
+        fed: u64,
+        window_tokens: usize,
+        session_id: u64,
+        max_position: u32,
+        model: &str,
+    ) -> Result<LayerPlan, String> {
+        if !self.head_plane {
+            return Err(
+                "kvmem head plan: head plane inactive (requires Layerwise + MTP)".to_string()
+            );
+        }
+        // `head` is the DETACHED resident map (G3 borrow resolution: the serve
+        // orchestration `take_head_plane`s it before building the carrier, which
+        // borrows the slot's `&RawStore`). The plan reads it independently of that
+        // borrow; the caller guarantees it exists (`take_head_plane` → `Some`).
+        let (incarnation, seq) = self
+            .layerwise_counters(slot)
+            .ok_or_else(|| format!("kvmem head plan: slot {slot} out of range"))?;
+        let bt = KV_BLOCK_TOKENS as u64;
+        if window_tokens == 0 || window_tokens % KV_BLOCK_TOKENS != 0 {
+            return Err(format!(
+                "kvmem head plan: window {window_tokens} must be a positive multiple of {KV_BLOCK_TOKENS}"
+            ));
+        }
+        let full_pages = fed / bt;
+        if full_pages == 0 {
+            return Err("kvmem head plan: no sealed full page yet".to_string());
+        }
+        let frontier = full_pages * bt;
+        // Composite Main+aux descriptor; the head plans ONLY the aux ordinal.
+        let mtp = LayerwiseMtpQ8Layout::resolve(self.n_fa_layers, self.n_kv_heads, self.head_dim)
+            .map_err(|e| format!("kvmem head plan: mtp layout: {e}"))?;
+        let layout = mtp
+            .payload_layout()
+            .map_err(|e| format!("kvmem head plan: manifest: {e}"))?;
+        let record_bytes = layout.record_bytes();
+        let descriptor = MemoryDescriptor::new(
+            &layerwise_backend(model),
+            &layout,
+            &layerwise_capabilities(max_position),
+        )
+        .map_err(|e| format!("kvmem head plan: descriptor: {e}"))?;
+        // 1-based logical identity (mirrors bootstrap_layerwise; the core requires
+        // every identity field != 0 and block.session == stamp.session).
+        let session = SessionIdentity { id: session_id + 1, incarnation: incarnation + 1 };
+        let revision = seq + 1;
+        let blocks: Vec<BlockCopies> = (0..full_pages)
+            .map(|page| BlockCopies {
+                block: BlockDescriptor {
+                    session,
+                    id: page,
+                    original_start: page * bt,
+                    valid_tokens: KV_BLOCK_TOKENS as u32,
+                    content_version: 1,
+                    statistics_version: 1,
+                },
+                host_version: 1,
+            })
+            .collect();
+        // The head's independent resident map (defensive filter to the sealed
+        // history, mirroring the trunk keep-set filter).
+        let resident: Vec<u64> = head
+            .auxiliary_pages
+            .iter()
+            .copied()
+            .map(u64::from)
+            .filter(|&id| id < full_pages)
+            .collect();
+        let stamp = MemoryStamp {
+            valid: 1,
+            session,
+            history_revision: revision,
+            // The head's OWN view version (ninfer NL:10576), not the trunk's.
+            view_version: head.auxiliary_view_version,
+            frontier,
+            execution_history: revision,
+        };
+        let aux = LayerMemorySnapshot {
+            model_layer: self.aux_ordinal,
+            memory: MemorySnapshot { stamp, blocks, resident },
+        };
+        let catalog = MemoryCatalog::new(&descriptor, &[aux])
+            .map_err(|e| format!("kvmem head plan: catalog: {e}"))?;
+        let budget = MemoryBudget {
+            selected_tokens: window_tokens as u64,
+            reserve_tokens: 0,
+            device_tokens: window_tokens as u64,
+            host_payload_bytes: full_pages * record_bytes,
+        };
+        let selection = LayerSelection {
+            model_layer: self.aux_ordinal,
+            expected: stamp,
+            selected: selected.to_vec(),
+            mandatory: Vec::new(),
+            budget,
+        };
+        catalog
+            .plan_layer(&selection)
+            .map_err(|e| format!("kvmem head plan: plan_layer aux {}: {e}", self.aux_ordinal))
+    }
+
+    /// P4.1② G4: publish the head's post-restore resident map (ninfer
+    /// NL:10609-10612). After the aux stripe restore returns its [`ExecutionView`],
+    /// the head's INDEPENDENT map becomes the restored compact view:
+    /// `auxiliary_pages` = the view's canonical block ids (chronological),
+    /// `auxiliary_view_version` = the view stamp's view version, and
+    /// `auxiliary_removed_tokens` = `frontier - view.visible_tokens` — the RoPE
+    /// shift for the head's restored rows (NL:5848/10328). The head ALGORITHM is
+    /// unchanged (full-history attention); only its KV residency map advances.
+    ///
+    /// Validates the ninfer aux invariant (`visible + removed == frontier`,
+    /// NL:10614 `maps.validate`) BEFORE publishing, so a corrupted or
+    /// non-chronological restore can never be attended. `head` is the DETACHED
+    /// resident map (G3 borrow resolution): the publish writes it in place
+    /// (`&self`, no `&mut ctl`), so it coexists with the verify carrier's
+    /// `&RawStore` borrow; the caller `restore_head_plane`s it back after the
+    /// forward. Fail-closed off the Layerwise+MTP path, when the visible extent
+    /// exceeds the frontier, or on a block id that does not fit `u32` — Legacy /
+    /// AR-only never publish a head map (byte-neutral).
+    pub fn accept_head_restore(
+        &self,
+        slot: usize,
+        head: &mut HeadPlaneState,
+        view: &ExecutionView,
+        frontier: u64,
+    ) -> Result<(), String> {
+        if !self.head_plane {
+            return Err(
+                "kvmem head restore: head plane inactive (requires Layerwise + MTP)".to_string()
+            );
+        }
+        let removed = auxiliary_removed_tokens(frontier, view.visible_tokens)
+            .map_err(|e| format!("kvmem head restore: {e}"))?;
+        let mut pages = Vec::with_capacity(view.blocks.len());
+        for b in &view.blocks {
+            pages.push(u32::try_from(b.block.id).map_err(|_| {
+                format!("kvmem head restore: block id {} overflow u32", b.block.id)
+            })?);
+        }
+        // ninfer restores into a TEMPORARY map and commits only after validate
+        // (NL:10614/10621): build the candidate, validate the aux invariant, and
+        // publish atomically so a failed restore never corrupts the live map.
+        // `head` is the DETACHED resident map (G3 borrow resolution); the caller
+        // `restore_head_plane`s it back after the forward.
+        let candidate = HeadPlaneState {
+            auxiliary_pages: pages,
+            auxiliary_view_version: view.stamp.view_version,
+            auxiliary_removed_tokens: removed,
+        };
+        candidate
+            .validate(frontier)
+            .map_err(|e| format!("kvmem head restore: slot {slot}: {e}"))?;
+        *head = candidate;
+        Ok(())
+    }
+
+    /// P4.1② G4 (f2-D): publish the head's accepted canonical append after the
+    /// consume pass co-archives the accepted verify rows — the hipfire analog of
+    /// ninfer `accept` calling `maps.accepted_auxiliary_append(begin, end)`
+    /// (NL:10387). Unlike [`Self::accept_head_restore`] (which publishes a
+    /// DETACHED map during a restore, `&self`), the consume runs with no carrier
+    /// borrowing the slot, so this advances the LIVE map in place (`&mut self`).
+    /// `begin`/`end` are the GLOBAL accepted frontier span (the same `pos` /
+    /// `pos + advance` fed to [`Self::feed_rows`]); the archive is indexed by
+    /// absolute position. Fail-closed off the Layerwise+MTP path, on a missing
+    /// head map, or on a map that does not reconstruct `end` — Legacy / AR-only
+    /// never publish a head append (byte-neutral).
+    pub fn accept_head_append(&mut self, slot: usize, begin: u64, end: u64) -> Result<(), String> {
+        if !self.head_plane {
+            return Err(
+                "kvmem head append: head plane inactive (requires Layerwise + MTP)".to_string()
+            );
+        }
+        let head = self
+            .head_plane_mut(slot)
+            .ok_or_else(|| format!("kvmem head append: slot {slot} has no head map"))?;
+        head.append_accepted(begin, end)
+            .map_err(|e| format!("kvmem head append: slot {slot}: {e}"))
     }
 
     /// Feed the tapped K rows [row_start, row_start + n_rows) of `slot`'s
@@ -1417,9 +2320,9 @@ impl KvMemCtl {
                 budget,
                 sink,
                 recent,
-                &self.q_span[..n_fa * len * qw],
+                &self.q_span[..self.n_record_layers * len * qw],
                 &self.q_layer_rows,
-                n_fa as u32,
+                self.n_record_layers as u32,
                 len as u32,
                 self.n_heads as u32,
                 self.n_kv_heads as u32,
@@ -1449,7 +2352,7 @@ impl KvMemCtl {
             pages as u32,
             &self.sums,
             &self.counts,
-            self.n_fa_layers as u32,
+            self.n_record_layers as u32,
             self.head_dim as u32,
             self.n_heads as u32,
             self.n_kv_heads as u32,
@@ -1678,6 +2581,51 @@ impl KvMemCtl {
                 self.slots[s].first_decode_done = true;
             }
             plans[s] = Some(StepPlan { keep, restore });
+            // P4.1② f2 (G5 prefill seed): seed the FirstLayer head aux selection
+            // from this step's trunk working set. The first MTP draft of a request
+            // runs BEFORE any decode/verify carrier restore-hook — the draft phase
+            // precedes `prepare_step` in the serve loop and the prefill is
+            // full-resident with no carrier — so the G5 carrier binding
+            // (serve_engine decode/verify arms) has not fired yet and the draft
+            // would fall back to full-resident, overflowing the bounded head cache
+            // once `fed > window`. This is the hipfire analog of ninfer's
+            // restore-hook `bind_auxiliary_selection` (NL:9985-9990) firing on the
+            // trunk's first restored layer; the draft `take_aux_selection`s it to
+            // engage the bounded head restore. The selected pages are full pages
+            // strictly below the frontier, so the visible extent is invariant
+            // between this step's `fed` and the later draft's `fed`. Additive +
+            // gated: Legacy / AR-only (`head_plane_enabled()` false) never bind
+            // (byte-neutral); zero core C++ change.
+            if self.head_plane_enabled() {
+                let frontier = u64::from(self.slots[s].fed);
+                // The head catalog (`plan_head_plane`) spans only SEALED FULL
+                // pages (`id < frontier/128`); the partial suffix page
+                // (`id == frontier/128`) is the draft-scratch boundary handled
+                // separately by `HeadSuffix`, NOT a canonical aux block. `picked`
+                // includes that suffix, so filter it out here — mirroring
+                // `restored_keep_set()` (suffix excluded), the source the G5
+                // carrier binding uses. `auxiliary_visible_tokens` clips the
+                // suffix to the frontier so `bind` would accept it, but
+                // `plan_layer` then rejects `id == full_pages` as an "unknown
+                // selected block" (out of catalog). Filtering to full pages also
+                // keeps the visible extent invariant (each contributes exactly
+                // one block) between this step's `fed` and the later draft's.
+                let full_pages = frontier / KV_BLOCK_TOKENS as u64;
+                let mut sel: Vec<u64> = picked
+                    .iter()
+                    .map(|&id| u64::from(id))
+                    .filter(|&id| id < full_pages)
+                    .collect();
+                sel.sort_unstable();
+                sel.dedup();
+                let aux = crate::layerwise_mtp::bind_first_layer_auxiliary(
+                    &sel,
+                    frontier,
+                    KV_BLOCK_TOKENS as u64,
+                )
+                .map_err(|e| format!("kvmem head aux seed (slot {s}): {e}"))?;
+                self.set_aux_selection(s, aux);
+            }
         }
 
         // ── Pass 2: restore the selected spilled pages ──────────────────────
@@ -2196,10 +3144,45 @@ mod tests {
             per_pos_bytes: 136,
             per_pos_v_bytes: 136,
             max_rows: 512,
+            mtp_head: false,
         }
+    }
+    /// P4.1② G3: the same tiny geometry with the native MTP head enabled, so the
+    /// composite host record (`n_fa_layers + 1` ordinals) and the head-plane
+    /// lifecycle can be exercised host-only.
+    fn geom_mtp() -> KvMemGeometry {
+        KvMemGeometry { mtp_head: true, ..geom() }
     }
     fn plan() -> KvMemPlan {
         KvMemPlan { pages_total: 16, budget_blocks: 4, grow_blocks: 2, interval: 1 }
+    }
+
+    /// [P4.1② fix] host-only: the per-request scorer-Query gate is armed by
+    /// `begin_request` (continuation admit), consumed exactly once by
+    /// `take_layerwise_query_due`, re-armed by the next request, and cleared by
+    /// `reset_slot`. Legacy never reads it (the carrier returns None early), so
+    /// arming it is byte-neutral there.
+    #[test]
+    fn per_request_query_gate_lifecycle() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let mut ctl =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("layerwise ctl");
+        // Cold slot: no request begun ⇒ gate idle.
+        assert!(!ctl.take_layerwise_query_due(0));
+        // A continuation admit arms the gate; the first decode step consumes it.
+        ctl.begin_request(0).expect("begin_request");
+        assert!(ctl.take_layerwise_query_due(0), "first take after begin_request");
+        assert!(!ctl.take_layerwise_query_due(0), "gate consumed exactly once");
+        // The next continuation re-arms it (per-request Query semantics).
+        ctl.begin_request(0).expect("begin_request 2");
+        assert!(ctl.take_layerwise_query_due(0));
+        // A fresh session drops the gate.
+        ctl.begin_request(0).expect("begin_request 3");
+        ctl.reset_slot(0).expect("reset_slot");
+        assert!(!ctl.take_layerwise_query_due(0), "reset_slot clears the gate");
+        // Out-of-range slot is a no-op (false), never panics.
+        assert!(!ctl.take_layerwise_query_due(99));
     }
 
     /// Host-only: the strategy parser/resolver mirror the core ordinals and
@@ -2473,6 +3456,265 @@ mod tests {
         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
     }
 
+    /// Host-only: the P4.1② MTP-verify output-pressure owner lifecycle — the
+    /// partial-acceptance sibling of the prefill owner above. Legacy never
+    /// creates it (fail-closed `ensure`, `None` borrow — byte-neutral, the AR
+    /// path is untouched). Layerwise constructs lazily and idempotently in its
+    /// OWN request space (session id/incarnation offset +1 from the prefill
+    /// owner), NonThinking scope, under the same finite fail-closed admission
+    /// ceiling; `take`/`restore` detach it for the scoped verify borrow without
+    /// disturbing the prefill owner / keep-set; and `reset_slot` drops it (a
+    /// fresh session never aliases the previous session's accepted output mass).
+    /// Exercises all five owner methods so none is dead code.
+    #[test]
+    fn layerwise_output_pressure_owner_lifecycle() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let fa_layers = [0u32, 1];
+
+        // Legacy: the output owner is never created; ensure fails closed.
+        let mut legacy =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
+                .expect("legacy ctl");
+        assert!(legacy.layerwise_output_pressure(0).is_none(), "Legacy: no output owner");
+        assert!(
+            legacy.ensure_layerwise_output_pressure(0, 0, 0, &fa_layers).is_err(),
+            "Legacy: ensure must fail closed (byte-neutral)"
+        );
+        assert!(
+            legacy.layerwise_output_pressure(0).is_none(),
+            "Legacy: still no output owner after ensure"
+        );
+
+        // Layerwise: lazy, idempotent construction.
+        let mut lw =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("layerwise ctl");
+        assert!(lw.layerwise_output_pressure(0).is_none(), "before ensure: no output owner");
+        assert!(lw.layerwise_output_pressure_mut(0).is_none(), "before ensure: no mut output owner");
+        lw.ensure_layerwise_output_pressure(0, 7, 3, &fa_layers).expect("construct output owner");
+        // The output window lives in its own request space: session id/incarnation +1.
+        {
+            let owner = lw.layerwise_output_pressure(0).expect("output owner");
+            let snap = owner.snapshot().expect("snapshot");
+            let session = snap.session().expect("session");
+            assert_eq!(session.id, 8, "output session id = session_id + 1");
+            assert_eq!(session.incarnation, 4, "output incarnation = incarnation + 1");
+            assert_eq!(snap.layer_count(), fa_layers.len(), "one output state per FA layer");
+            assert_eq!(snap.read().expect("read").accepted_end, 0, "fresh owner: no accepted output");
+        }
+        // Idempotent within a session: a second ensure is a no-op, owner persists.
+        lw.ensure_layerwise_output_pressure(0, 7, 3, &fa_layers).expect("idempotent ensure");
+        assert!(lw.layerwise_output_pressure(0).is_some(), "output owner persists across ensure");
+        assert!(lw.layerwise_output_pressure_mut(0).is_some(), "mut borrow available");
+
+        // The output owner is independent of the prefill owner: constructing it
+        // does not create the prefill owner, and vice versa.
+        assert!(lw.layerwise_pressure(0).is_none(), "output ensure does not build the prefill owner");
+        lw.ensure_layerwise_pressure(0, 7, 3, &fa_layers).expect("construct prefill owner");
+        assert!(lw.layerwise_output_pressure(0).is_some(), "prefill ensure leaves the output owner");
+
+        // take/restore detaches the output owner for the scoped verify borrow,
+        // then returns it (the prefill owner / keep-set survive throughout).
+        lw.set_layerwise_keep_set(0, vec![vec![0, 2], vec![1]]);
+        let detached = lw.take_layerwise_output_pressure(0).expect("take output owner");
+        assert!(lw.layerwise_output_pressure(0).is_none(), "output owner detached");
+        assert!(lw.layerwise_pressure(0).is_some(), "prefill owner survives output take");
+        assert_eq!(
+            lw.layerwise_keep_set(0),
+            Some(&[vec![0u64, 2], vec![1u64]][..]),
+            "keep-set survives output take"
+        );
+        lw.restore_layerwise_output_pressure(0, detached);
+        assert!(lw.layerwise_output_pressure(0).is_some(), "output owner restored");
+
+        // Out-of-range accessors are None / Err (no panic).
+        assert!(lw.layerwise_output_pressure(9).is_none());
+        assert!(lw.layerwise_output_pressure_mut(9).is_none());
+        assert!(lw.take_layerwise_output_pressure(9).is_none());
+        assert!(lw.ensure_layerwise_output_pressure(9, 0, 0, &fa_layers).is_err());
+        // restore out of range is a silent no-op (never panics, never aliases).
+        let stray = lw.take_layerwise_output_pressure(0).expect("take for stray restore");
+        lw.restore_layerwise_output_pressure(9, stray);
+        assert!(lw.layerwise_output_pressure(0).is_none(), "stray restore did not alias slot 0");
+        lw.ensure_layerwise_output_pressure(0, 7, 3, &fa_layers).expect("rebuild after stray");
+
+        // reset_slot drops the output owner AND bumps incarnation; the prefill
+        // owner is dropped too (a fresh session never aliases either).
+        let (inc_before, _) = lw.layerwise_counters(0).expect("counters");
+        lw.reset_slot(0).expect("reset");
+        assert!(lw.layerwise_output_pressure(0).is_none(), "reset drops the output owner");
+        assert!(lw.layerwise_pressure(0).is_none(), "reset drops the prefill owner");
+        let (inc_after, _) = lw.layerwise_counters(0).expect("counters after reset");
+        assert_eq!(inc_after, inc_before + 1, "reset bumps incarnation");
+        // A fresh session reconstructs under the new incarnation.
+        lw.ensure_layerwise_output_pressure(0, 7, inc_after, &fa_layers).expect("reconstruct");
+        assert!(lw.layerwise_output_pressure(0).is_some(), "reconstructed output owner");
+
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// Host-only regression for P4.1② bug #9: a continuation turn's unsampled
+    /// Legacy prefill advances the native consumed frontier without the persistent
+    /// output window observing it. hipfire keeps ONE window per session
+    /// (request = session_id + 1, `begin_scope` idempotent, never finished), so after
+    /// the previous turn's verify `accept` the window is left `prepared_ = true`
+    /// with `accepted_end` at the old frontier; the next turn's `prepare_scope` at
+    /// the new frontier was rejected ("native grammar verifier differs from accepted
+    /// frontier"). `sync_prefill` repositions the accepted feedback to the validated
+    /// native prefix via the core restore primitive (ninfer accept_prefill semantics,
+    /// NL:8482/17094), preserving the accumulated pending mass + sample count and
+    /// clearing prepared_. Idempotent / no-op when accepted_end >= position.
+    #[test]
+    fn layerwise_output_sync_prefill_continuation() {
+        use hipfire_kvmem::{
+            MemoryStamp, OutputAcceptance, OutputMass, OutputOptions, OutputPressure,
+            OutputScope, OutputScopeRow, OutputScopeState, PrefillOptions, SessionIdentity,
+        };
+        let session = SessionIdentity { id: 8, incarnation: 4 };
+        let fa = [0u32, 1];
+        let prefill_opts = PrefillOptions {
+            block_tokens: 128,
+            select_tokens: 128,
+            reserve_tokens: 128,
+            interval: 1024,
+            stride: 32,
+            half_life: 8192.0,
+        };
+        let output_opts = OutputOptions {
+            scope: OutputScope::NonThinking as u32,
+            interval: 1,
+            decay: 0.5,
+            commit_max_bytes: 16_777_216,
+        };
+        let mut p = OutputPressure::new_external(session, &fa, &prefill_opts, &output_opts)
+            .expect("output owner");
+        let stamp = |frontier: u64| MemoryStamp {
+            valid: 1,
+            session,
+            history_revision: 1,
+            view_version: 1,
+            frontier,
+            execution_history: 1,
+        };
+        let request = 8u64;
+        let rows = vec![OutputScopeRow::new(false, false, true); 4];
+
+        // Turn 1: open the window at frontier 384, prepare 4 body rows, accept all
+        // four (each row contributes unit mass to logical page 0).
+        let f0 = 384u64;
+        p.begin_scope(&stamp(f0), request, OutputScopeState::new(false, false))
+            .expect("begin_scope turn1");
+        let mask = p.prepare_scope(request, f0, &rows).expect("prepare_scope turn1");
+        assert_eq!(mask, 0b1111, "all four verify rows sampled");
+        let acc = OutputAcceptance {
+            history: stamp(f0 + 4),
+            request,
+            accepted: 4,
+            rows: vec![0, 1, 2, 3],
+            layers: fa
+                .iter()
+                .map(|&l| OutputMass {
+                    model_layer: l,
+                    history: vec![0],
+                    masses: vec![1.0, 1.0, 1.0, 1.0],
+                })
+                .collect(),
+        };
+        p.accept(&acc).expect("accept turn1");
+        let s = p.snapshot().expect("snap").read().expect("read");
+        assert_eq!(s.accepted_end, f0 + 4, "accept advances accepted_end");
+        assert_eq!(s.layers[0].pending, vec![(0u64, 4.0)], "pending mass seeded");
+        assert_eq!(s.layers[0].samples, 4, "four sampled rows");
+
+        // Continuation turn 2: Legacy prefill advances the native frontier to 1024
+        // WITHOUT the window observing it; begin_scope is a same-request no-op.
+        let f1 = 1024u64;
+        p.begin_scope(&stamp(f1), request, OutputScopeState::new(false, false))
+            .expect("begin_scope no-op");
+        // #9 reproduction: prepare_scope at the new frontier is rejected because
+        // accepted_end still lags at f0 + 4 (and prepared_ is left true by accept).
+        let err = p
+            .prepare_scope(request, f1, &rows)
+            .expect_err("prefill gap must reject prepare_scope");
+        assert!(err.0.contains("accepted frontier"), "unexpected error: {err}");
+
+        // The fix: sync the accepted feedback to the validated native prefix.
+        p.sync_prefill(f1).expect("sync_prefill");
+        let s = p.snapshot().expect("snap").read().expect("read");
+        assert_eq!(s.accepted_end, f1, "sync advances accepted_end to the native frontier");
+        assert_eq!(s.layers[0].pending, vec![(0u64, 4.0)], "sync preserves pending mass");
+        assert_eq!(s.layers[0].samples, 4, "sync preserves sample count");
+        assert!(s.active, "window stays active");
+        let mask = p
+            .prepare_scope(request, f1, &rows)
+            .expect("prepare_scope turn2 after sync");
+        assert_eq!(mask, 0b1111, "verifier matches the synced frontier");
+
+        // Idempotent: syncing again to the same frontier is a no-op.
+        p.sync_prefill(f1).expect("sync idempotent");
+        assert_eq!(p.snapshot().expect("snap").read().expect("read").accepted_end, f1);
+        // No-op guard: a position at/below accepted_end never rewinds the frontier.
+        p.sync_prefill(f0).expect("sync below frontier is a no-op");
+        assert_eq!(p.snapshot().expect("snap").read().expect("read").accepted_end, f1);
+    }
+
+    /// Host-only: the pending output-acceptance snapshot's per-slot lifecycle
+    /// (P4.1②, design §A.6). The orchestration stores the verify carrier's
+    /// extracted snapshot before freeing it; `mtp_verify_accept_step` takes it
+    /// after `feed_rows` to publish at the confirmed prefix. Verifies set/take
+    /// (consume-once), out-of-range safety, independence from the output owner /
+    /// keep-set, and that `reset_slot` drops it (a fresh session never publishes a
+    /// stale verify). Legacy never stores one in production (byte-neutral).
+    #[test]
+    fn layerwise_pending_output_lifecycle() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let mk_snap = |begin: u64| OutputAcceptanceSnapshot {
+            base_stamp: hipfire_kvmem::MemoryStamp {
+                valid: 1,
+                session: hipfire_kvmem::SessionIdentity { id: 8, incarnation: 4 },
+                history_revision: 1,
+                view_version: 1,
+                frontier: 384,
+                execution_history: 1,
+            },
+            request: 8,
+            begin,
+            eval_rows: 4,
+            mass_rows: vec![0, 1, 2, 3],
+            layers: Vec::new(),
+        };
+
+        let mut lw =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("layerwise ctl");
+        // Nothing pending before the first verify.
+        assert!(lw.take_layerwise_pending_output(0).is_none(), "fresh slot: nothing pending");
+        // Store + take consumes once; fields survive the round-trip.
+        lw.set_layerwise_pending_output(0, mk_snap(384));
+        let got = lw.take_layerwise_pending_output(0).expect("pending snapshot");
+        assert_eq!(got.request, 8);
+        assert_eq!(got.begin, 384);
+        assert_eq!(got.eval_rows, 4);
+        assert_eq!(got.mass_rows, vec![0, 1, 2, 3]);
+        assert_eq!(got.base_stamp.frontier, 384);
+        assert!(lw.take_layerwise_pending_output(0).is_none(), "take consumes the snapshot");
+        // Out-of-range: set is a silent no-op, take is None (never panics/aliases).
+        lw.set_layerwise_pending_output(9, mk_snap(512));
+        assert!(lw.take_layerwise_pending_output(9).is_none(), "out-of-range take");
+        assert!(lw.take_layerwise_pending_output(0).is_none(), "stray set did not alias slot 0");
+        // Pending is independent of the output owner / keep-set.
+        lw.set_layerwise_pending_output(0, mk_snap(640));
+        lw.set_layerwise_keep_set(0, vec![vec![0, 2], vec![1]]);
+        assert!(lw.layerwise_output_pressure(0).is_none(), "pending does not build the owner");
+        assert!(lw.take_layerwise_pending_output(0).is_some(), "pending survives keep-set write");
+        // reset_slot drops the pending snapshot (fresh session never publishes stale).
+        lw.set_layerwise_pending_output(0, mk_snap(768));
+        lw.reset_slot(0).expect("reset");
+        assert!(lw.take_layerwise_pending_output(0).is_none(), "reset drops the pending snapshot");
+
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
     /// Host-only: the SESSION-lifetime pressure owner's finite, fail-closed
     /// admission (design §3.11, ③-E4; ninfer essence = "complete mutable history
     /// ceiling"). The owner's retained history is bounded by
@@ -2723,6 +3965,625 @@ mod tests {
         for t in v_arenas {
             gpu.free_tensor(t).expect("free v arena");
         }
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// P4.1② G3 host-only: the composite head aux record is trunk-byte-neutral.
+    /// Legacy carries `mtp_head` UNREAD (trunk-only record, no head plane);
+    /// Layerwise AR-only likewise; Layerwise + MTP appends exactly one aux ordinal
+    /// (`n_fa_layers + 1`). Because the core lays each layer out as an independent
+    /// per-block allocation (raw_kv_store.cpp:154/404), the SAME trunk K/V reads
+    /// back identically with or without the aux ordinal, and writing the aux plane
+    /// never perturbs a trunk ordinal.
+    #[test]
+    fn head_plane_composite_record_trunk_byte_neutral() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let n_fa = geom().n_fa_layers;
+        let row = geom().per_pos_bytes;
+        let bt = KV_BLOCK_TOKENS;
+
+        // Legacy + MTP: the head plane is a Layerwise-only feature, so Legacy
+        // keeps the trunk-only record even with mtp_head set (byte-neutral).
+        let legacy_mtp =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Legacy)
+                .expect("legacy mtp ctl");
+        assert!(!legacy_mtp.head_plane_enabled(), "Legacy: head plane inactive");
+        assert_eq!(legacy_mtp.raw_cfg.n_layer, n_fa as u32, "Legacy: trunk-only record");
+
+        // Layerwise AR-only: no head plane, trunk-only record.
+        let lw_ar =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("layerwise ar ctl");
+        assert!(!lw_ar.head_plane_enabled(), "AR-only: head plane inactive");
+        assert_eq!(lw_ar.raw_cfg.n_layer, n_fa as u32, "AR-only: trunk-only record");
+
+        // Layerwise + MTP: composite record, aux ordinal = n_fa.
+        let lw_mtp =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Layerwise)
+                .expect("layerwise mtp ctl");
+        assert!(lw_mtp.head_plane_enabled(), "Layerwise+MTP: head plane active");
+        assert_eq!(lw_mtp.raw_cfg.n_layer, (n_fa + 1) as u32, "composite record");
+        assert_eq!(lw_mtp.aux_ordinal(), n_fa as u32, "aux ordinal = n_fa");
+
+        let pattern = |il: usize, is_v: usize| -> Vec<u8> {
+            (0..bt * row).map(|i| ((il * 7 + is_v * 101 + i * 13) & 0xff) as u8).collect()
+        };
+        // Write the identical trunk K/V to ordinals 0..n_fa-1 and read K back.
+        let write_trunk = |ctl: &KvMemCtl| -> Vec<Vec<u8>> {
+            let (raw, _kv) = ctl.layerwise_stores(0).expect("slot stores");
+            raw.ensure_blocks(2).expect("ensure blocks");
+            for il in 0..n_fa {
+                raw.write_layer_k_gpu(0, bt as u32, il as u32, &pattern(il, 0)).expect("write K");
+                raw.write_layer_v_gpu(0, bt as u32, il as u32, &pattern(il, 1)).expect("write V");
+            }
+            (0..n_fa)
+                .map(|il| {
+                    let mut buf = vec![0u8; bt * row];
+                    assert!(raw.copy_k_gpu(0, il as u32, &mut buf, bt as u32), "read K");
+                    buf
+                })
+                .collect()
+        };
+        assert_eq!(
+            write_trunk(&lw_ar),
+            write_trunk(&lw_mtp),
+            "trunk K bytes identical with/without the aux ordinal"
+        );
+
+        // The aux ordinal is a SEPARATE allocation: empty before any head write,
+        // and writing it leaves every trunk ordinal byte-identical.
+        let (raw, _kv) = lw_mtp.layerwise_stores(0).expect("slot stores");
+        let aux = lw_mtp.aux_ordinal();
+        assert!(!raw.has_k_gpu(0, aux, bt as u32), "aux plane empty before head write");
+        raw.write_layer_k_gpu(0, bt as u32, aux, &pattern(99, 0)).expect("write aux K");
+        assert!(raw.has_k_gpu(0, aux, bt as u32), "aux plane present after write");
+        for il in 0..n_fa {
+            let mut trunk = vec![0u8; bt * row];
+            assert!(raw.copy_k_gpu(0, il as u32, &mut trunk, bt as u32));
+            assert_eq!(trunk, pattern(il, 0), "trunk ordinal {il} unchanged by aux write");
+        }
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// P4.1② G3 regression (live serve HTTP 500): the composite head-aux record has
+    /// `n_layer = n_fa_layers + 1`, so the trunk retrieval query MUST pass the full
+    /// record layer count (`n_record_layers`) with the aux ordinal's token count
+    /// zeroed. Passing the trunk-only `n_fa_layers` trips the core mean-key geometry
+    /// check (`query.layers == n_layer`) and throws — the exact Err that surfaced as
+    /// HTTP 500 at the first decode selection under Layerwise+MTP. Host-only: an
+    /// empty store exercises the geometry gate without reading any mean-K payload.
+    #[test]
+    fn head_plane_retrieval_query_geometry() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let n_fa = geom().n_fa_layers;
+
+        let lw = KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Layerwise)
+            .expect("layerwise mtp ctl");
+        assert!(lw.head_plane_enabled());
+        // Query buffers span the FULL composite record; the aux ordinal is skipped.
+        assert_eq!(lw.n_record_layers, n_fa + 1, "composite record layer count");
+        assert_eq!(lw.sums.len(), (n_fa + 1) * lw.q_width, "sums sized for the record");
+        assert_eq!(lw.counts.len(), n_fa + 1, "counts sized for the record");
+        assert_eq!(lw.counts[n_fa], 0, "aux ordinal zeroed ⇒ trunk-only scoring");
+        for il in 0..n_fa {
+            assert_eq!(lw.counts[il], 1, "trunk ordinal {il} active");
+        }
+
+        let (raw, _kv) = lw.layerwise_stores(0).expect("slot stores");
+        // The query refresh_scores issues: full record layer count. The core
+        // geometry check passes (empty store ⇒ no mean-K read, scores all zero).
+        let scores = mean_key_retrieval_scores(
+            raw,
+            2,
+            &lw.sums,
+            &lw.counts,
+            lw.n_record_layers as u32,
+            lw.head_dim as u32,
+            lw.n_heads as u32,
+            lw.n_kv_heads as u32,
+            GqaAggregation::Mean,
+        )
+        .expect("composite-record retrieval query satisfies the core geometry check");
+        assert_eq!(scores.len(), 2);
+
+        // The pre-fix trunk-only query (n_fa_layers against n_layer = n_fa+1) is
+        // exactly what threw the live 500 — it must still be rejected.
+        let bad = mean_key_retrieval_scores(
+            raw,
+            2,
+            &lw.sums[..n_fa * lw.q_width],
+            &lw.counts[..n_fa],
+            n_fa as u32,
+            lw.head_dim as u32,
+            lw.n_heads as u32,
+            lw.n_kv_heads as u32,
+            GqaAggregation::Mean,
+        );
+        assert!(bad.is_err(), "trunk-only layer count must trip the geometry check");
+        assert!(format!("{}", bad.unwrap_err()).contains("incompatible query/key geometry"));
+
+        // Legacy / AR-only: n_record_layers == n_fa ⇒ the default query is unchanged.
+        let ar = KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
+            .expect("ar ctl");
+        assert_eq!(ar.n_record_layers, n_fa);
+        assert_eq!(ar.counts.len(), n_fa);
+        assert_eq!(ar.sums.len(), n_fa * ar.q_width);
+        let legacy =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Legacy)
+                .expect("legacy ctl");
+        assert_eq!(legacy.n_record_layers, n_fa, "Legacy: trunk-only record even with MTP");
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// P4.1② G3 host-only: the head-plane lifecycle mirrors the trunk pressure
+    /// owners. Legacy / AR-only fail closed (no map — byte-neutral); Layerwise +
+    /// MTP constructs lazily and idempotently; the map take/restore round-trips
+    /// around the scoped carrier borrow; the per-Query aux binding is bind-once
+    /// and transient; `reset_slot` drops BOTH so a fresh session never aliases
+    /// the previous head history.
+    #[test]
+    fn head_plane_lifecycle() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+
+        // Legacy: fail-closed, no map.
+        let mut legacy =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Legacy)
+                .expect("legacy ctl");
+        assert!(legacy.head_plane(0).is_none(), "Legacy: no head map");
+        assert!(legacy.ensure_head_plane(0).is_err(), "Legacy: ensure fails closed");
+        assert!(legacy.head_plane(0).is_none(), "Legacy: still no map");
+
+        // Layerwise AR-only: head plane inactive, ensure fails closed.
+        let mut ar =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("ar ctl");
+        assert!(ar.ensure_head_plane(0).is_err(), "AR-only: ensure fails closed");
+
+        // Layerwise + MTP: lazy, idempotent construction.
+        let mut lw =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Layerwise)
+                .expect("mtp ctl");
+        assert!(lw.head_plane(0).is_none(), "before ensure: no map");
+        lw.ensure_head_plane(0).expect("construct head map");
+        assert!(lw.head_plane(0).is_some(), "after ensure: map present");
+        lw.ensure_head_plane(0).expect("idempotent");
+        assert_eq!(lw.validate_head_plane(0, 0).expect("empty map"), 0);
+
+        // take/restore round-trip (the scoped carrier borrow resolution).
+        let mut head = lw.take_head_plane(0).expect("take map");
+        assert!(lw.head_plane(0).is_none(), "taken: slot empty");
+        head.auxiliary_pages = vec![0, 1, 2];
+        head.auxiliary_view_version = 7;
+        lw.restore_head_plane(0, head);
+        let restored = lw.head_plane(0).expect("restored map");
+        assert_eq!(restored.auxiliary_pages, vec![0, 1, 2]);
+        assert_eq!(restored.auxiliary_view_version, 7);
+        // 300 tokens over 128-blocks: 128 + 128 + 44 = 300, removed 0.
+        assert_eq!(lw.validate_head_plane(0, 300).expect("validate"), 300);
+
+        // aux_selection per-Query transient: bind-once, set/take round-trip.
+        assert!(lw.take_aux_selection(0).is_none(), "no binding yet");
+        let mut sel = AuxiliarySelection::new(300, KV_BLOCK_TOKENS as u64, true);
+        sel.bind(&[0, 1, 2], 300).expect("bind");
+        lw.set_aux_selection(0, sel);
+        let taken = lw.take_aux_selection(0).expect("take binding");
+        assert!(taken.is_bound());
+        assert_eq!(taken.selected(), Some(&[0u32, 1, 2][..]));
+        assert!(lw.take_aux_selection(0).is_none(), "taken: binding empty");
+
+        // reset_slot drops BOTH the map and the binding (fresh session).
+        lw.reset_slot(0).expect("reset");
+        assert!(lw.head_plane(0).is_none(), "reset: map dropped");
+        assert!(lw.take_aux_selection(0).is_none(), "reset: binding dropped");
+        lw.ensure_head_plane(0).expect("re-construct");
+        assert_eq!(lw.head_plane(0).expect("map").auxiliary_pages, Vec::<u32>::new());
+
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// P4.1② G3 host-only: the head resident-map invariant (ninfer
+    /// `KvmemLayerViews::validate`, NL:12267-12270) reconstructs the accepted
+    /// frontier from `visible_tokens(pages) + removed_tokens`, and fails closed
+    /// on a wrong extent or a non-chronological map. The fully-evicted head
+    /// (empty map, removed == frontier) is admitted.
+    #[test]
+    fn head_plane_validate_fail_closed() {
+        let mut head = HeadPlaneState {
+            auxiliary_pages: vec![0, 1],
+            auxiliary_view_version: 0,
+            auxiliary_removed_tokens: 44,
+        };
+        // visible([0,1], 300, 128) = 256; 256 + 44 = 300.
+        assert_eq!(head.validate(300).expect("reconstructs"), 300);
+        // Wrong removed count → extent != frontier.
+        head.auxiliary_removed_tokens = 0;
+        assert!(head.validate(300).is_err(), "256 != 300");
+        // Non-chronological map → fail closed before the extent check.
+        head.auxiliary_pages = vec![1, 0];
+        head.auxiliary_removed_tokens = 44;
+        assert!(head.validate(300).is_err(), "non-chronological");
+        // Fully-evicted head: empty map, removed == frontier.
+        let evicted = HeadPlaneState {
+            auxiliary_pages: vec![],
+            auxiliary_view_version: 0,
+            auxiliary_removed_tokens: 300,
+        };
+        assert_eq!(evicted.validate(300).expect("fully evicted"), 300);
+    }
+
+    /// P4.1② G3b host-only: the head auxiliary-plane write-through seal lands
+    /// the gathered packed Q8 K/V at the AUX ordinal of the composite record and
+    /// reads back byte-identical, leaves every trunk ordinal untouched, addresses
+    /// successive blocks by position, and fails closed off the Layerwise+MTP
+    /// path. The GPU gather (`head_write_through_archive`) is a contiguous D2H
+    /// proven by the production smoke; this exercises the host seal + readback
+    /// round-trip it feeds.
+    #[test]
+    fn head_plane_write_through_seal_readback() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let n_fa = geom().n_fa_layers;
+        let row = geom().per_pos_bytes;
+        let vrow = geom().per_pos_v_bytes;
+        let bt = KV_BLOCK_TOKENS;
+
+        let mut lw =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Layerwise)
+                .expect("mtp ctl");
+        let aux = lw.aux_ordinal();
+        assert_eq!(aux, n_fa as u32);
+
+        let k_pat: Vec<u8> = (0..bt * row).map(|i| ((i * 13 + 7) & 0xff) as u8).collect();
+        let v_pat: Vec<u8> = (0..bt * vrow).map(|i| ((i * 29 + 101) & 0xff) as u8).collect();
+        let trunk_pat = |il: usize, is_v: usize| -> Vec<u8> {
+            (0..bt * row).map(|i| ((il * 7 + is_v * 101 + i * 13) & 0xff) as u8).collect()
+        };
+
+        // Seed the trunk ordinals, then seal the head aux plane at pos0 = 0.
+        {
+            let (raw, _kv) = lw.layerwise_stores(0).expect("slot stores");
+            raw.ensure_blocks(2).expect("ensure blocks");
+            for il in 0..n_fa {
+                raw.write_layer_k_gpu(0, bt as u32, il as u32, &trunk_pat(il, 0)).expect("trunk K");
+                raw.write_layer_v_gpu(0, bt as u32, il as u32, &trunk_pat(il, 1)).expect("trunk V");
+            }
+            assert!(!raw.has_k_gpu(0, aux, bt as u32), "aux empty before seal");
+        }
+        lw.seal_head_plane(0, 0, bt, &k_pat, &v_pat).expect("seal head plane");
+
+        // Read back the aux plane byte-identical; trunk ordinals unchanged.
+        {
+            let (raw, _kv) = lw.layerwise_stores(0).expect("slot stores");
+            assert!(raw.has_k_gpu(0, aux, bt as u32), "aux present after seal");
+            let mut kb = vec![0u8; bt * row];
+            let mut vb = vec![0u8; bt * vrow];
+            assert!(raw.copy_k_gpu(0, aux, &mut kb, bt as u32), "read aux K");
+            assert!(raw.copy_v_gpu(0, aux, &mut vb, bt as u32), "read aux V");
+            assert_eq!(kb, k_pat, "aux K byte-identical");
+            assert_eq!(vb, v_pat, "aux V byte-identical");
+            for il in 0..n_fa {
+                let mut tk = vec![0u8; bt * row];
+                let mut tv = vec![0u8; bt * row];
+                assert!(raw.copy_k_gpu(0, il as u32, &mut tk, bt as u32));
+                assert!(raw.copy_v_gpu(0, il as u32, &mut tv, bt as u32));
+                assert_eq!(tk, trunk_pat(il, 0), "trunk K {il} unchanged by head seal");
+                assert_eq!(tv, trunk_pat(il, 1), "trunk V {il} unchanged by head seal");
+            }
+        }
+
+        // A second feed at the next block seals at pos0 = bt without disturbing
+        // the first block (position addressing).
+        let k_pat2: Vec<u8> = (0..bt * row).map(|i| ((i * 17 + 3) & 0xff) as u8).collect();
+        let v_pat2: Vec<u8> = (0..bt * vrow).map(|i| ((i * 31 + 5) & 0xff) as u8).collect();
+        lw.seal_head_plane(0, bt, bt, &k_pat2, &v_pat2).expect("seal second block");
+        {
+            let (raw, _kv) = lw.layerwise_stores(0).expect("slot stores");
+            let mut kb = vec![0u8; bt * row];
+            assert!(raw.copy_k_gpu(1, aux, &mut kb, bt as u32), "read aux K block 1");
+            assert_eq!(kb, k_pat2, "second block byte-identical");
+            let mut kb0 = vec![0u8; bt * row];
+            assert!(raw.copy_k_gpu(0, aux, &mut kb0, bt as u32));
+            assert_eq!(kb0, k_pat, "first block intact");
+        }
+
+        // n_rows == 0 is a no-op; out-of-range slot fails closed.
+        lw.seal_head_plane(0, 0, 0, &[], &[]).expect("empty feed no-op");
+        assert!(lw.seal_head_plane(9, 0, bt, &k_pat, &v_pat).is_err(), "slot out of range");
+
+        // Fail-closed off the Layerwise+MTP path (Legacy / AR-only never co-archive).
+        let mut legacy =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Legacy)
+                .expect("legacy ctl");
+        assert!(legacy.seal_head_plane(0, 0, bt, &k_pat, &v_pat).is_err(), "Legacy fail-closed");
+        let mut ar =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("ar ctl");
+        assert!(ar.seal_head_plane(0, 0, bt, &k_pat, &v_pat).is_err(), "AR-only fail-closed");
+
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// P4.1② G3c host-only: the bounded head-pool geometry is the trunk window +
+    /// ONE draft-scratch block (① `mtp_auxiliary_capacity` / `mtp_head_pool`),
+    /// owned independently of the trunk; fail-closed off Layerwise+MTP and on a
+    /// bad window. The head pool is a 1-layer composite whose slot bytes equal the
+    /// composite record's aux-plane bytes (① F2 invariant).
+    #[test]
+    fn head_pool_bounded_geometry() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let bt = KV_BLOCK_TOKENS;
+        let row = geom().per_pos_bytes;
+        let vrow = geom().per_pos_v_bytes;
+        let window = 4 * bt; // page-aligned trunk working-set window
+
+        let lw =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Layerwise)
+                .expect("mtp ctl");
+        // capacity = window + one scratch block.
+        assert_eq!(lw.head_pool_capacity(window).expect("capacity"), window + bt);
+        // pool: window/block + 1 slots, ONE head layer.
+        let pool = lw.head_pool(window).expect("head pool");
+        assert_eq!(pool.n_slots(), window / bt + 1, "window pages + one scratch page");
+        assert_eq!(pool.n_layers(), 1, "head is a single aux layer");
+        // The head carrier (engine_carrier_head) sizes the bounded head arena +
+        // block-table staging from head_pool_capacity (TOKENS) converted to pages.
+        // Lock that conversion against the pool's slot count: a token-vs-page
+        // regression would size the head staging to (window+bt) PAGES, giving
+        // ctx_len = (window+bt)*bt, and the paged head attention would walk unmapped
+        // block-table tiles → GPU hang (the head forward never returns).
+        assert_eq!(
+            lw.head_pool_capacity(window).expect("capacity") / bt,
+            pool.n_slots(),
+            "head_pool_capacity tokens / block == head_pool slots (carrier conversion)"
+        );
+        // slot bytes == the composite record's aux-plane bytes (block × (K+V)).
+        assert_eq!(pool.layout().slot_bytes(), bt * (row + vrow));
+        assert_eq!(pool.layout().arena_bytes(), pool.n_slots() * bt * (row + vrow));
+
+        // Fail-closed: non-page-aligned window, zero window.
+        assert!(lw.head_pool_capacity(window + 1).is_err(), "non-page-aligned");
+        assert!(lw.head_pool_capacity(0).is_err(), "zero window");
+        assert!(lw.head_pool(0).is_err(), "zero window pool");
+
+        // Legacy / AR-only: no head pool (byte-neutral).
+        let legacy =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Legacy)
+                .expect("legacy ctl");
+        assert!(legacy.head_pool_capacity(window).is_err(), "Legacy fail-closed");
+        assert!(legacy.head_pool(window).is_err(), "Legacy pool fail-closed");
+        let ar =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("ar ctl");
+        assert!(ar.head_pool_capacity(window).is_err(), "AR-only fail-closed");
+
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// Host-only: the head's INDEPENDENT aux-plane `LayerWorkingSetPlan` (P4.1②
+    /// G3c, design §A.8 Q1, ninfer NL:10578-10584). Verifies the single-layer aux
+    /// catalog over the composite descriptor plans the head's own resident map
+    /// against the window quota: the aux ordinal, the restored/visible block
+    /// counts, the head's independent view-version bump, the device-token envelope,
+    /// the resident-map defensive filter, the quota gate, and every fail-closed
+    /// path (Legacy / AR-only / no map / bad window / no sealed page / cold id).
+    #[test]
+    fn head_plane_independent_plan() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let bt = KV_BLOCK_TOKENS as u64;
+        let window = (4 * bt) as usize; // 512 tokens, page-aligned
+        let fed = 3 * bt; // 3 sealed full pages, frontier 384
+        let aux = geom_mtp().n_fa_layers as u32; // == 2
+
+        let mut lw =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Layerwise)
+                .expect("mtp ctl");
+        // No head map yet ⇒ the caller's detach fails closed (the plan reads a
+        // DETACHED map; `take_head_plane` is the existence gate, G3 borrow res).
+        assert!(lw.take_head_plane(0).is_none(), "no map");
+        lw.ensure_head_plane(0).expect("head map");
+        let mut head = lw.take_head_plane(0).expect("detach map");
+        // Resident page 0; id 99 is outside the sealed history and must be
+        // filtered (not rejected as an invalid resident block).
+        head.auxiliary_pages = vec![0, 99];
+        head.auxiliary_view_version = 7;
+        // FirstLayer-bound target ids [0, 1]: page 1 is a cold restore (resident
+        // holds only 0), page 0 stays. The head plans its OWN aux ordinal.
+        let head_plan = lw
+            .plan_head_plane(0, &head, &[0, 1], fed, window, 0, 4096, "test")
+            .expect("head plan");
+        assert_eq!(head_plan.model_layer(), aux, "plans the aux ordinal");
+        assert_eq!(head_plan.next_block_count(), 2, "two selected pages");
+        assert_eq!(head_plan.next_visible_tokens(), 2 * bt, "selected page tokens");
+        assert_eq!(head_plan.restore_count(), 1, "page 1 restored, page 0 resident");
+        // device envelope = page_ceil(reserve 0) + 2 full pages = 256 tokens.
+        assert_eq!(head_plan.device_tokens_required(), 2 * bt, "device tokens");
+        // The head's independent view version bumps (7 → 8), not the trunk's.
+        assert_eq!(head_plan.next_stamp().expect("stamp").view_version, 8, "aux view bump");
+
+        // Quota gate: a one-page window cannot hold two selected pages.
+        assert!(
+            lw.plan_head_plane(0, &head, &[0, 1], fed, bt as usize, 0, 4096, "test").is_err(),
+            "window quota exceeded"
+        );
+        // Cold-history id (outside the sealed frame) is rejected by the core.
+        assert!(lw.plan_head_plane(0, &head, &[5], fed, window, 0, 4096, "test").is_err(), "cold id");
+        // Bad window / no sealed page.
+        assert!(lw.plan_head_plane(0, &head, &[0], fed, window + 1, 0, 4096, "test").is_err(), "unaligned");
+        assert!(lw.plan_head_plane(0, &head, &[0], fed, 0, 0, 4096, "test").is_err(), "zero window");
+        assert!(lw.plan_head_plane(0, &head, &[0], bt - 1, window, 0, 4096, "test").is_err(), "no page");
+        // Return the detached map (session-lifetime persistence).
+        lw.restore_head_plane(0, head);
+
+        // Legacy / AR-only: no head plan (byte-neutral); a default detached map
+        // is inert, the flag gate fails closed first.
+        let legacy =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Legacy)
+                .expect("legacy ctl");
+        assert!(legacy.plan_head_plane(0, &HeadPlaneState::default(), &[0], fed, window, 0, 4096, "test").is_err(), "Legacy");
+        let ar =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Layerwise)
+                .expect("ar ctl");
+        assert!(ar.plan_head_plane(0, &HeadPlaneState::default(), &[0], fed, window, 0, 4096, "test").is_err(), "AR-only");
+
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    /// Host-only: the head's post-restore resident-map publish (P4.1② G4, ninfer
+    /// NL:10609-10612). The restored compact view becomes the head's independent
+    /// map (pages / view version / removed tokens), the aux invariant validates,
+    /// the publish is transactional (a failed accept never corrupts the live map),
+    /// and every fail-closed path holds (Legacy / no map / visible>frontier /
+    /// non-chronological).
+    #[test]
+    fn head_plane_accept_restore() {
+        use hipfire_kvmem::ViewBlock;
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let bt = KV_BLOCK_TOKENS as u64;
+        let frontier = 3 * bt; // 384
+        let session = SessionIdentity { id: 1, incarnation: 1 };
+        let mk_view = |ids: &[u64], visible: u64, view_version: u64| ExecutionView {
+            stamp: MemoryStamp {
+                valid: 1,
+                session,
+                history_revision: 1,
+                view_version,
+                frontier,
+                execution_history: 1,
+            },
+            blocks: ids
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| ViewBlock {
+                    block: BlockDescriptor {
+                        session,
+                        id,
+                        original_start: id * bt,
+                        valid_tokens: KV_BLOCK_TOKENS as u32,
+                        content_version: 1,
+                        statistics_version: 1,
+                    },
+                    compact_start: i as u64 * bt,
+                })
+                .collect(),
+            visible_tokens: visible,
+        };
+
+        let mut lw =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Layerwise)
+                .expect("mtp ctl");
+        let view = mk_view(&[0, 1], 2 * bt, 8);
+        // No map yet ⇒ the caller's detach fails closed (no mutation).
+        assert!(lw.take_head_plane(0).is_none(), "no map");
+        lw.ensure_head_plane(0).expect("head map");
+        let mut head = lw.take_head_plane(0).expect("detach map");
+        // Publish: pages [0,1], view version 8, removed = 384 - 256 = 128.
+        lw.accept_head_restore(0, &mut head, &view, frontier).expect("accept");
+        assert_eq!(head.auxiliary_pages, vec![0, 1], "restored pages");
+        assert_eq!(head.auxiliary_view_version, 8, "view version");
+        assert_eq!(head.auxiliary_removed_tokens, (frontier - 2 * bt) as u32, "RoPE shift");
+        // Return the map so the on-ctl validate path sees the published extent.
+        lw.restore_head_plane(0, head);
+        assert_eq!(lw.validate_head_plane(0, frontier).expect("validate"), frontier);
+
+        // Detach again for the fail-closed accepts (transactional on the map).
+        let mut head = lw.take_head_plane(0).expect("detach map");
+        // visible > frontier ⇒ fail-closed (removed would underflow).
+        let over = mk_view(&[0, 1], frontier + bt, 9);
+        assert!(lw.accept_head_restore(0, &mut head, &over, frontier).is_err(), "visible>frontier");
+        // Non-chronological restored map ⇒ validate fails closed.
+        let bad = mk_view(&[1, 0], 2 * bt, 9);
+        assert!(lw.accept_head_restore(0, &mut head, &bad, frontier).is_err(), "non-chronological");
+        // Transactional: the failed accepts left the published map untouched.
+        assert_eq!(head.auxiliary_view_version, 8, "atomic publish");
+        lw.restore_head_plane(0, head);
+
+        // Legacy: no head plane ⇒ fail-closed (byte-neutral); a default detached
+        // map is inert, the flag gate fails closed first.
+        let legacy =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Legacy)
+                .expect("legacy ctl");
+        assert!(legacy.accept_head_restore(0, &mut HeadPlaneState::default(), &view, frontier).is_err(), "Legacy");
+
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+    }
+
+    #[test]
+    fn head_plane_accept_append() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let bt = KV_BLOCK_TOKENS as u64;
+        let mut lw =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Layerwise)
+                .expect("mtp ctl");
+        lw.ensure_head_plane(0).expect("head map");
+
+        // Cold prefill append from an empty map: a page-aligned begin needs no
+        // partial anchor; pages [0,1,2] reconstruct 384 with removed == 0 and the
+        // view version stays 0 (an append is not a restore).
+        lw.accept_head_append(0, 0, 3 * bt).expect("prefill append");
+        {
+            let head = lw.head_plane(0).expect("map");
+            assert_eq!(head.auxiliary_pages, vec![0, 1, 2], "prefill pages");
+            assert_eq!(head.auxiliary_removed_tokens, 0, "full-resident removed");
+            assert_eq!(head.auxiliary_view_version, 0, "append does not bump view version");
+        }
+        assert_eq!(lw.validate_head_plane(0, 3 * bt).expect("validate"), 3 * bt);
+
+        // §3.9g sub-page append: the 16-token partial tail (384..400) rides the
+        // suffix stripe, NOT a canonical block, so no new page joins and the
+        // canonical frame stays page-rounded 384; removed stays 0.
+        lw.accept_head_append(0, 3 * bt, 3 * bt + 16).expect("sub-page append");
+        assert_eq!(lw.head_plane(0).unwrap().auxiliary_pages, vec![0, 1, 2]);
+        assert_eq!(lw.head_plane(0).unwrap().auxiliary_removed_tokens, 0);
+        assert_eq!(lw.validate_head_plane(0, 3 * bt).expect("validate"), 3 * bt);
+
+        // Filling the suffix page to the next boundary seals it canonical: page 3
+        // (the old suffix page) becomes a full page and joins; frame advances 512.
+        lw.accept_head_append(0, 3 * bt + 16, 4 * bt).expect("seal suffix append");
+        assert_eq!(lw.head_plane(0).unwrap().auxiliary_pages, vec![0, 1, 2, 3]);
+        assert_eq!(lw.head_plane(0).unwrap().auxiliary_removed_tokens, 0);
+        assert_eq!(lw.validate_head_plane(0, 4 * bt).expect("validate"), 4 * bt);
+
+        // Fail-closed: end < begin is rejected and leaves the map empty
+        // (transactional). The §3.9g suffix stripe is the compact-shift anchor, so
+        // a sub-page begin needs no resident partial page (ninfer's NL:12343
+        // anchor guard does not apply to the suffix representation).
+        let mut lw2 =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Layerwise)
+                .expect("mtp ctl 2");
+        lw2.ensure_head_plane(0).expect("head map");
+        assert!(lw2.accept_head_append(0, 200, 100).is_err(), "end < begin");
+        assert!(lw2.head_plane(0).unwrap().auxiliary_pages.is_empty(), "atomic");
+        // A sub-page begin on a fresh map seals the first full page: frame 0->128.
+        lw2.accept_head_append(0, 100, 200).expect("sub-page begin append");
+        assert_eq!(lw2.head_plane(0).unwrap().auxiliary_pages, vec![0]);
+
+        // Subset resident map (a post-restore compacted view with a gap): the
+        // append recomputes removed = end - visible, preserving the aux invariant
+        // and leaving the view version untouched.
+        let mut lw3 =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Layerwise)
+                .expect("mtp ctl 3");
+        lw3.ensure_head_plane(0).expect("head map");
+        {
+            let head = lw3.head_plane_mut(0).expect("map");
+            head.auxiliary_pages = vec![0, 1];
+            head.auxiliary_removed_tokens = bt as u32; // frontier 384, visible 256
+            head.auxiliary_view_version = 8;
+        }
+        lw3.accept_head_append(0, 3 * bt, 4 * bt).expect("subset append");
+        {
+            let head = lw3.head_plane(0).expect("map");
+            assert_eq!(head.auxiliary_pages, vec![0, 1, 3], "subset + new page");
+            assert_eq!(head.auxiliary_removed_tokens, bt as u32, "removed recomputed");
+            assert_eq!(head.auxiliary_view_version, 8, "view version unchanged");
+        }
+        assert_eq!(lw3.validate_head_plane(0, 4 * bt).expect("validate"), 4 * bt);
+
+        // Legacy: no head plane ⇒ fail-closed (byte-neutral).
+        let mut legacy =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Legacy)
+                .expect("legacy ctl");
+        assert!(legacy.accept_head_append(0, 0, bt).is_err(), "Legacy");
+
         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
     }
 }

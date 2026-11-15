@@ -233,6 +233,73 @@ pub fn first_layer_auxiliary_ids(source_layers: &[SourceLayerView]) -> Result<&[
         })
 }
 
+/// P4.1② G5: the LIVE FirstLayer auxiliary-selection bind — the hipfire mirror of
+/// ninfer's restore-hook condition (NL:9985-9990: `model == source_layers.front()`
+/// && `backend_kv_pages` && policy FirstLayer → `bind_auxiliary_selection(ids)`,
+/// NL:10189-10204). Called from the trunk restore hook with the FIRST target FA
+/// ordinal's restored canonical page ids (`restored_keep_set()[0]`, chronological,
+/// suffix page excluded) and the accepted `frontier` (the query's
+/// `evaluation.begin` == `ctl.fed_tokens(slot)`).
+///
+/// Under FirstLayer the head history IS the trunk's first-layer restored view, so
+/// the target extent `history_tokens = auxiliary_visible_tokens(restored_first,
+/// frontier, block_tokens)` (ninfer `auxiliary_tokens = history_tokens`, NL:9911);
+/// [`AuxiliarySelection::bind`] then re-validates the ids are chronological/unique
+/// and cover exactly that extent, failing closed on a corrupt restore.
+/// `has_head_pool = true`: the caller gates on [`KvMemCtl::head_plane_enabled`]
+/// (Layerwise + native MTP), which under ② is exactly the FirstLayer policy — ③
+/// adds the UpstreamGlobal private-probe branch. Returns the bound selection for
+/// [`KvMemCtl::set_aux_selection`]; Legacy / AR-only never reach this (the whole
+/// Layerwise orchestration is skipped, byte-neutral).
+pub fn bind_first_layer_auxiliary(
+    restored_first: &[u64],
+    frontier: u64,
+    block_tokens: u64,
+) -> Result<AuxiliarySelection, String> {
+    let selected: Vec<u32> = restored_first
+        .iter()
+        .map(|&id| {
+            u32::try_from(id)
+                .map_err(|_| format!("first-layer aux binding: page id {id} overflow u32"))
+        })
+        .collect::<Result<Vec<u32>, String>>()?;
+    let history_tokens = auxiliary_visible_tokens(&selected, frontier, block_tokens)?;
+    let mut sel = AuxiliarySelection::new(history_tokens, block_tokens, true);
+    sel.bind(&selected, frontier)?;
+    Ok(sel)
+}
+
+// ── head restored-position + RoPE-shift contract (P4.1② G4) ───────────────
+//
+// Pure-host mirror of ninfer's native MTP head restore (NL:10285-10296) and
+// COW boundary rebuild (NL:5849-5886). The bounded head pool restores a COMPACT
+// resident view of the accepted history, so each verify-span row carries TWO
+// distinct coordinates:
+//   * a COMPACT pool-local KV-cache write position (where the new K/V lands in
+//     the bounded head arena), shifted down by the dropped history; and
+//   * a GLOBAL RoPE position (where the head attends), kept aligned with the
+//     trunk's original frame by an accumulated `rope_delta`.
+// ② produces and validates these coordinates here; the GPU boundary-rebuild +
+// head-forward wiring consumes them. Legacy never constructs any of this.
+
+/// ninfer `auxiliary_removed_tokens = evaluation.begin - auxiliary_tokens`
+/// (NL:10285): the count of accepted head-history tokens dropped from the bounded
+/// resident view by the restore. `evaluation_begin` is the target's accepted
+/// frontier (the verify span's begin); `auxiliary_tokens` is the head view's
+/// restored visible tokens. Fail-closed if the visible view exceeds the frontier
+/// (underflow) or the difference overflows `u32` (ninfer casts to `uint32_t`).
+pub fn auxiliary_removed_tokens(
+    evaluation_begin: u64,
+    auxiliary_tokens: u64,
+) -> Result<u32, String> {
+    let removed = evaluation_begin.checked_sub(auxiliary_tokens).ok_or_else(|| {
+        format!(
+            "auxiliary removed tokens: visible {auxiliary_tokens} exceeds frontier {evaluation_begin}"
+        )
+    })?;
+    u32::try_from(removed).map_err(|_| format!("auxiliary removed tokens: {removed} overflow u32"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,4 +490,50 @@ mod tests {
         sel.bind(ids, 300).unwrap();
         assert_eq!(sel.selected(), Some(&[0u32, 1, 2][..]));
     }
+
+    #[test]
+    fn bind_first_layer_auxiliary_live_hook() {
+        // G5 restore-hook mirror: the first FA ordinal's restored canonical ids
+        // (u64) bind the head history at the accepted frontier. The extent is
+        // DERIVED from the restored view (FirstLayer mirrors the trunk's first
+        // layer), then `bind` re-validates chronological/unique + extent.
+        // [0,1,2] @ frontier 300 ⇒ 128 + 128 + 44 = 300 visible.
+        let sel = bind_first_layer_auxiliary(&[0, 1, 2], 300, 128).unwrap();
+        assert!(sel.is_bound());
+        assert_eq!(sel.selected(), Some(&[0u32, 1, 2][..]));
+        assert_eq!(sel.history_tokens(), 300);
+        // Partial tail: [0,1] @ frontier 200 ⇒ 128 + 72 = 200.
+        let sel = bind_first_layer_auxiliary(&[0, 1], 200, 128).unwrap();
+        assert_eq!(sel.history_tokens(), 200);
+        assert_eq!(sel.selected(), Some(&[0u32, 1][..]));
+        // Cold start: no restored history ⇒ empty bound selection, extent 0.
+        let sel = bind_first_layer_auxiliary(&[], 0, 128).unwrap();
+        assert_eq!(sel.history_tokens(), 0);
+        assert_eq!(sel.selected(), Some(&[][..]));
+    }
+
+    #[test]
+    fn bind_first_layer_auxiliary_fails_closed() {
+        // Non-chronological / duplicate restored map ⇒ corrupt restore.
+        assert!(bind_first_layer_auxiliary(&[1, 0], 300, 128).is_err());
+        assert!(bind_first_layer_auxiliary(&[0, 0], 300, 128).is_err());
+        // A page starting at/beyond the frontier is not an accepted view.
+        assert!(bind_first_layer_auxiliary(&[0, 5], 300, 128).is_err());
+        // Canonical id wider than u32 fails closed (ninfer casts to uint32_t).
+        assert!(bind_first_layer_auxiliary(&[u64::from(u32::MAX) + 1], 300, 128).is_err());
+    }
+
+    // ── head restored-position + RoPE-shift contract (ninfer mirror) ──────
+    #[test]
+    fn removed_tokens_frontier_minus_visible() {
+        // ninfer NL:10285: evaluation.begin - auxiliary_tokens.
+        assert_eq!(auxiliary_removed_tokens(384, 256).unwrap(), 128);
+        assert_eq!(auxiliary_removed_tokens(384, 384).unwrap(), 0);
+        assert_eq!(auxiliary_removed_tokens(0, 0).unwrap(), 0);
+        // visible > frontier ⇒ underflow fail-closed.
+        assert!(auxiliary_removed_tokens(256, 384).is_err());
+        // difference overflow u32 fail-closed.
+        assert!(auxiliary_removed_tokens(u32::MAX as u64 + 2, 1).is_err());
+    }
+
 }

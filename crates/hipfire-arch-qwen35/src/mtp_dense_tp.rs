@@ -235,6 +235,7 @@ impl MtpTpRuntime {
                 max_n,
                 max_n,
                 kv_mode,
+                /* head_max_seq: dense TP stays full-resident */ None,
             )
             .map_err(|e| format!("dense TP MTP state: {e}"))?
         };
@@ -586,6 +587,7 @@ pub fn spec_step_mtp_dense_tp(
             last_committed,
             max_n,
             /* skip_proposal_graph */ true,
+            None,
         )
         .map_err(|e| format!("dense TP MTP draft: {e}"))?
     };
@@ -781,6 +783,7 @@ pub fn prefill_trunk_and_mtp_cache_dense_tp(
                         &target.weights[0],
                         Some(rot),
                         true,
+                        /* rope_shift */ 0,
                     )
                     .map_err(|e| format!("dense TP MTP batched head fill: {e}"))?;
                 }

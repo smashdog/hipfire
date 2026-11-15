@@ -24,8 +24,10 @@
 //! D4 adds the COW stripe-write guards, drop-evict and the three paged forward
 //! path integrations. Single serve thread; the FFI handles are `!Send`/`!Sync`.
 
-use crate::kvmem_ctl::{KvMemCtl, LayerwiseQuotas};
-use crate::layerwise_layout::{LayerwiseQ8Layout, LAYERWISE_BLOCK_TOKENS, Q8_PACKED_FORMAT};
+use crate::kvmem_ctl::{HeadPlaneState, KvMemCtl, LayerwiseQuotas};
+use crate::layerwise_layout::{
+    LayerwiseMtpQ8Layout, LayerwiseQ8Layout, LAYERWISE_BLOCK_TOKENS, Q8_PACKED_FORMAT,
+};
 use hip_bridge::{DeviceBuffer, PinnedTransferBuffer};
 use hipfire_kvmem::{
     BackendIdentity, BlockCopies, BlockDescriptor, ExecutionView, HostRecord, HostSource, KvMemError,
@@ -33,7 +35,7 @@ use hipfire_kvmem::{
     LayerwiseIdentity, LayerwisePhase, LayerwiseRequest, LayerwiseWork, MemoryBudget,
     MemoryCapabilities, MemoryCatalog, MemoryDescriptor, MemorySnapshot, MemoryStamp,
     NativeCurrentLayerQuery, NativePayload, OutputAcceptance, OutputMass, OutputPressure,
-    PayloadLayout, PrefillAcceptance, PrefillMass,
+    OutputScopeRow, OutputScopeState, PayloadLayout, PrefillAcceptance, PrefillMass,
     PrefillPressure, QueryPlaneBytes, QueryProjectionLayout,
     QueryProjectionPlane, QueryProjectionTape, QueryRange, QueryScoreFrame, RawStore, Reservation,
     SessionIdentity, SpillFile, Storage,
@@ -44,6 +46,8 @@ use rdna_compute::kv_slots::KvSlotDesc;
 use rdna_compute::layerwise_pool::{LayerwisePagePool, PackedArenaLayout};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
+
+use crate::mtp_head::HeadPagedKv;
 
 /// Map a core `NativeQueryScalar` ordinal (`native_layer_query.hpp`) to the
 /// launcher's `PageQueryScalar`. The ordinals are identical (F32=0, F16=1,
@@ -796,6 +800,70 @@ impl MassCapture {
             masses: (0..n_layers).map(|_| None).collect(),
         }
     }
+}
+
+/// Owned snapshot of one step's captured output-scope acceptance data (P4.1②,
+/// design §A.6). Extracted from a [`LayerwiseQuery`] carrier AFTER the verify
+/// forward (every FA layer's mass captured) but BEFORE the carrier is freed, so
+/// the partial acceptance can be published LATER — at the scheduler-confirmed
+/// accepted prefix (`mtp_verify_accept_step`'s `result.advance`), which is known
+/// only post-sampling, outside the carrier's borrow of the controller. Every field
+/// is owned (the carrier borrows `&KvMemCtl`/`&KvStore` only for restore/attend,
+/// never for accept), so the snapshot outlives both the carrier and the scoped
+/// controller take. `base_stamp.frontier` is overridden to `begin + accepted` at
+/// publish time; `eval_rows` is the physical verify width (the accept guard's
+/// ceiling). Legacy / AR-only sessions never build one (byte-neutral).
+pub struct OutputAcceptanceSnapshot {
+    /// Frozen canonical identity of FA ordinal 0; `frontier` is set to
+    /// `begin + accepted` when published.
+    pub base_stamp: MemoryStamp,
+    /// The output-scope request id (`session_id + 1`) the owner was prepared at.
+    pub request: u64,
+    /// The native consumed-row frontier the owner was `prepare`d at (`fed`).
+    pub begin: u64,
+    /// Physical evaluation row count (verify width); the accepted-prefix ceiling.
+    pub eval_rows: u64,
+    /// The admitted sample schedule (rejected rows ignored at publish).
+    pub mass_rows: Vec<u32>,
+    /// Per-FA-layer captured mass packets (logical-start history + masses).
+    pub layers: Vec<OutputMass>,
+}
+
+/// Publish an extracted [`OutputAcceptanceSnapshot`] into a persistent OUTPUT-scope
+/// pressure owner at the scheduler-confirmed accepted PREFIX (P4.1②, design §A.6).
+/// The shared accept core of [`LayerwiseQuery::accept_output_pressure`] (in-scope
+/// accept) and the MTP-verify post-sampling accept: validates `accepted <=
+/// eval_rows`, sets `history.frontier == begin + accepted` (core
+/// layerwise_pressure.cpp:340), and publishes the captured `mass_rows` schedule +
+/// per-layer masses (no renormalization). Returns the newly-accepted sampled-row
+/// bitmask (`Ok(0)` no-op when the schedule was empty). The caller must have
+/// `prepare`d the owner for `snap.request`/`snap.begin` first.
+pub fn publish_output_acceptance(
+    pressure: &mut OutputPressure,
+    snap: OutputAcceptanceSnapshot,
+    accepted: u32,
+) -> Result<u64, String> {
+    if snap.mass_rows.is_empty() {
+        return Ok(0);
+    }
+    if accepted as u64 > snap.eval_rows {
+        return Err(format!(
+            "layerwise output accept: accepted prefix {accepted} > eval_rows {}",
+            snap.eval_rows
+        ));
+    }
+    let mut stamp = snap.base_stamp;
+    stamp.frontier = snap.begin + accepted as u64;
+    let acceptance = OutputAcceptance {
+        history: stamp,
+        request: snap.request,
+        accepted,
+        rows: snap.mass_rows,
+        layers: snap.layers,
+    };
+    pressure
+        .accept(&acceptance)
+        .map_err(|e| format!("layerwise output accept: {e}"))
 }
 
 /// Owned GPU handles for one layer's paged attention binding, extracted from the
@@ -1580,18 +1648,35 @@ impl<'a> LayerwiseQuery<'a> {
         begin: u64,
         accepted: u32,
     ) -> Result<u64, String> {
-        let m = match self.mass.as_ref() {
-            Some(m) => m,
+        let snap = match self.extract_output_acceptance(request, begin)? {
+            Some(s) => s,
             None => return Ok(0),
         };
+        publish_output_acceptance(pressure, snap, accepted)
+    }
+
+    /// Extract this step's captured output-scope acceptance data into an owned
+    /// [`OutputAcceptanceSnapshot`] (P4.1②, design §A.6). Call AFTER the verify
+    /// forward (every FA layer's mass captured), BEFORE the carrier is freed. The
+    /// snapshot outlives the carrier's borrow of the controller, so the partial
+    /// acceptance can be published later at the scheduler-confirmed prefix
+    /// ([`publish_output_acceptance`]) — the MTP-verify accept count
+    /// (`result.advance`) is known only post-sampling, outside the orchestration's
+    /// scoped controller take. `Ok(None)` when no pressure owner backs the step or
+    /// the `rows()` schedule is empty (no capture/accept this step); `Err` when a
+    /// layer was not restored / its mass not captured. Reads only owned data
+    /// (`mass`, the Copy canonical stamp, `fa_layers`), so it takes `&self`.
+    pub fn extract_output_acceptance(
+        &self,
+        request: u64,
+        begin: u64,
+    ) -> Result<Option<OutputAcceptanceSnapshot>, String> {
+        let m = match self.mass.as_ref() {
+            Some(m) => m,
+            None => return Ok(None),
+        };
         if m.mass_rows.is_empty() {
-            return Ok(0);
-        }
-        if accepted as u64 > m.eval_rows {
-            return Err(format!(
-                "layerwise output accept: accepted prefix {accepted} > eval_rows {}",
-                m.eval_rows
-            ));
+            return Ok(None);
         }
         let fa_layers = self.driver.fa_layers();
         let mut layers = Vec::with_capacity(fa_layers.len());
@@ -1608,21 +1693,14 @@ impl<'a> LayerwiseQuery<'a> {
                 masses: masses.clone(),
             });
         }
-        // Native consumed-row frontier: the prepare begin advanced by the
-        // accepted prefix (never the predicted-token +1). The core validates
-        // history.frontier == begin_ + accepted atomically before publishing.
-        let mut stamp = self.driver.canonical()[0].memory.stamp;
-        stamp.frontier = begin + accepted as u64;
-        let acceptance = OutputAcceptance {
-            history: stamp,
+        Ok(Some(OutputAcceptanceSnapshot {
+            base_stamp: self.driver.canonical()[0].memory.stamp,
             request,
-            accepted,
-            rows: m.mass_rows.clone(),
+            begin,
+            eval_rows: m.eval_rows,
+            mass_rows: m.mass_rows.clone(),
             layers,
-        };
-        pressure
-            .accept(&acceptance)
-            .map_err(|e| format!("layerwise output accept: {e}"))
+        }))
     }
 
     /// The per-ordinal restored canonical page ids (the keep-set contribution of
@@ -1699,6 +1777,7 @@ impl<'a> LayerwiseQuery<'a> {
     ) -> Result<Self, String> {
         Self::build_with_pressure(
             gpu, keys, policy, q8, backend, capabilities, bootstrap, n_slots, archive_bytes, None, None,
+            None,
         )
     }
 
@@ -1712,6 +1791,13 @@ impl<'a> LayerwiseQuery<'a> {
     /// subsystem is attached separately by the engine ONLY in Query mode (it
     /// admits under the query identity); Pressure mode reads the live post-RoPE Q
     /// for mass.
+    ///
+    /// P4.1② G4 (f1): `composite == Some((mtp, max_position))` switches the
+    /// seal/restore export manifest to the composite Main+aux layout BEFORE the
+    /// query is admitted ([`LayerwiseDriver::set_composite_export`] must precede
+    /// `begin_query` — the catalog plans against the composite descriptor, which
+    /// tolerates the trunk's `n_fa` canonical snapshots). `None` keeps the default
+    /// trunk manifest (Legacy / AR-only / certified ② fixtures, byte-neutral).
     #[allow(clippy::too_many_arguments)]
     pub fn build_with_pressure(
         gpu: &mut Gpu,
@@ -1725,8 +1811,19 @@ impl<'a> LayerwiseQuery<'a> {
         archive_bytes: u64,
         pressure: Option<PressureStep>,
         mass: Option<MassCapture>,
+        composite: Option<(&LayerwiseMtpQ8Layout, u32)>,
     ) -> Result<Self, String> {
         let n_layers = bootstrap.canonical.len();
+        // P4.1② G1: the staging width is the evaluation-span row count (1 = AR
+        // decode, n = MTP verify span). Read from the bootstrap identity BEFORE
+        // canonical/identity are moved into the driver below. `width == 1`
+        // reproduces the AR single-row staging byte-for-byte (new_with_width(1)
+        // delegates to the same one-i32 positions/row_slot geometry as new()).
+        let width =
+            (bootstrap.identity.evaluation.end - bootstrap.identity.evaluation.begin) as usize;
+        let native_history_tokens = bootstrap.native_history_tokens;
+        let suffix_page = bootstrap.suffix_page;
+        let partial_tokens = bootstrap.partial_tokens;
         let mut driver = LayerwiseDriver::new(
             gpu,
             keys,
@@ -1738,21 +1835,111 @@ impl<'a> LayerwiseQuery<'a> {
             n_slots,
             archive_bytes,
         )?;
-        if pressure.is_none() {
-            driver.begin_query(
-                bootstrap.identity,
-                bootstrap.specs,
-                bootstrap.native_history_tokens,
-            )?;
+        // Switch the composite export BEFORE begin_query (the catalog plans against
+        // the composite descriptor). Free the driver explicitly on failure (no Drop).
+        if let Some((mtp, max_position)) = composite {
+            if let Err(e) = driver.set_composite_export(mtp, max_position) {
+                let _ = driver.free(gpu);
+                return Err(e);
+            }
         }
-        // The per-layer block table maps the compacted history (selected_pages)
-        // plus the one suffix page; `n_slots` may carry extra arena headroom, so
-        // derive the tight table bound from the selected extent rather than the
-        // arena size (the kernel masks any `-1` padding either way — D4a).
-        let selected_pages =
-            (bootstrap.native_history_tokens / LAYERWISE_BLOCK_TOKENS as u64) as usize;
+        if pressure.is_none() {
+            driver.begin_query(bootstrap.identity, bootstrap.specs, native_history_tokens)?;
+        }
+        Self::assemble(
+            gpu, driver, n_layers, width, native_history_tokens, suffix_page, partial_tokens,
+            pressure, mass,
+        )
+    }
+
+    /// P4.1② G4 (f2): build the head draft carrier with the bounded aux arena
+    /// attached BEFORE any query admission (design §A.8). The head restore is
+    /// independent of the trunk scorer — [`KvMemCtl::plan_head_plane`] builds its
+    /// own composite catalog over the single aux ordinal — so this carrier admits
+    /// NO trunk Query: `begin_query` would seal a trunk catalog and trip
+    /// [`LayerwiseDriver::attach_head_plane`]'s before-begin_query guard (the
+    /// composite export manifest must precede the catalog). Mirrors
+    /// [`Self::build_with_pressure`]'s staging tail via [`Self::assemble`]; the
+    /// head-plane attach switches the export manifest to the composite Main+aux
+    /// layout and allocates the bounded head arena (`head_n_slots`). The trunk
+    /// arena is still allocated (the carrier owns it) but never restored — the
+    /// draft attends only the head arena. Fail-closed on bad head geometry; the
+    /// driver is freed explicitly on the attach error path (no Drop). Legacy /
+    /// AR-only never call this (byte-neutral).
+    ///
+    /// [`KvMemCtl::plan_head_plane`]: crate::kvmem_ctl::KvMemCtl::plan_head_plane
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_head(
+        gpu: &mut Gpu,
+        keys: &'a RawStore,
+        policy: &'a KvStore,
+        q8: &LayerwiseQ8Layout,
+        backend: BackendIdentity,
+        capabilities: MemoryCapabilities,
+        bootstrap: LayerwiseBootstrap,
+        n_slots: usize,
+        archive_bytes: u64,
+        mtp: &LayerwiseMtpQ8Layout,
+        n_kv_heads: usize,
+        head_dim: usize,
+        head_n_slots: usize,
+        max_position: u32,
+    ) -> Result<Self, String> {
+        let n_layers = bootstrap.canonical.len();
+        let width =
+            (bootstrap.identity.evaluation.end - bootstrap.identity.evaluation.begin) as usize;
+        let native_history_tokens = bootstrap.native_history_tokens;
+        let suffix_page = bootstrap.suffix_page;
+        let partial_tokens = bootstrap.partial_tokens;
+        let mut driver = LayerwiseDriver::new(
+            gpu,
+            keys,
+            policy,
+            q8,
+            backend,
+            capabilities,
+            bootstrap.canonical,
+            n_slots,
+            archive_bytes,
+        )?;
+        // Attach the bounded head arena + composite export BEFORE any query (the
+        // manifest the head restore reads). Free the driver explicitly on failure
+        // (no Drop), mirroring engine_carrier_head's prior attach error path.
+        if let Err(e) = driver.attach_head_plane(
+            gpu, mtp, n_kv_heads, head_dim, head_n_slots, width, max_position,
+        ) {
+            let _ = driver.free(gpu);
+            return Err(e);
+        }
+        // No trunk Query admitted: the head restore plans independently.
+        Self::assemble(
+            gpu, driver, n_layers, width, native_history_tokens, suffix_page, partial_tokens,
+            None, None,
+        )
+    }
+
+    /// Shared carrier assembly tail (trunk [`Self::build_with_pressure`] and head
+    /// [`Self::build_head`]): the per-layer block-table staging over the compacted
+    /// history (`selected_pages`) plus the one suffix page, the reserved trunk
+    /// suffix slot, and the mode fields. `n_slots` may carry extra arena headroom,
+    /// so the tight table bound derives from the selected extent rather than the
+    /// arena size (the kernel masks any `-1` padding either way — D4a). The caller
+    /// has already admitted the trunk Query or attached the head plane on `driver`.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        gpu: &mut Gpu,
+        mut driver: LayerwiseDriver<'a>,
+        n_layers: usize,
+        width: usize,
+        native_history_tokens: u64,
+        suffix_page: u32,
+        partial_tokens: u32,
+        pressure: Option<PressureStep>,
+        mass: Option<MassCapture>,
+    ) -> Result<Self, String> {
+        let selected_pages = (native_history_tokens / LAYERWISE_BLOCK_TOKENS as u64) as usize;
         let max_pages = selected_pages + 1;
-        let staging = LayerwiseDescStaging::new(gpu, n_layers, max_pages)?;
+        let staging = LayerwiseDescStaging::new_with_width(gpu, n_layers, max_pages, width)?;
         let suffix_phys = driver
             .arena_mut()
             .pool()
@@ -1761,8 +1948,8 @@ impl<'a> LayerwiseQuery<'a> {
             .phys;
         let mut carrier = Self::new(driver, staging);
         carrier.suffix_slot = Some(suffix_phys);
-        carrier.suffix_page = bootstrap.suffix_page;
-        carrier.partial_tokens = bootstrap.partial_tokens;
+        carrier.suffix_page = suffix_page;
+        carrier.partial_tokens = partial_tokens;
         carrier.pressure = pressure;
         carrier.mass = mass;
         Ok(carrier)
@@ -2020,39 +2207,32 @@ pub fn layerwise_capabilities(max_position: u32) -> MemoryCapabilities {
     }
 }
 
-/// Engine-side per-step carrier builder (design §3.9g orchestration). Given the
-/// taken-out controller and the admitted slot's identity + model geometry,
-/// synthesize the bootstrap and build the scoped carrier borrowing the slot's
-/// statistics store and the caller-supplied selection policy. Returns `None`
-/// (Legacy fallback, byte-neutral) when the strategy is not Layerwise, the slot
-/// is out of range, or no sealed history page exists yet (`fed < 128` — the
-/// prompt-completing prefill still runs Legacy). The caller owns the returned
-/// carrier and MUST [`LayerwiseQuery::free`] it exactly once after the forward;
-/// the `ctl` and `policy` borrows must outlive it (scoped take/restore).
+/// P4.1② G1: the multi-row MTP-verify carrier builder (design §3.9g). Builds a
+/// `width`-row verify carrier (draft + bonus span) under Layerwise and opens the
+/// persistent OUTPUT-scope pressure window for PARTIAL (prefix) acceptance — the
+/// prefill owner's all-or-nothing `accept` cannot publish a verify span that
+/// rejects a draft suffix (core layerwise_pressure.cpp:79), so the trunk verify
+/// publishes through [`OutputPressure`] instead (design §A.6).
 ///
-/// `policy` MUST be a fresh, page-aligned selection index over ONLY the sealed
-/// full pages (`KvMemCtl::layerwise_policy`): the core `prepare_selection`
-/// rejects a partial tail (`total_tokens % block == 0`, every block full). The
-/// slot's shared `kv` store tracks ALL fed tokens for the Legacy path and is
-/// deliberately NOT borrowed here, so Layerwise never mutates it (byte-neutral).
+/// Faithful to ninfer's native Output cadence (NL:17113-17134): the window lives
+/// at the NATIVE CONSUMED frontier `fed` (NOT the page-boundary selection
+/// frontier `full_pages*128` — the partial tail rides the physical suffix stripe
+/// and is not part of the logical canonical frame). One `begin_scope` per session
+/// (request `session_id+1`, idempotent — core begin_state:272), `prepare_scope`
+/// per step at `begin == accepted_end == fed`, and the orchestration's
+/// `accept_output_pressure` advances `accepted_end` to `fed + accepted` so the
+/// next step's `fed` matches naturally. `width == 1, query == None` reproduces the
+/// AR single-row geometry; the Legacy spine never calls this (byte-neutral).
 ///
-/// `fa_layers` are the DENSE fa ordinals `0..n_fa_layers`: the `KvMemCtl` store
-/// indexes statistics/arena layers by ordinal (`raw_cfg.n_layer == n_fa_layers`,
-/// fed via `write_layer_*_gpu(.., il, ..)`), so the layerwise `model_layer` is the
-/// ordinal — not the sparse model layer id. `max_position` is the engine KV
-/// capacity (an upper bound on any decode position); `model` tags the backend
-/// identity (opaque admission key, consistent across the transaction).
-///
-/// `pressure` is the slot's detached persistent pressure owner (design §3.10a,
-/// decision A), borrowed for the trigger / `select` / `rows` schedule (all
-/// `&self`). `None` ⇒ the certified ② scorer Query path with no mass capture
-/// (the Legacy spine and the ② fixtures). `Some` ⇒ the engine decides Query
-/// (scorer cold-start / new-page admission) vs Pressure (resident-only mass
-/// refinement) per the Q2/Q3 trigger, and attaches the mode-independent mass
-/// capture. The orchestration owns the owner for the post-forward `accept`
-/// (scoped take/restore — the carrier borrows `ctl`, so the owner is detached).
+/// `output` is borrowed `&mut` only for `begin_scope`/`prepare_scope`/`select`;
+/// the returned carrier borrows `ctl`/`policy` (lifetime `'a`) but NOT `output`,
+/// so the orchestration retains the owner for the post-forward
+/// `accept_output_pressure`. `prefill` seeds the `output.select` conjunction
+/// (positive decayed output scores override the prefill snapshot fallback);
+/// `None` ⇒ no Pressure refinement (scorer Query only). Returns `Ok(None)` under
+/// Legacy, before the first sealed page (`fed < 128`), or `width == 0`.
 #[allow(clippy::too_many_arguments)]
-pub fn engine_carrier<'a>(
+pub fn engine_carrier_rows<'a>(
     gpu: &mut Gpu,
     ctl: &'a KvMemCtl,
     policy: &'a KvStore,
@@ -2064,9 +2244,13 @@ pub fn engine_carrier<'a>(
     head_dim: usize,
     max_position: u32,
     model: &str,
-    pressure: Option<&PrefillPressure>,
+    width: u64,
+    query: Option<QueryRange>,
+    output: &mut OutputPressure,
+    prefill: Option<&PrefillPressure>,
+    force_query: bool,
 ) -> Result<Option<LayerwiseQuery<'a>>, String> {
-    if !ctl.strategy().is_layerwise() {
+    if !ctl.strategy().is_layerwise() || width == 0 {
         return Ok(None);
     }
     let (fed, incarnation, seq, stores) = match (
@@ -2081,18 +2265,34 @@ pub fn engine_carrier<'a>(
     if fed < LAYERWISE_BLOCK_TOKENS {
         return Ok(None);
     }
-    // Borrow only the statistics store from the slot; the selection policy is
-    // the caller-supplied fresh page-aligned index (the slot's shared `kv`
-    // store tracks the partial tail for Legacy and must not be used here).
     let (keys, _slot_policy) = stores;
     let fa_layers: Vec<u32> = (0..n_fa_layers as u32).collect();
     let q8 = LayerwiseQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim, &fa_layers)
-        .map_err(|e| format!("layerwise engine: q8 layout: {e}"))?;
-    let record_bytes = q8
-        .payload_layout()
-        .map_err(|e| format!("layerwise engine: manifest: {e}"))?
-        .record_bytes();
-    let bootstrap = bootstrap_layerwise(
+        .map_err(|e| format!("layerwise engine rows: q8 layout: {e}"))?;
+    // P4.1② G4 (f1): under Layerwise + MTP the canonical archive is the COMPOSITE
+    // Main+aux manifest (n_fa + 1 layers) so every sealed trunk record co-archives
+    // the head aux plane the head write-through populates. The trunk device arena
+    // stays n_fa (q8); only the record/archive sizing + export manifest switch.
+    // Legacy / AR-only keep the standalone trunk manifest (byte-neutral).
+    let mtp = if ctl.head_plane_enabled() {
+        Some(
+            LayerwiseMtpQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim)
+                .map_err(|e| format!("layerwise engine rows: mtp layout: {e}"))?,
+        )
+    } else {
+        None
+    };
+    let record_bytes = match &mtp {
+        Some(m) => m
+            .payload_layout()
+            .map_err(|e| format!("layerwise engine rows: composite manifest: {e}"))?
+            .record_bytes(),
+        None => q8
+            .payload_layout()
+            .map_err(|e| format!("layerwise engine rows: manifest: {e}"))?
+            .record_bytes(),
+    };
+    let bootstrap = bootstrap_layerwise_rows(
         fed,
         session_id,
         incarnation,
@@ -2103,73 +2303,108 @@ pub fn engine_carrier<'a>(
         head_dim as u32,
         ctl.budget_blocks() as u32,
         record_bytes,
-        // Decision A (§3.10a): the slot's persistent PER-LAYER keep-set drives
-        // each layer's canonical resident list (empty before the first selection
-        // ⇒ ② re-bootstrap).
         ctl.layerwise_keep_set(slot).unwrap_or(&[]),
+        width,
+        query,
     )?;
     let selected_pages =
         (bootstrap.native_history_tokens / LAYERWISE_BLOCK_TOKENS as u64) as usize;
-    // Arena: one composite slot per compact history position (selected_pages,
-    // SHARED across all FA layers — design §3.1 mixed-stripe destinations) plus
-    // the suffix page, plus one slot of headroom. The position-shared model needs
-    // `selected_pages + 1` regardless of the layer count; the extra slot keeps a
-    // scratch bind from exhausting the pool.
     let n_slots = selected_pages + 2;
-    // Archive (host RAM restore source): `seal_record_source` caches ONE sealed
-    // canonical record per unique page, keyed by page id, lazily re-exported on
-    // first restore. Different FA layers select DIFFERENT pages into the shared
-    // compact positions, so the union of pages sealed across all ordinals can
-    // reach the FULL sealed history (full_pages), NOT the per-layer selected
-    // budget — sizing to `selected_pages` exhausts the archive mid-restore once
-    // the union exceeds the budget (real 16-layer serve: "alloc block 45: native
-    // KV RAM capacity exhausted"). Size to the full canonical history + suffix
-    // (+1 headroom); the GPU arena above stays compact regardless.
     let full_pages = (fed / LAYERWISE_BLOCK_TOKENS) as u64;
     let archive_bytes = (full_pages + 2) * record_bytes;
-    // ── Pressure trigger (design §3.10a, Q2/Q3) ──────────────────────────────
-    // A new canonical page is sealed exactly when `fed` lands on a page boundary
-    // (`fed % 128 == 0`): the scorer Query admits it (pressure has no cold recall).
-    // Mid-page steps refine the resident keep-set by accumulated attention mass
-    // ONLY when the history overflows the budget AND every FA layer has a positive
-    // accepted pressure state. `pressure.select` Pending (any layer without a
-    // positive-mass selection) falls back to Query. The owner is borrowed (`&self`
-    // select/rows/snapshot); the orchestration owns it for the post-forward accept.
     let budget_blocks = ctl.budget_blocks() as u32;
+
+    // ── Output window (ninfer native Output cadence) ─────────────────────────
+    // The window frontier is the native consumed frontier `fed`, not the
+    // page-boundary selection frontier: override the bootstrap stamp's frontier
+    // (the rest of the identity — session/revision — is shared with the owner).
+    let request = session_id + 1;
+    let begin = fed as u64;
+    let mut output_stamp = bootstrap.identity.history;
+    output_stamp.frontier = begin;
+    // Idempotent within the session (core begin_state:272): the first call opens
+    // the window at `accepted_end = fed`; later calls are no-ops and `accept`
+    // advances `accepted_end` to `fed + accepted` for the next step's `begin`.
+    output
+        .begin_scope(&output_stamp, request, OutputScopeState::new(false, false))
+        .map_err(|e| format!("layerwise engine rows: begin_scope: {e}"))?;
+    // P4.1② (#9) + A'-1: a continuation turn's unsampled Legacy prefill advances
+    // the native consumed frontier `fed` without the persistent output window
+    // observing it (ninfer calls accept_prefill after every prefill chunk —
+    // NL:8482/17094). hipfire keeps ONE window per session (request=session_id+1,
+    // begin_scope idempotent, never finished), so after a turn boundary the
+    // window's accepted_end lags `fed` and prepare_scope rejects the verifier
+    // ("native grammar verifier differs from accepted frontier"). Sync the
+    // accepted feedback to the validated native prefix. Idempotent: a no-op
+    // within a turn (accepted_end == fed via accept lockstep), so steady-state
+    // decode and Legacy (which never reaches this arm) stay byte-neutral.
+    //
+    // Fire for the MTP/head-plane verify regime (mtp.is_some()) AND for A'-1 AR
+    // Query-only decode (prefill.is_none()). A'-1 switched AR decode onto this
+    // same persistent OutputPressure window, so AR inherits the continuation
+    // desync and MUST re-base too (else turn2 prepare_scope fails => HTTP 500,
+    // reproduced multiturn REPS=5). The original #9 restriction to MTP was
+    // because firing the restore-based sync in AR advanced the output.select
+    // SEED frontier through the unsampled prefill and dropped needle pages
+    // (deterministic recall loss, reproduced on two needles). That mechanism is
+    // INAPPLICABLE to Query-only selection: when prefill.is_none() the
+    // pressure_step conjunction below never matches Some(pf), so output.select
+    // is never called and the seed frontier drives nothing — selection is the
+    // scorer Query over the bootstrap canonical (fed / keep-set / current-Q),
+    // independent of accepted_end. sync_prefill only re-bases accepted_end and
+    // clears the prepared verifier, preserving scores/mass; it never touches
+    // page selection. A hypothetical Pressure-refinement path (prefill=Some,
+    // mtp=None) still skips the sync to preserve the #9 guard.
+    if mtp.is_some() || prefill.is_none() {
+        output
+            .sync_prefill(begin)
+            .map_err(|e| format!("layerwise engine rows: sync_prefill: {e}"))?;
+    }
+    // Every verify row is body output (NonThinking scope, interval=1 ⇒ all rows
+    // sampled). The returned bitmask is the admitted sample schedule.
+    let scope_rows = vec![OutputScopeRow::new(false, false, true); width as usize];
+    let mask = output
+        .prepare_scope(request, begin, &scope_rows)
+        .map_err(|e| format!("layerwise engine rows: prepare_scope: {e}"))?;
+    let mass_rows: Vec<u32> = (0..width as u32).filter(|&r| mask & (1u64 << r) != 0).collect();
+
+    // ── Pressure trigger (design §A.8) ──────────────────────────────────────
+    // Mid-page keep-set refinement by accumulated OUTPUT attention mass ONLY when
+    // the history overflows the budget, every FA layer has a positive accepted
+    // output state, AND a prefill owner backs the conjunction. `output.select`
+    // Pending (any layer without a positive-mass selection) falls back to Query.
     let new_page = fed % LAYERWISE_BLOCK_TOKENS == 0;
     let keep_empty = ctl
         .layerwise_keep_set(slot)
         .map(|k| k.iter().all(|ids| ids.is_empty()))
         .unwrap_or(true);
-    let pressure_positive = match pressure {
-        Some(p) => p
-            .snapshot()
-            .ok()
-            .and_then(|s| s.read().ok())
-            .map(|snap| !snap.layers.is_empty() && snap.layers.iter().all(|l| l.samples > 0))
-            .unwrap_or(false),
-        None => false,
-    };
-    let pressure_step: Option<PressureStep> = match pressure {
-        Some(p) if !new_page && !keep_empty && pressure_positive && full_pages > budget_blocks as u64 => {
+    let pressure_positive = output
+        .snapshot()
+        .ok()
+        .and_then(|s| s.read().ok())
+        .map(|snap| !snap.layers.is_empty() && snap.layers.iter().all(|l| l.samples > 0))
+        .unwrap_or(false);
+    // [P4.1② fix] continuation per-request Query (AR + MTP verify).
+    let pressure_step: Option<PressureStep> = match prefill {
+        Some(pf) if !force_query && !new_page && !keep_empty && pressure_positive && full_pages > budget_blocks as u64 => {
             let layout = q8
                 .payload_layout()
-                .map_err(|e| format!("layerwise engine: manifest: {e}"))?;
+                .map_err(|e| format!("layerwise engine rows: manifest: {e}"))?;
             let descriptor = MemoryDescriptor::new(
                 &layerwise_backend(model),
                 &layout,
                 &layerwise_capabilities(max_position),
             )
-            .map_err(|e| format!("layerwise engine: descriptor: {e}"))?;
+            .map_err(|e| format!("layerwise engine rows: descriptor: {e}"))?;
             let catalog = MemoryCatalog::new(&descriptor, &bootstrap.canonical)
-                .map_err(|e| format!("layerwise engine: catalog: {e}"))?;
+                .map_err(|e| format!("layerwise engine rows: catalog: {e}"))?;
             let budget_tokens = budget_blocks as u64 * LAYERWISE_BLOCK_TOKENS as u64;
-            let choices = p
-                .select(&catalog, &[], budget_tokens, 0)
-                .map_err(|e| format!("layerwise engine: pressure select: {e}"))?;
+            let choices = output
+                .select(&catalog, pf, &[], budget_tokens, 0)
+                .map_err(|e| format!("layerwise engine rows: output select: {e}"))?;
             let all = choices
                 .read_all()
-                .map_err(|e| format!("layerwise engine: pressure choices: {e}"))?;
+                .map_err(|e| format!("layerwise engine rows: output choices: {e}"))?;
             if all.len() != n_fa_layers || all.iter().any(|c| c.selected.is_empty()) {
                 None // Pending ⇒ scorer Query fallback
             } else {
@@ -2179,7 +2414,7 @@ pub fn engine_carrier<'a>(
                         .iter()
                         .find(|c| c.model_layer == fa_layers[ordinal])
                         .ok_or_else(|| {
-                            format!("layerwise engine: pressure choice missing layer {ordinal}")
+                            format!("layerwise engine rows: output choice missing layer {ordinal}")
                         })?;
                     selected.push(choice.selected.clone());
                 }
@@ -2189,23 +2424,18 @@ pub fn engine_carrier<'a>(
         }
         _ => None,
     };
-    // Mode-independent mass-capture state (design §3.10a): present whenever a
-    // pressure owner backs the step. The sample schedule is gated by the core
-    // `rows()` (frontier advance + interval/near); empty ⇒ no capture/accept this
-    // step. `local_begin` is the compact causal tail of the single decode row
-    // (selected_pages*128 + partial_tokens), identical in both modes because the
-    // picker reproduces `native_history_tokens` (Σ selected page tokens).
-    let mass = match pressure {
-        Some(p) => {
-            let frontier = bootstrap.identity.history.frontier;
-            let local_begin = bootstrap.native_history_tokens + bootstrap.partial_tokens as u64;
-            let mass_rows = p
-                .rows(frontier - 1, 1, local_begin, false)
-                .map_err(|e| format!("layerwise engine: pressure rows: {e}"))?;
-            Some(MassCapture::new(n_fa_layers, frontier, local_begin, 1, mass_rows))
-        }
-        None => None,
-    };
+    // Mode-independent mass capture: the verify span rides the single physical
+    // suffix stripe, so the compact causal tail is the same as AR
+    // (selected_pages*128 + partial_tokens); `width` rows are evaluated there.
+    let frontier = bootstrap.identity.history.frontier;
+    let local_begin = bootstrap.native_history_tokens + bootstrap.partial_tokens as u64;
+    let mass = MassCapture::new(n_fa_layers, frontier, local_begin, width, mass_rows);
+    // P4.1② G4 (f1): switch the carrier's seal/restore export to the composite
+    // manifest so the trunk restore co-archives the head aux plane. The trunk
+    // arena stays n_fa; no head arena here (the head draft carrier owns that).
+    // Switched BEFORE begin_query inside build_with_pressure (a post-build switch
+    // would trip the guard in Query mode — the verify carrier admits a Query when
+    // no Pressure refinement is pending).
     let mut carrier = LayerwiseQuery::build_with_pressure(
         gpu,
         keys,
@@ -2217,13 +2447,12 @@ pub fn engine_carrier<'a>(
         n_slots,
         archive_bytes,
         pressure_step,
-        mass,
+        Some(mass),
+        mtp.as_ref().map(|m| (m, max_position)),
     )?;
-    // ③-E1: attach the activation-quota subsystem (five live accounts + per-FA-layer
-    // projected-Q tapes) ONLY in Query mode — it admits under the query identity.
-    // Pressure mode runs no query state machine and reads the live post-RoPE Q for
-    // mass instead. On a quota admission failure the just-built carrier owns GPU
-    // buffers with no Drop, so free it before propagating the error.
+    // ③-E1: the activation-quota subsystem admits ONLY in Query mode (it admits
+    // under the query identity); Pressure mode reads the live post-RoPE Q for
+    // mass. Free the just-built carrier on a quota admission failure (no Drop).
     if !carrier.is_pressure() {
         if let Err(e) = carrier.attach_activation(gpu, ctl.layerwise_quotas(), n_heads * head_dim * 4) {
             let _ = carrier.free(gpu);
@@ -2233,14 +2462,254 @@ pub fn engine_carrier<'a>(
     Ok(Some(carrier))
 }
 
-/// Combine the previous per-layer keep-set with this step's restored canonical
-/// page ids (design §3.10a keep-set lifecycle, ninfer window-faithful). A Query
-/// step UNIONS (`prev ∪ restored`, sorted/deduped) so the resident pool grows to
-/// admit scorer selections and newly sealed pages; a Pressure step TRUNCATES to
-/// the refined `restored` selection (the mass/exposure reorder prunes the pool
-/// back to budget). `n_layers` is the FA ordinal count; an absent ordinal entry
-/// reads as `[]`. Pure host logic — the arena is still freshly restored every
-/// step (device-truth); the keep-set persists only the SELECTION state.
+/// P4.1② G4 (f2): the head-only restore carrier for the MTP draft phase under
+/// Layerwise + native MTP. Mirrors [`engine_carrier_rows`]'s composite bootstrap
+/// (the head reads the aux region of the SAME sealed composite records the trunk
+/// verify co-archives) but attaches the bounded head arena ([`LayerwiseDriver::attach_head_plane`])
+/// instead of opening an output-pressure window — the head does NOT mass-score
+/// (ninfer's independent aux resident map, quota = window). The draft phase drives
+/// `ctl.plan_head_plane → driver.restore_head_plane_with_suffix → ctl.accept_head_restore`
+/// on this carrier, then consumes [`LayerwiseDriver::head_layer_views`] /
+/// [`LayerwiseDriver::head_arena_views`] through `HeadPagedKv` for the K draft
+/// forwards. `width` is the single draft row (1). Returns `Ok(None)` under Legacy /
+/// AR-only / head-plane-inactive / before the first sealed page (byte-neutral — the
+/// draft keeps the full-resident head `KvCache`). The trunk arena built here is the
+/// composite-record restore source; only the attached head arena is attended.
+#[allow(clippy::too_many_arguments)]
+pub fn engine_carrier_head<'a>(
+    gpu: &mut Gpu,
+    ctl: &'a KvMemCtl,
+    policy: &'a KvStore,
+    slot: usize,
+    session_id: u64,
+    n_fa_layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_position: u32,
+    model: &str,
+    width: u64,
+    window_tokens: usize,
+) -> Result<Option<LayerwiseQuery<'a>>, String> {
+    if !ctl.strategy().is_layerwise() || !ctl.head_plane_enabled() || width == 0 {
+        return Ok(None);
+    }
+    let (fed, incarnation, seq, stores) = match (
+        ctl.fed_tokens(slot),
+        ctl.layerwise_counters(slot),
+        ctl.layerwise_stores(slot),
+    ) {
+        (Some(fed), Some((incarnation, seq)), Some(stores)) => (fed, incarnation, seq, stores),
+        _ => return Ok(None),
+    };
+    // No sealed full page yet ⇒ nothing to recall; the draft stays full-resident.
+    if fed < LAYERWISE_BLOCK_TOKENS {
+        return Ok(None);
+    }
+    let (keys, _slot_policy) = stores;
+    let fa_layers: Vec<u32> = (0..n_fa_layers as u32).collect();
+    let q8 = LayerwiseQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim, &fa_layers)
+        .map_err(|e| format!("layerwise head carrier: q8 layout: {e}"))?;
+    let mtp = LayerwiseMtpQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim)
+        .map_err(|e| format!("layerwise head carrier: mtp layout: {e}"))?;
+    let record_bytes = mtp
+        .payload_layout()
+        .map_err(|e| format!("layerwise head carrier: composite manifest: {e}"))?
+        .record_bytes();
+    let bootstrap = bootstrap_layerwise_rows(
+        fed,
+        session_id,
+        incarnation,
+        seq,
+        &fa_layers,
+        n_heads as u32,
+        n_kv_heads as u32,
+        head_dim as u32,
+        ctl.budget_blocks() as u32,
+        record_bytes,
+        ctl.layerwise_keep_set(slot).unwrap_or(&[]),
+        width,
+        None,
+    )?;
+    let selected_pages =
+        (bootstrap.native_history_tokens / LAYERWISE_BLOCK_TOKENS as u64) as usize;
+    let n_slots = selected_pages + 2;
+    let full_pages = (fed / LAYERWISE_BLOCK_TOKENS) as u64;
+    let archive_bytes = (full_pages + 2) * record_bytes;
+    // No pressure step / mass capture: the head restores its independent aux
+    // selection (FirstLayer, G5) and never mass-scores. `build_head` attaches the
+    // bounded head arena + composite export BEFORE query admission and admits NO
+    // trunk Query (the head restore plans independently via `plan_head_plane`);
+    // admitting one here would trip attach_head_plane's before-begin_query guard.
+    // head_pool_capacity returns the bounded head TOKEN capacity (window + one
+    // native draft-scratch block, `mtp_auxiliary_capacity`); the head arena and
+    // block-table staging take a SLOT (page) count. Convert tokens→pages exactly
+    // as `mtp_head_pool` does (`aux_capacity / block_tokens`). The capacity is
+    // page-aligned by construction (page-aligned window + one block), so the
+    // division is exact. Passing the token count straight through would size the
+    // head staging to `window/128+1` PAGES × 128 (ctx_len = (window+128)*128),
+    // and the paged head attention would walk unmapped block-table tiles → GPU
+    // hang (the head forward never returns).
+    let head_n_slots = ctl.head_pool_capacity(window_tokens)? / LAYERWISE_BLOCK_TOKENS as usize;
+    let carrier = LayerwiseQuery::build_head(
+        gpu,
+        keys,
+        policy,
+        &q8,
+        layerwise_backend(model),
+        layerwise_capabilities(max_position),
+        bootstrap,
+        n_slots,
+        archive_bytes,
+        &mtp,
+        n_kv_heads,
+        head_dim,
+        head_n_slots,
+        max_position,
+    )?;
+    Ok(Some(carrier))
+}
+
+/// P4.1② G4 (f2): the head restore-before-attend guard (ninfer NL:10274-10339).
+/// Drives the three-step head restore on a head-attached carrier from
+/// [`engine_carrier_head`]: `ctl.plan_head_plane` (independent aux selection) →
+/// `driver.restore_head_plane_with_suffix` (bounded aux arena + draft-scratch
+/// boundary page) → `ctl.accept_head_restore` (publish the head map + RoPE shift,
+/// validating the aux invariant). Returns the post-fence [`ExecutionView`] and the
+/// head's `auxiliary_removed_tokens` (the RoPE shift the draft adds to each row's
+/// global position). `selected` is the head's FirstLayer aux selection (G5 binds
+/// it; the vertical slice passes the sealed-history window). `suffix` is the
+/// boundary draft-scratch page ([`HeadSuffix`]). Fail-closed off Layerwise+MTP.
+#[allow(clippy::too_many_arguments)]
+pub fn head_restore_guard(
+    gpu: &mut Gpu,
+    ctl: &KvMemCtl,
+    head: &mut HeadPlaneState,
+    carrier: &mut LayerwiseQuery<'_>,
+    slot: usize,
+    selected: &[u64],
+    fed: u64,
+    window_tokens: usize,
+    session_id: u64,
+    max_position: u32,
+    model: &str,
+    suffix: &HeadSuffix,
+) -> Result<(ExecutionView, u32), String> {
+    let plan = ctl.plan_head_plane(
+        slot, head, selected, fed, window_tokens, session_id, max_position, model,
+    )?;
+    let view = carrier.driver.restore_head_plane_with_suffix(gpu, &plan, suffix)?;
+    let frontier = (fed / LAYERWISE_BLOCK_TOKENS as u64) * LAYERWISE_BLOCK_TOKENS as u64;
+    ctl.accept_head_restore(slot, head, &view, frontier)?;
+    Ok((view, head.removed_tokens()))
+}
+
+/// P4.1② G4 (f2): the draft phase's head-layerwise consumer handle. Owns the
+/// head-attached carrier from [`engine_carrier_head`], runs the restore guard
+/// once, and caches the head's stable-address paged views so each draft row can
+/// borrow a [`HeadPagedKv`] without re-querying the driver. `rope_pos` is the
+/// GLOBAL RoPE position buffer (device i32, one element) the draft fills per row
+/// (the row's global position plus the guard's `removed` RoPE shift); the cached `positions`
+/// (from the head staging) is the COMPACT write position the paged KV write
+/// consumes. The cached views are non-owning aliases of the carrier's head arena
+/// (no Drop); the carrier owns the allocation and frees it on [`Self::free`].
+pub struct HeadLayerwise<'a> {
+    pub carrier: LayerwiseQuery<'a>,
+    k_view: GpuTensor,
+    v_view: GpuTensor,
+    descs: GpuTensor,
+    positions: GpuTensor,
+    row_slot: GpuTensor,
+    /// Page-rounded context cap the paged tile grid / reduce span are sized from
+    /// (the draft passes it as the head forward's `seq_len_hint`).
+    pub ctx_len: usize,
+    /// GLOBAL RoPE position (device i32, 1 elem); the draft writes it per row.
+    pub rope_pos: DeviceBuffer,
+    /// The head's RoPE shift (`frontier - visible`, ninfer NL:5848/10328).
+    pub removed: u32,
+}
+
+impl<'a> HeadLayerwise<'a> {
+    /// Build the handle and run the restore-before-attend guard once. `rope_pos`
+    /// is a caller-allocated 1-element i32 device buffer the draft fills per row.
+    /// Fail-closed off Layerwise+MTP / on a bad restore (the carrier is freed).
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore(
+        gpu: &mut Gpu,
+        ctl: &KvMemCtl,
+        head: &mut HeadPlaneState,
+        carrier: LayerwiseQuery<'a>,
+        slot: usize,
+        selected: &[u64],
+        fed: u64,
+        window_tokens: usize,
+        session_id: u64,
+        max_position: u32,
+        model: &str,
+        suffix: &HeadSuffix,
+        rope_pos: DeviceBuffer,
+    ) -> Result<Self, String> {
+        let mut carrier = carrier;
+        let (_view, removed) = head_restore_guard(
+            gpu, ctl, head, &mut carrier, slot, selected, fed, window_tokens, session_id,
+            max_position, model, suffix,
+        )?;
+        let views = carrier.driver.head_layer_views()?;
+        let (k_view, v_view) = carrier.driver.head_arena_views()?;
+        Ok(Self {
+            carrier,
+            k_view,
+            v_view,
+            descs: views.descs,
+            positions: views.positions,
+            row_slot: views.row_slot,
+            ctx_len: views.ctx_len,
+            rope_pos,
+            removed,
+        })
+    }
+
+    /// Borrow the head's paged KV views for one draft row. The caller must have
+    /// written the row's GLOBAL RoPE position into [`Self::rope_pos`] first.
+    pub fn paged_kv(&self) -> HeadPagedKv<'_> {
+        HeadPagedKv {
+            k_view: &self.k_view,
+            v_view: &self.v_view,
+            positions: &self.positions,
+            descs: &self.descs,
+            row_slot: &self.row_slot,
+            ctx_len: self.ctx_len,
+            rope_pos_buf: &self.rope_pos,
+        }
+    }
+
+    /// Release the head carrier (frees the trunk + head arenas) and the owned
+    /// `rope_pos` device buffer. The cached view aliases drop with the handle
+    /// (no Drop); `DeviceBuffer` has no Drop, so `rope_pos` (a caller-allocated
+    /// owning `hipMalloc` buffer handed to the handle) is freed here explicitly.
+    pub fn free(self, gpu: &mut Gpu) -> Result<(), String> {
+        let Self { carrier, rope_pos, .. } = self;
+        let _ = gpu.hip.free(rope_pos);
+        carrier.free(gpu)
+    }
+}
+
+/// Publish this step's per-layer restored canonical page ids as the new keep-set
+/// (design §3.10a keep-set lifecycle, ninfer `KvmemLayerViews::restored`
+/// NL:12287-12300 REPLACE — ninfer never unions the target maps). The restored
+/// view IS the resident map: the core picker reproduces `native_history_tokens`
+/// for every FA layer, so each ordinal's selection carries the SAME visible extent
+/// (the catalog's cross-layer invariant, `layerwise_memory.cpp:53`) while the page
+/// IDS differ per layer (per-layer scorer / pressure mass). The scorer Query
+/// already admits cold pages and newly sealed pages into the restored view, so a
+/// growing `prev ∪ restored` union is both redundant and wrong: it retains pages
+/// the selector rejected AND diverges the per-layer resident counts (the union of
+/// two equal-count sets with different ids has a layer-dependent size, which the
+/// catalog rejects as "inconsistent resident extent"). The suffix page is excluded
+/// (it rides the physical suffix stripe, not the canonical map, §3.9g). `n_layers`
+/// is the FA ordinal count; an absent ordinal entry reads as `[]`. Pure host logic
+/// — the arena is still freshly restored every step (device-truth); the keep-set
+/// persists only the SELECTION state.
 pub fn combine_keep_set(
     prev: &[Vec<u64>],
     restored: &[Vec<u64>],
@@ -2249,6 +2718,15 @@ pub fn combine_keep_set(
 ) -> Vec<Vec<u64>> {
     (0..n_layers)
         .map(|ordinal| {
+            // Query step ⇒ UNION the previous resident pool with this step's
+            // restored selection (pool growth, design §3.10a): the trunk scorer
+            // selects symmetric page ids across FA layers, so the union keeps
+            // every layer's resident COUNT equal (the catalog's cross-layer
+            // extent invariant) while retaining cold-recalled needle pages
+            // across continuation turns. Pressure step ⇒ REPLACE (truncate to
+            // the refined budget selection). The MTP composite verify regime
+            // forces `pressure = true` (asymmetric trunk+aux planes would
+            // diverge counts under a union — bug #8).
             let mut ids = if pressure {
                 restored.get(ordinal).cloned().unwrap_or_default()
             } else {
@@ -2270,6 +2748,79 @@ pub fn combine_keep_set(
 /// the core `export_raw_kv_payload` bridge gathers the RawStore's packed K/V into
 /// the canonical record, so the statistics store and the sealed archive stay
 /// distinct (mirrors the core `layerwise_request_test.cpp` Fixture).
+/// P4.1② G4: restore the head boundary page's already-fed `partial_tokens` into
+/// the reserved draft-scratch slot (the head analog of [`LayerwiseDriver::restore_suffix_page`],
+/// ninfer `rebuild_auxiliary_boundary` NL:10205-10258). Reads the boundary block's
+/// AUX region through the SAME `plan.payload()` regions the head history restore
+/// uses (head arena ordinal 0 == the composite aux plane), into the head's pinned
+/// slab, then H2D-scatters both planes into the scratch stripe. Bytes beyond
+/// `partial_tokens` are masked by the compacted causal bound the caller publishes.
+/// A page boundary (`partial_tokens == 0`) is a no-op — the scratch starts empty.
+#[allow(clippy::too_many_arguments)]
+fn restore_head_suffix_page(
+    gpu: &mut Gpu,
+    arena: &mut LayerwiseArena,
+    slab: &mut PinnedTransferBuffer,
+    records: &mut HashMap<u64, HostRecord>,
+    storage: &Storage,
+    keys: &RawStore,
+    backend: &BackendIdentity,
+    layout: &PayloadLayout,
+    plan: &LayerPlan,
+    block_tokens: u32,
+    suffix_slot: u32,
+    session: SessionIdentity,
+    suffix: &HeadSuffix,
+) -> Result<(), String> {
+    if suffix.partial_tokens == 0 {
+        return Ok(());
+    }
+    let regions = plan
+        .payload()
+        .map_err(|e| format!("layerwise head suffix: payload regions: {e}"))?;
+    let bt = block_tokens;
+    let block = BlockDescriptor {
+        session,
+        id: suffix.page as u64,
+        original_start: suffix.page as u64 * bt as u64,
+        valid_tokens: suffix.partial_tokens,
+        content_version: 1,
+        statistics_version: 1,
+    };
+    let source = seal_record_source(records, storage, keys, backend, layout, &block, bt)?;
+    let k_plane = arena.layout().k_plane_bytes() as usize;
+    let v_plane = arena.layout().v_plane_bytes() as usize;
+    let extent = k_plane + v_plane;
+    if slab.size() < extent {
+        return Err(format!(
+            "layerwise head suffix: pinned slab {} < layer extent {extent}",
+            slab.size()
+        ));
+    }
+    {
+        let host = slab.as_bytes_mut();
+        regions
+            .read(&source, 0, &mut host[..extent], extent)
+            .map_err(|e| format!("layerwise head suffix: read page {}: {e}", suffix.page))?;
+    }
+    let k_off = arena
+        .layout()
+        .layer_k_offset(suffix_slot as usize, 0)
+        .map_err(|e| format!("layerwise head suffix: k offset: {e}"))?;
+    let v_off = arena
+        .layout()
+        .layer_v_offset(suffix_slot as usize, 0)
+        .map_err(|e| format!("layerwise head suffix: v offset: {e}"))?;
+    let host = slab.as_bytes_mut();
+    gpu.hip
+        .memcpy_htod_offset(&arena.arena().buf, k_off, &host[..k_plane])
+        .map_err(|e| format!("layerwise head suffix: H2D K page {}: {e:?}", suffix.page))?;
+    gpu.hip
+        .memcpy_htod_offset(&arena.arena().buf, v_off, &host[k_plane..extent])
+        .map_err(|e| format!("layerwise head suffix: H2D V page {}: {e:?}", suffix.page))?;
+    Ok(())
+}
+
 fn seal_record_source(
     records: &mut HashMap<u64, HostRecord>,
     storage: &Storage,
@@ -2507,6 +3058,72 @@ struct ActiveQuery {
 ///
 /// Clean sibling to the legacy copy-only path: it wires the core
 /// [`LayerwiseRequest`] state machine to hipfire's OWN device resources — the
+/// P4.1② G4: the MTP head's bounded aux-plane restore subsystem (design §A.8).
+/// A SEPARATE single-layer composite arena (the head aux plane, ordinal 0 in its
+/// own pool) plus its own pinned staging slab, attached to the trunk driver only
+/// under Layerwise + native MTP ([`LayerwiseDriver::attach_head_plane`]). The head
+/// ALGORITHM is unchanged (full-history attention); only its KV residency is
+/// bounded — accepted history beyond `window_tokens` is co-archived to the shared
+/// composite host record and restored before attend. The head reads the AUX region
+/// (ordinal `n_fa`) of the SAME sealed composite records the trunk seals, so the
+/// archive + record cache are shared with the trunk; only the destination arena and
+/// the export layout's layer count differ. Legacy / AR-only never attach it
+/// (byte-neutral). The GPU buffers have no `Drop`; release via the driver's `free`.
+struct HeadSubsystem {
+    /// Bounded single-layer head arena (the aux plane). `n_slots` =
+    /// `window_tokens / 128 + 1` (accepted history + one draft-scratch block).
+    arena: LayerwiseArena,
+    /// Disjoint pinned staging slices for the head's in-flight cold-page H2D
+    /// copies (one layer {K,V} extent per slot), independent of the trunk slab.
+    slab: PinnedTransferBuffer,
+    /// The head's OWN per-layer paged block table (ONE layer — the aux plane at
+    /// ordinal 0 in the head arena), the exact [`LayerwiseDescStaging`] machinery
+    /// the trunk uses but sized `n_layers = 1` over the head's single-layer arena
+    /// (`encode_layer_block_table` with `layer = 0, n_layers = 1` → stripe `2*slot`).
+    /// `restore_head_plane` re-encodes it in place from the restored compact view
+    /// so the head attends the bounded working set through the SAME paged GQA
+    /// decode kernel as the trunk (`LayerKvAddr::Layerwise` / `GatedAttentionOp`'s
+    /// `paged`). `width` matches the head attend's evaluation-span row count.
+    staging: LayerwiseDescStaging,
+    /// The reserved draft-scratch suffix slot (ninfer `scratch_slot =
+    /// auxiliary_tokens / 64`): the `+1` block in the `window + scratch` geometry,
+    /// allocated once at attach and kept OUT of the history compact view so the
+    /// head's current-token write extends a valid prefix. `restore_head_plane_with_suffix`
+    /// restores the boundary page's already-fed tokens here and binds it as the
+    /// staging suffix; history-only restores leave it reserved but unmapped.
+    suffix_slot: u32,
+    /// The head draft's base compact view captured at the suffix restore (ninfer
+    /// NL:10322 `visible` + NL:10335 `increment_i32_scalar(position)`). The serial
+    /// draft appends `max_n` rows into the reserved scratch page; each row advances
+    /// the compacted causal bound by one ([`LayerwiseDriver::stage_head_draft_row`])
+    /// while the block table stays fixed. `None` until a suffix restore binds it.
+    draft_base: Option<HeadDraftBase>,
+}
+
+/// P4.1② G4 (f2): the head serial-draft staging base. `compact`/`suffix_slot` are
+/// the restored history view + the bound scratch page (the block table is unchanged
+/// across draft rows); `base_seq` is the restore's compacted extent (`auxiliary_tokens
+/// + 1` for a single-row suffix). Draft row `k` re-stages at `base_seq + k`, giving
+/// the compact write position `auxiliary_tokens + k` (ninfer NL:10296 cache coord).
+struct HeadDraftBase {
+    compact: Vec<u32>,
+    suffix_slot: Option<u32>,
+    base_seq: i32,
+}
+
+/// P4.1② G4: the head draft-scratch suffix geometry for
+/// [`LayerwiseDriver::restore_head_plane_with_suffix`] (the head analog of the
+/// trunk's `suffix_page` / `partial_tokens` / evaluation rows). `page` is the
+/// boundary page's dense ordinal (`original_start / block_tokens`); `partial_tokens`
+/// its already-fed tokens restored into the scratch slot before the live write;
+/// `rows` the fresh evaluation rows the head writes+attends this step. The
+/// compacted causal bound extends by `partial_tokens + rows` (design §3.9g).
+pub struct HeadSuffix {
+    pub page: u32,
+    pub partial_tokens: u32,
+    pub rows: u32,
+}
+
 /// composite packed [`LayerwiseArena`], the sealed write-through archive
 /// ([`Storage`] + cached [`HostRecord`]s), the reusable pinned slab, and the
 /// GPU scorer bridge ([`score_current_layer_native`], Rust→HIP, no shim). It
@@ -2525,7 +3142,19 @@ pub struct LayerwiseDriver<'a> {
     arena: LayerwiseArena,
     archive: Storage,
     backend: BackendIdentity,
-    layout: PayloadLayout,
+    /// The seal/restore EXPORT manifest (P4.1② G4). The trunk `n_fa` manifest
+    /// ([`Q8_PACKED_FORMAT`]) by default; under head-plane it is the COMPOSITE
+    /// Main+aux manifest (`n_fa + 1`, [`Q8_MAIN_MTP_FORMAT`]) so
+    /// `seal_record_source` co-archives the head aux plane into every canonical
+    /// record. [`Self::descriptor`] tracks it (both become composite under
+    /// head-plane, mirroring ninfer's single shared composite archive descriptor),
+    /// so the trunk plan's `KvRegions` matches the composite records. The trunk
+    /// arena stays `n_fa`; the head restore reads the aux region of these same
+    /// records ([`Self::restore_head_plane`]).
+    ///
+    /// [`Q8_PACKED_FORMAT`]: crate::layerwise_layout::Q8_PACKED_FORMAT
+    /// [`Q8_MAIN_MTP_FORMAT`]: crate::layerwise_layout::Q8_MAIN_MTP_FORMAT
+    export_layout: PayloadLayout,
     descriptor: MemoryDescriptor,
     /// ordinal → model layer (the statistics/arena layer index is the ordinal).
     fa_layers: Vec<u32>,
@@ -2535,6 +3164,10 @@ pub struct LayerwiseDriver<'a> {
     canonical: Vec<LayerMemorySnapshot>,
     stamp: MemoryStamp,
     active: Option<ActiveQuery>,
+    /// P4.1② G4: the bounded head aux-plane restore subsystem. `None` under
+    /// Legacy / AR-only (byte-neutral); attached under Layerwise + native MTP via
+    /// [`Self::attach_head_plane`].
+    head: Option<HeadSubsystem>,
 }
 
 impl<'a> LayerwiseDriver<'a> {
@@ -2591,7 +3224,7 @@ impl<'a> LayerwiseDriver<'a> {
             arena,
             archive,
             backend,
-            layout,
+            export_layout: layout,
             descriptor,
             fa_layers,
             block_tokens,
@@ -2600,6 +3233,7 @@ impl<'a> LayerwiseDriver<'a> {
             canonical,
             stamp,
             active: None,
+            head: None,
         })
     }
 
@@ -2707,7 +3341,7 @@ impl<'a> LayerwiseDriver<'a> {
             &self.archive,
             self.keys,
             &self.backend,
-            &self.layout,
+            &self.export_layout,
             &mut self.records,
             &mut self.slab,
             &plan,
@@ -2772,7 +3406,7 @@ impl<'a> LayerwiseDriver<'a> {
             &self.archive,
             self.keys,
             &self.backend,
-            &self.layout,
+            &self.export_layout,
             &mut self.records,
             &mut self.slab,
             &plan,
@@ -2895,11 +3529,11 @@ impl<'a> LayerwiseDriver<'a> {
             &self.archive,
             self.keys,
             &self.backend,
-            &self.layout,
+            &self.export_layout,
             &block,
             bt,
         )?;
-        let regions = KvRegions::new(&self.layout, ordinal as u32, None)
+        let regions = KvRegions::new(&self.export_layout, ordinal as u32, None)
             .map_err(|e| format!("layerwise suffix: regions: {e}"))?;
         let k_plane = self.arena.layout().k_plane_bytes() as usize;
         let v_plane = self.arena.layout().v_plane_bytes() as usize;
@@ -3107,10 +3741,342 @@ impl<'a> LayerwiseDriver<'a> {
         self.records.len()
     }
 
+    /// P4.1② G4 (f1): switch the seal/restore EXPORT manifest AND the planning
+    /// descriptor to the COMPOSITE Main+aux layout (`mtp.payload_layout()`,
+    /// `n_fa + 1` layers, [`Q8_MAIN_MTP_FORMAT`]) WITHOUT allocating the head arena.
+    /// The trunk carrier calls this so every canonical record co-archives the head
+    /// aux plane (the head write-through populates it before the trunk verify seals);
+    /// the head draft carrier additionally allocates the bounded head arena via
+    /// [`Self::attach_head_plane`], which delegates here for the same manifest switch.
+    /// Must be called BEFORE [`Self::begin_query`] (it replaces the manifest the
+    /// catalog seals/plans against). Fail-closed when a query is active. Legacy /
+    /// AR-only never call it (the default trunk manifest is byte-neutral).
+    ///
+    /// [`Q8_MAIN_MTP_FORMAT`]: crate::layerwise_layout::Q8_MAIN_MTP_FORMAT
+    pub fn set_composite_export(
+        &mut self,
+        mtp: &LayerwiseMtpQ8Layout,
+        max_position: u32,
+    ) -> Result<(), String> {
+        if self.active.is_some() {
+            return Err("layerwise head: set_composite_export before begin_query".to_string());
+        }
+        let composite = mtp
+            .payload_layout()
+            .map_err(|e| format!("layerwise head: composite manifest: {e}"))?;
+        let descriptor = MemoryDescriptor::new(
+            &self.backend,
+            &composite,
+            &layerwise_capabilities(max_position),
+        )
+        .map_err(|e| format!("layerwise head: composite descriptor: {e}"))?;
+        self.export_layout = composite;
+        self.descriptor = descriptor;
+        Ok(())
+    }
+
+    /// P4.1② G4: attach the bounded head aux-plane restore subsystem (design
+    /// §A.8). Switches the seal/restore EXPORT manifest AND the planning descriptor
+    /// to the COMPOSITE Main+aux layout (`mtp.payload_layout()`, `n_fa + 1` layers,
+    /// [`Q8_MAIN_MTP_FORMAT`]) so every canonical record co-archives the head aux
+    /// plane and the trunk plan's `KvRegions` matches the composite records —
+    /// exactly ninfer's single shared composite archive descriptor. Allocates a
+    /// SEPARATE single-layer head arena (`head_n_slots` = `window_tokens / 128 + 1`,
+    /// the aux plane at ordinal 0) with its own pinned slab. The trunk device arena
+    /// stays `n_fa`; the trunk restore reads its ordinals from the now-composite
+    /// records, the head restore reads the aux ordinal ([`Self::restore_head_plane`]).
+    ///
+    /// Must be called BEFORE [`Self::begin_query`] (it replaces the manifest the
+    /// catalog seals/plans against). Fail-closed if already attached, if a query is
+    /// active, or on bad head geometry. Legacy / AR-only never call it (the default
+    /// trunk manifest + arena are byte-neutral).
+    ///
+    /// [`Q8_MAIN_MTP_FORMAT`]: crate::layerwise_layout::Q8_MAIN_MTP_FORMAT
+    pub fn attach_head_plane(
+        &mut self,
+        gpu: &mut Gpu,
+        mtp: &LayerwiseMtpQ8Layout,
+        n_kv_heads: usize,
+        head_dim: usize,
+        head_n_slots: usize,
+        width: usize,
+        max_position: u32,
+    ) -> Result<(), String> {
+        if self.head.is_some() {
+            return Err("layerwise head: head plane already attached".to_string());
+        }
+        if self.active.is_some() {
+            return Err("layerwise head: attach_head_plane before begin_query".to_string());
+        }
+        if head_n_slots == 0 {
+            return Err("layerwise head: head_n_slots == 0".to_string());
+        }
+        if width == 0 {
+            return Err("layerwise head: width == 0".to_string());
+        }
+        // Composite export manifest + descriptor (shared with the trunk carrier's
+        // f1 `set_composite_export`); the head arena below is the extra piece the
+        // head draft carrier needs for `restore_head_plane`.
+        self.set_composite_export(mtp, max_position)?;
+        // The head's bounded single-layer arena (the aux plane, ordinal 0).
+        let head_q8 = LayerwiseQ8Layout::resolve(1, n_kv_heads, head_dim, &[0])
+            .map_err(|e| format!("layerwise head: head q8 layout: {e}"))?;
+        let mut arena = LayerwiseArena::new(gpu, &head_q8, head_n_slots)?;
+        // Reserve the draft-scratch suffix slot up front (the `+1` block in the
+        // window+scratch geometry). Keeping it reserved excludes it from the
+        // history compact view, so `restore_head_plane_with_suffix` can bind it as
+        // the staging suffix without a history page ever landing in it. On failure
+        // free the arena explicitly (nothing else allocated yet); never leak.
+        let suffix_slot = match arena.pool().alloc_slot() {
+            Ok(h) => h.phys,
+            Err(e) => {
+                let _ = arena.free(gpu);
+                return Err(format!("layerwise head: scratch slot: {e}"));
+            }
+        };
+        let extent = (arena.layout().k_plane_bytes() + arena.layout().v_plane_bytes()) as usize;
+        let slab_bytes = match extent.checked_mul(head_n_slots) {
+            Some(b) => b,
+            None => {
+                let _ = arena.free(gpu);
+                return Err(format!(
+                    "layerwise head: slab extent {extent} * {head_n_slots} overflow"
+                ));
+            }
+        };
+        let slab = match gpu.hip.transfer_buffer(slab_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = arena.free(gpu);
+                return Err(format!("layerwise head: pinned slab {slab_bytes}B: {e:?}"));
+            }
+        };
+        // The head's own paged block table: ONE layer (aux ordinal 0) over the
+        // head's single-layer arena, `head_n_slots` pages, `width` attend rows.
+        // On failure free the arena explicitly (the slab self-Drops); never leak.
+        let staging = match LayerwiseDescStaging::new_with_width(gpu, 1, head_n_slots, width) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = arena.free(gpu);
+                return Err(format!("layerwise head: desc staging: {e}"));
+            }
+        };
+        self.head = Some(HeadSubsystem { arena, slab, staging, suffix_slot, draft_base: None });
+        Ok(())
+    }
+
+    /// P4.1② G4: restore the MTP head's selected aux-plane pages into the bounded
+    /// head arena BEFORE the head attends (design §A.8, ninfer NL:10274-10287).
+    /// `plan` is the head's independent [`LayerPlan`] from
+    /// [`KvMemCtl::plan_head_plane`] (a single-layer aux catalog over the composite
+    /// descriptor). Executes through the SAME certified [`restore_layer_pages`] the
+    /// trunk uses — evict/bind/restore/fence — with the head arena (ordinal 0), the
+    /// composite export manifest, and the SHARED trunk record cache (the head reads
+    /// the aux region of the same sealed composite records). Returns the post-fence
+    /// [`ExecutionView`] the caller publishes via [`KvMemCtl::accept_head_restore`].
+    /// Fail-closed when the head subsystem is not attached (Legacy / AR-only).
+    ///
+    /// [`KvMemCtl::plan_head_plane`]: crate::kvmem_ctl::KvMemCtl::plan_head_plane
+    /// [`KvMemCtl::accept_head_restore`]: crate::kvmem_ctl::KvMemCtl::accept_head_restore
+    pub fn restore_head_plane(
+        &mut self,
+        gpu: &mut Gpu,
+        plan: &LayerPlan,
+    ) -> Result<ExecutionView, String> {
+        self.restore_head_plane_inner(gpu, plan, None)
+    }
+
+    /// P4.1② G4: [`Self::restore_head_plane`] plus the draft-scratch suffix page
+    /// (ninfer `rebuild_auxiliary_boundary` + the per-row compact write pos,
+    /// NL:10205-10339). Restores the boundary page's `partial_tokens` already-fed
+    /// tokens into the reserved scratch slot, then publishes the head block table
+    /// with that slot as the staging suffix and the compacted causal bound extended
+    /// by `partial_tokens + rows` — so the head's live current-token write extends a
+    /// valid prefix and the fresh evaluation rows are visible to the paged attend.
+    /// `suffix.rows` is the head attend's evaluation-span row count (1 = AR draft).
+    pub fn restore_head_plane_with_suffix(
+        &mut self,
+        gpu: &mut Gpu,
+        plan: &LayerPlan,
+        suffix: &HeadSuffix,
+    ) -> Result<ExecutionView, String> {
+        self.restore_head_plane_inner(gpu, plan, Some(suffix))
+    }
+
+    fn restore_head_plane_inner(
+        &mut self,
+        gpu: &mut Gpu,
+        plan: &LayerPlan,
+        suffix: Option<&HeadSuffix>,
+    ) -> Result<ExecutionView, String> {
+        // Split borrow: the head arena/slab are disjoint from the shared
+        // archive/keys/backend/export_layout/records the restore free fn reads.
+        let keys = self.keys;
+        let backend = &self.backend;
+        let export_layout = &self.export_layout;
+        let archive = &self.archive;
+        let block_tokens = self.block_tokens;
+        let records = &mut self.records;
+        let head = self
+            .head
+            .as_mut()
+            .ok_or_else(|| "layerwise head restore: head plane not attached".to_string())?;
+        let view = restore_layer_pages(
+            gpu,
+            &mut head.arena,
+            archive,
+            keys,
+            backend,
+            export_layout,
+            records,
+            &mut head.slab,
+            plan,
+            0,
+            block_tokens,
+        )?;
+        // Publish the head's paged block table from the restored compact view so
+        // the head attends the bounded working set through the SAME paged GQA
+        // decode kernel as the trunk (ninfer NL:10280-10285 restore-then-attend).
+        let compact = head
+            .arena
+            .pool_ref()
+            .compact_slots(0)
+            .map_err(|e| format!("layerwise head restore: compact slots: {e}"))?
+            .to_vec();
+        // History-only (`None`) leaves the reserved scratch slot unmapped and the
+        // causal bound at `visible_tokens` (byte-neutral with the pre-suffix seam).
+        // `Some` restores the boundary partial page into the scratch slot and binds
+        // it as the staging suffix, extending the bound by `partial_tokens + rows`.
+        let (suffix_slot, suffix_extent) = if let Some(s) = suffix {
+            let scratch = head.suffix_slot;
+            let session = plan
+                .next_block(0)
+                .map_err(|e| format!("layerwise head suffix: session: {e}"))?
+                .block
+                .session;
+            restore_head_suffix_page(
+                gpu,
+                &mut head.arena,
+                &mut head.slab,
+                records,
+                archive,
+                keys,
+                backend,
+                export_layout,
+                plan,
+                block_tokens,
+                scratch,
+                session,
+                s,
+            )?;
+            (Some(scratch), s.partial_tokens as u64 + s.rows as u64)
+        } else {
+            (None, 0)
+        };
+        let extent = view.visible_tokens + suffix_extent;
+        let seq_len = i32::try_from(extent).map_err(|_| {
+            format!("layerwise head restore: compacted extent {extent} exceeds i32")
+        })?;
+        head.staging
+            .update_layer(gpu, 0, &compact, suffix_slot, seq_len)
+            .map_err(|e| format!("layerwise head restore: staging: {e}"))?;
+        // Capture the serial-draft staging base (ninfer NL:10322/10335). A suffix
+        // restore binds the scratch page and the compacted extent the draft rows
+        // advance from; a history-only restore leaves no draft base (the head is
+        // not about to append live rows). `stage_head_draft_row` re-stages the
+        // causal bound per row over this fixed block table.
+        head.draft_base = suffix_slot.map(|slot| HeadDraftBase {
+            compact: compact.clone(),
+            suffix_slot: Some(slot),
+            base_seq: seq_len,
+        });
+        Ok(view)
+    }
+
+    /// P4.1② G4 (f2): advance the head serial-draft staging to compact write row
+    /// `row` (ninfer NL:10335 `increment_i32_scalar(position)` + the `{visible+i}`
+    /// causal bound). The block table is unchanged — the reserved scratch suffix
+    /// page already maps the whole draft span — so only the compacted causal bound
+    /// (`positions = [base_seq - 1 + row]`) and `desc.seq_len` (`base_seq + row`)
+    /// advance. Row 0 reproduces the suffix restore's staging byte-for-byte. The
+    /// caller fills the row's GLOBAL RoPE position separately (`rope_pos`); this is
+    /// the COMPACT write coordinate. Fail-closed without a prior suffix restore or
+    /// if the draft span overflows the mapped scratch page.
+    pub fn stage_head_draft_row(&self, gpu: &mut Gpu, row: usize) -> Result<(), String> {
+        let head = self
+            .head
+            .as_ref()
+            .ok_or_else(|| "layerwise head draft: head plane not attached".to_string())?;
+        let base = head.draft_base.as_ref().ok_or_else(|| {
+            "layerwise head draft: no draft base (restore_head_plane_with_suffix first)".to_string()
+        })?;
+        let row_i32 = i32::try_from(row)
+            .map_err(|_| format!("layerwise head draft: row {row} overflow i32"))?;
+        let seq_len = base.base_seq.checked_add(row_i32).ok_or_else(|| {
+            format!("layerwise head draft: base_seq {} + row {row} overflow i32", base.base_seq)
+        })?;
+        head.staging
+            .update_layer(gpu, 0, &base.compact, base.suffix_slot, seq_len)
+            .map_err(|e| format!("layerwise head draft: staging row {row}: {e}"))
+    }
+
+    /// P4.1② G4: the head's paged block-table views over the restored bounded aux
+    /// arena (the head analog of [`LayerwiseQuery::layer_views`]). `descs`/
+    /// `positions`/`row_slot` alias the head staging's stable-address buffers
+    /// (re-uploaded in place by [`Self::restore_head_plane`]); `ctx_len` is the
+    /// page-rounded upper bound. Hand these to the head's `GatedAttentionOp`
+    /// `paged` (single decode row) or the slots-style paged verify route, with
+    /// [`Self::head_arena_views`] supplying the K/V base. Fail-closed when the head
+    /// subsystem is not attached (Legacy / AR-only never call it).
+    pub fn head_layer_views(&self) -> Result<LayerwiseLayerViews, String> {
+        let head = self
+            .head
+            .as_ref()
+            .ok_or_else(|| "layerwise head views: head plane not attached".to_string())?;
+        let descs = head.staging.descs(0)?;
+        let positions = head.staging.positions(0)?;
+        let row_slot = head.staging.row_slot();
+        Ok(LayerwiseLayerViews {
+            descs: descs.sub_offset(0, descs.numel()),
+            positions: positions.sub_offset(0, positions.numel()),
+            row_slot: row_slot.sub_offset(0, row_slot.numel()),
+            ctx_len: head.staging.max_pages() * LAYERWISE_BLOCK_TOKENS as usize,
+        })
+    }
+
+    /// P4.1② G4: the head arena's shared K base + shifted V base views (the head
+    /// analog of the trunk's `arena().arena()` / `arena().v_cache_view()` aliases
+    /// in `layerwise_fa_slots`). Non-owning aliases of the head arena allocation;
+    /// never freed by the caller. Fail-closed when the head is not attached.
+    pub fn head_arena_views(&self) -> Result<(GpuTensor, GpuTensor), String> {
+        let head = self
+            .head
+            .as_ref()
+            .ok_or_else(|| "layerwise head views: head plane not attached".to_string())?;
+        let numel = head.arena.arena().numel();
+        let k_view = head.arena.arena().sub_offset(0, numel);
+        let v_view = head
+            .arena
+            .v_cache_view()
+            .map_err(|e| format!("layerwise head views: v cache: {e}"))?;
+        Ok((k_view, v_view))
+    }
+
+    /// Whether the bounded head aux-plane subsystem is attached (P4.1② G4).
+    pub fn head_plane_attached(&self) -> bool {
+        self.head.is_some()
+    }
+
     /// Release the device arena, consuming the driver. The archive, records,
     /// slab, descriptor and any active request drop with it (their C++ handles
     /// are freed by their own `Drop`); `keys`/`policy` are borrowed and unaffected.
     pub fn free(self, gpu: &mut Gpu) -> Result<(), String> {
+        if let Some(head) = self.head {
+            // The head slab frees itself on Drop; the arena + block-table staging
+            // hold GpuTensors with no Drop, so release them explicitly.
+            head.staging.free_gpu(gpu);
+            head.arena.free(gpu)?;
+        }
         self.arena.free(gpu)
     }
 }
@@ -3198,9 +4164,13 @@ mod tests {
         (starts, counts, mask.to_vec(), vec![0u8; n])
     }
 
-    /// Keep-set lifecycle (design §3.10a): a Query step UNIONS the resident pool
-    /// (sorted/deduped, admitting scorer selections + newly sealed pages); a
-    /// Pressure step TRUNCATES to the refined selection. Pure host logic — no GPU.
+    /// Keep-set lifecycle (design §3.10a): a Query step UNIONS the previous
+    /// resident pool with this step's restored selection (pool growth, sorted +
+    /// deduped) so cold-recalled needle pages survive continuation turns; a
+    /// Pressure step TRUNCATES to the refined selection. The MTP composite verify
+    /// regime forces Pressure/REPLACE because asymmetric trunk+aux selections
+    /// diverge the per-layer resident counts the catalog requires equal (bug #8).
+    /// Pure host logic — no GPU.
     #[test]
     fn combine_keep_set_query_union_pressure_truncate() {
         let prev = vec![vec![0u64, 2, 3], vec![1, 2]];
@@ -3220,6 +4190,14 @@ mod tests {
         // Empty restored on a Pressure step truncates to empty.
         let empty = combine_keep_set(&prev, &[vec![], vec![]], true, 2);
         assert_eq!(empty, vec![Vec::<u64>::new(), Vec::<u64>::new()]);
+        // Cross-layer invariant (bug #8): different page IDS, equal COUNT ⇒ equal
+        // extent survives REPLACE. A union against a shared prev pool {0,1,2}
+        // would diverge (|{0,1,2}∪{0,1,3}|=4 vs |{0,1,2}∪{4,5,6}|=6); the MTP
+        // composite path forces Pressure/REPLACE to keep both layers at 3.
+        let sel = vec![vec![0u64, 1, 3], vec![4, 5, 6]];
+        let kept = combine_keep_set(&prev, &sel, true, 2);
+        assert_eq!(kept[0].len(), kept[1].len(), "equal extent must survive REPLACE");
+        assert_eq!(kept, vec![vec![0, 1, 3], vec![4, 5, 6]]);
     }
 
     /// P4.1① multi-row seam (pure host, no GPU): `bootstrap_layerwise_rows`
@@ -3732,6 +4710,429 @@ mod tests {
         assert!(records.contains_key(&200));
 
         arena.free(&mut gpu).expect("free arena");
+    }
+
+    /// P4.1② G4 GPU parity: the MTP head's aux-plane stripe restores byte-exact
+    /// from the SAME composite Main+aux records the trunk seals. Proves the head
+    /// restore composition — `restore_layer_pages` with a 1-layer head arena
+    /// (ordinal 0), the COMPOSITE export layout, and a head plan whose `payload()`
+    /// KvRegions bakes the aux ordinal (`n_fa`) — reads the head's aux region (NOT
+    /// a trunk plane) and lands it in the bounded head arena. Mirrors
+    /// `restore_layer_archive_to_arena_byte_exact`, but the selected layer is the
+    /// head aux plane (ordinal `FX_LAYERS`) of a `(FX_LAYERS+1)`-layer composite
+    /// record and the destination is a separate single-layer head pool. ninfer
+    /// NL:10274-10287 (`restore_native_layer_stripe`, offset = main page stride).
+    #[test]
+    #[ignore]
+    fn restore_head_aux_stripe_byte_exact() {
+        use crate::layerwise_layout::LayerwiseMtpQ8Layout;
+        let mut gpu = Gpu::init().expect("gpu");
+        // Composite Main+aux: FX_LAYERS trunk planes + ONE head aux plane (ordinal n_fa).
+        let mtp = LayerwiseMtpQ8Layout::resolve(FX_LAYERS as usize, FX_KV_HEADS, FX_HEAD_DIM)
+            .expect("mtp layout");
+        let aux = mtp.head_layer();
+        assert_eq!(aux, FX_LAYERS);
+        let layout = mtp.payload_layout().expect("composite manifest");
+        let composite_record = layout.record_bytes();
+        assert_eq!(composite_record, (FX_LAYERS as u64 + 1) * FX_LAYER_BYTES);
+        let backend = fx_backend();
+        let descriptor =
+            MemoryDescriptor::new(&backend, &layout, &fx_capabilities()).expect("descriptor");
+
+        // Composite statistics store: feed trunk planes 0..n_fa AND the head aux
+        // plane for both canonical pages, so the sealed record carries the head K/V.
+        let keys_storage = Storage::new_ram(16 << 20).expect("keys storage");
+        let mut cfg = mtp.main().raw_config().clone();
+        cfg.n_layer = mtp.n_layer_total() as u32;
+        let keys = RawStore::new(cfg, Some(&keys_storage)).expect("keys");
+        keys.ensure_blocks(2).expect("ensure blocks");
+        for b in 0..2u32 {
+            for il in 0..mtp.n_layer_total() as u32 {
+                keys.write_layer_k_gpu(b * FX_BT, FX_BT, il, &fx_pack(b, il, false))
+                    .expect("feed K");
+                keys.write_layer_v_gpu(b * FX_BT, FX_BT, il, &fx_pack(b, il, true))
+                    .expect("feed V");
+            }
+        }
+
+        // Single-layer aux catalog over the composite descriptor (ninfer
+        // NL:10578-10584): the head follows the target's selection; resident=[100],
+        // select the cold page 200. A 1-layer catalog over a multi-layer composite
+        // descriptor is exactly ninfer's aux_catalog shape.
+        let blocks = vec![
+            BlockCopies { block: fx_block(100, 0, 1), host_version: 1 },
+            BlockCopies { block: fx_block(200, FX_BT as u64, 2), host_version: 2 },
+        ];
+        let aux_snapshot = LayerMemorySnapshot {
+            model_layer: aux,
+            memory: MemorySnapshot { stamp: fx_stamp(), blocks, resident: vec![100] },
+        };
+        let catalog = MemoryCatalog::new(&descriptor, &[aux_snapshot]).expect("aux catalog");
+        let budget = MemoryBudget {
+            selected_tokens: FX_BT as u64,
+            reserve_tokens: FX_BT as u64,
+            device_tokens: 2 * FX_BT as u64,
+            host_payload_bytes: 2 * composite_record,
+        };
+        let sel = LayerSelection {
+            model_layer: aux,
+            expected: fx_stamp(),
+            selected: vec![200],
+            mandatory: vec![],
+            budget,
+        };
+        let plan = catalog.plan_layer(&sel).expect("aux plan");
+        assert_eq!(plan.model_layer(), aux);
+        assert_eq!(plan.restore_count(), 1);
+        assert_eq!(plan.restore_block(0).unwrap().id, 200);
+        // The head plan's transfer regions are the AUX plane's {K,V}: one layer worth.
+        let regions = plan.payload().expect("aux regions");
+        assert_eq!(regions.packed_bytes(), FX_LAYER_BYTES);
+
+        // Bounded head arena: ONE layer (the aux plane), separate from the trunk arena.
+        let head_q8 =
+            LayerwiseQ8Layout::resolve(1, FX_KV_HEADS, FX_HEAD_DIM, &[0]).expect("head q8");
+        let archive = Storage::new_ram(16 << 20).expect("archive storage");
+        let mut records: HashMap<u64, HostRecord> = HashMap::new();
+        let mut slab = gpu.hip.transfer_buffer(FX_LAYER_BYTES as usize).expect("slab");
+        let mut head_arena = LayerwiseArena::new(&mut gpu, &head_q8, 3).expect("head arena");
+
+        // Restore the head aux stripe: ordinal 0 in the head arena, composite export
+        // layout, head plan (regions baked at the aux ordinal). Reads the aux region
+        // of the SAME composite record the trunk would seal.
+        let view = restore_layer_pages(
+            &mut gpu, &mut head_arena, &archive, &keys, &backend, &layout, &mut records,
+            &mut slab, &plan, 0, FX_BT,
+        )
+        .expect("head restore");
+
+        // Compact view binds the selected cold page (dense ordinal 1).
+        assert_eq!(head_arena.pool_ref().compact_slots(0).unwrap().len(), 1);
+        assert_eq!(head_arena.pool_ref().canonical_pages(0).unwrap(), vec![1]);
+        let phys = head_arena.pool_ref().compact_slots(0).unwrap()[0];
+        assert_eq!(head_arena.pool_ref().stripe_page(phys, 0), Some(1));
+
+        // D2H readback: the head stripe holds page 200's AUX-plane K then V,
+        // byte-exact (fx_pack at layer ordinal aux == FX_LAYERS, NOT a trunk plane).
+        let k_off = head_arena.layout().layer_k_offset(phys as usize, 0).unwrap();
+        let v_off = head_arena.layout().layer_v_offset(phys as usize, 0).unwrap();
+        let mut k_read = vec![0u8; FX_PLANE as usize];
+        let mut v_read = vec![0u8; FX_PLANE as usize];
+        gpu.hip
+            .memcpy_dtoh_at(&mut k_read, &head_arena.arena().buf, k_off)
+            .expect("d2h K");
+        gpu.hip
+            .memcpy_dtoh_at(&mut v_read, &head_arena.arena().buf, v_off)
+            .expect("d2h V");
+        assert_eq!(k_read, fx_pack(1, aux, false), "restored head aux K bytes");
+        assert_eq!(v_read, fx_pack(1, aux, true), "restored head aux V bytes");
+
+        // ExecutionView == plan.next exactly (restored() same_view contract).
+        assert_eq!(view.visible_tokens, plan.next_visible_tokens());
+        assert_eq!(view.stamp, plan.next_stamp().unwrap());
+        assert_eq!(view.blocks.len(), plan.next_block_count());
+        for i in 0..view.blocks.len() {
+            assert_eq!(view.blocks[i], plan.next_block(i).unwrap());
+        }
+        assert_eq!(records.len(), 1);
+        assert!(records.contains_key(&200));
+
+        head_arena.free(&mut gpu).expect("free head arena");
+    }
+
+    /// P4.1② G4 driver-level integration: attaching the head subsystem to a real
+    /// [`LayerwiseDriver`] switches the seal/restore EXPORT manifest AND the
+    /// planning descriptor to the composite Main+aux layout, allocates the bounded
+    /// head arena, and lets BOTH planes restore byte-exact from ONE shared
+    /// composite record. Proves the ninfer-faithful shared-archive contract
+    /// end-to-end through the public driver API:
+    /// (1) a trunk [`LayerwiseDriver::restore_layer_selected`] (ordinal 0) seals the
+    ///     cold page's COMPOSITE record once and restores trunk plane 0 byte-exact —
+    ///     the composite export does NOT perturb the trunk stripe (the trunk plane
+    ///     stays byte-neutral, exactly as Legacy/AR see it);
+    /// (2) [`LayerwiseDriver::restore_head_plane`] reads the AUX region of that SAME
+    ///     cached record (no re-seal) into the bounded head arena, byte-exact at the
+    ///     aux ordinal. `sealed_records() == 1` after both confirms the trunk and
+    ///     head share ONE composite archive keyed by page id. Mirrors ninfer's single
+    ///     shared composite descriptor for both catalogs (NL:10578-10584) and the
+    ///     head aux-stripe restore (NL:10274-10287).
+    #[test]
+    #[ignore]
+    fn driver_head_plane_attach_restore_integration() {
+        let mut gpu = Gpu::init().expect("gpu");
+        let mtp = LayerwiseMtpQ8Layout::resolve(FX_LAYERS as usize, FX_KV_HEADS, FX_HEAD_DIM)
+            .expect("mtp layout");
+        let aux = mtp.head_layer();
+        let composite_record = mtp.payload_layout().expect("composite manifest").record_bytes();
+        assert_eq!(composite_record, (FX_LAYERS as u64 + 1) * FX_LAYER_BYTES);
+
+        // Composite statistics store: trunk planes 0..n_fa AND the head aux plane,
+        // both canonical pages (the head co-archives into the SAME RawStore).
+        let keys_storage = Storage::new_ram(16 << 20).expect("keys storage");
+        let mut cfg = mtp.main().raw_config().clone();
+        cfg.n_layer = mtp.n_layer_total() as u32;
+        let keys = RawStore::new(cfg, Some(&keys_storage)).expect("keys");
+        keys.ensure_blocks(3).expect("ensure blocks");
+        for b in 0..2u32 {
+            for il in 0..mtp.n_layer_total() as u32 {
+                keys.write_layer_k_gpu(b * FX_BT, FX_BT, il, &fx_pack(b, il, false)).expect("K");
+                keys.write_layer_v_gpu(b * FX_BT, FX_BT, il, &fx_pack(b, il, true)).expect("V");
+            }
+        }
+        // Partial boundary page (dense ordinal 2): 64 already-fed tokens in every
+        // plane — the head draft-scratch suffix source. The rest of the page is
+        // masked by the compacted causal bound the suffix restore publishes.
+        let row_bytes = FX_PLANE as usize / FX_BT as usize;
+        for il in 0..mtp.n_layer_total() as u32 {
+            keys.write_layer_k_gpu(2 * FX_BT, 64, il, &fx_pack(2, il, false)[..64 * row_bytes])
+                .expect("partial K");
+            keys.write_layer_v_gpu(2 * FX_BT, 64, il, &fx_pack(2, il, true)[..64 * row_bytes])
+                .expect("partial V");
+        }
+
+        // Trunk driver: n_fa-layer device arena + trunk manifest (the default).
+        let q8 = fx_layout();
+        let policy = KvStore::new(&KvStoreConfig {
+            block_tokens: FX_BT,
+            select_budget: FX_BT,
+            sink_blocks: 0,
+            recent_blocks: 0,
+            ..Default::default()
+        })
+        .expect("policy");
+        policy.register_append(FX_FRONTIER as u32).expect("append");
+        let mut driver = LayerwiseDriver::new(
+            &mut gpu, &keys, &policy, &q8, fx_backend(), fx_capabilities(), fx_snapshots(), 3, 16 << 20,
+        )
+        .expect("driver");
+        assert!(!driver.head_plane_attached(), "head absent before attach (Legacy default)");
+
+        // Attach the head subsystem: composite export + descriptor, bounded head
+        // arena + its own paged block-table staging (width 1 = single draft row).
+        driver
+            .attach_head_plane(&mut gpu, &mtp, FX_KV_HEADS, FX_HEAD_DIM, 3, 1, 4096)
+            .expect("attach_head_plane");
+        assert!(driver.head_plane_attached());
+
+        // (1) Trunk restore ordinal 0, cold page 200. The budget covers the COMPOSITE
+        // record (host_records × composite record_bytes), not the trunk record.
+        let trunk_budget = MemoryBudget {
+            selected_tokens: FX_BT as u64,
+            reserve_tokens: FX_BT as u64,
+            device_tokens: 2 * FX_BT as u64,
+            host_payload_bytes: 2 * composite_record,
+        };
+        let trunk_view = driver
+            .restore_layer_selected(&mut gpu, 0, &[200], trunk_budget)
+            .expect("trunk restore");
+        assert_eq!(trunk_view.blocks.len(), 1);
+        assert_eq!(trunk_view.blocks[0].block.id, 200);
+        // The composite export sealed ONE record (the cold page); trunk plane 0 bound.
+        assert_eq!(driver.sealed_records(), 1);
+        assert_eq!(driver.arena().pool_ref().canonical_pages(0).unwrap(), vec![1]);
+        let phys = driver.arena().pool_ref().compact_slots(0).unwrap()[0];
+        let k_off = driver.arena().layout().layer_k_offset(phys as usize, 0).unwrap();
+        let v_off = driver.arena().layout().layer_v_offset(phys as usize, 0).unwrap();
+        let mut k_read = vec![0u8; FX_PLANE as usize];
+        let mut v_read = vec![0u8; FX_PLANE as usize];
+        gpu.hip
+            .memcpy_dtoh_at(&mut k_read, &driver.arena().arena().buf, k_off)
+            .expect("trunk d2h K");
+        gpu.hip
+            .memcpy_dtoh_at(&mut v_read, &driver.arena().arena().buf, v_off)
+            .expect("trunk d2h V");
+        assert_eq!(k_read, fx_pack(1, 0, false), "trunk plane 0 K byte-neutral under composite export");
+        assert_eq!(v_read, fx_pack(1, 0, true), "trunk plane 0 V byte-neutral under composite export");
+
+        // (2) Head restore: a single-layer aux catalog over the driver's NOW-composite
+        // descriptor, selecting the SAME cold page 200. Reads the aux region of the
+        // record the trunk already sealed — no re-seal (shared composite archive).
+        let head_plan = {
+            let aux_snapshot = LayerMemorySnapshot {
+                model_layer: aux,
+                memory: MemorySnapshot {
+                    stamp: fx_stamp(),
+                    blocks: vec![
+                        BlockCopies { block: fx_block(100, 0, 1), host_version: 1 },
+                        BlockCopies { block: fx_block(200, FX_BT as u64, 2), host_version: 2 },
+                    ],
+                    resident: vec![100],
+                },
+            };
+            let aux_catalog =
+                MemoryCatalog::new(&driver.descriptor, &[aux_snapshot]).expect("aux catalog");
+            let aux_sel = LayerSelection {
+                model_layer: aux,
+                expected: fx_stamp(),
+                selected: vec![200],
+                mandatory: vec![],
+                budget: MemoryBudget {
+                    selected_tokens: FX_BT as u64,
+                    reserve_tokens: FX_BT as u64,
+                    device_tokens: 2 * FX_BT as u64,
+                    host_payload_bytes: 2 * composite_record,
+                },
+            };
+            aux_catalog.plan_layer(&aux_sel).expect("head plan")
+        };
+        assert_eq!(head_plan.model_layer(), aux);
+        assert_eq!(head_plan.payload().expect("aux regions").packed_bytes(), FX_LAYER_BYTES);
+        let head_view = driver.restore_head_plane(&mut gpu, &head_plan).expect("head restore");
+        assert_eq!(head_view.blocks.len(), 1);
+        assert_eq!(head_view.blocks[0].block.id, 200);
+        // STILL one shared record: the head read the trunk's cached composite record.
+        assert_eq!(driver.sealed_records(), 1, "trunk + head share ONE composite archive");
+        assert_eq!(head_view.visible_tokens, head_plan.next_visible_tokens());
+        assert_eq!(head_view.stamp, head_plan.next_stamp().unwrap());
+
+        // Head arena stripe (ordinal 0) holds page 200's AUX-plane K/V byte-exact.
+        {
+            let head = driver.head.as_ref().expect("head attached");
+            assert_eq!(head.arena.pool_ref().canonical_pages(0).unwrap(), vec![1]);
+            let hphys = head.arena.pool_ref().compact_slots(0).unwrap()[0];
+            let hk_off = head.arena.layout().layer_k_offset(hphys as usize, 0).unwrap();
+            let hv_off = head.arena.layout().layer_v_offset(hphys as usize, 0).unwrap();
+            let mut hk_read = vec![0u8; FX_PLANE as usize];
+            let mut hv_read = vec![0u8; FX_PLANE as usize];
+            gpu.hip
+                .memcpy_dtoh_at(&mut hk_read, &head.arena.arena().buf, hk_off)
+                .expect("head d2h K");
+            gpu.hip
+                .memcpy_dtoh_at(&mut hv_read, &head.arena.arena().buf, hv_off)
+                .expect("head d2h V");
+            assert_eq!(hk_read, fx_pack(1, aux, false), "head aux K bytes");
+            assert_eq!(hv_read, fx_pack(1, aux, true), "head aux V bytes");
+        }
+
+        // (3) Head paged views: restore_head_plane published the head's block table
+        // from the restored compact view. Prove the addressing the head attend reads
+        // — positions[] = [visible-1] (compacted causal bound), the block table maps
+        // the restored compact slot at stripe 2*slot (layer 0, n_layers 1, no suffix),
+        // the descriptor carries seq_len = visible / page_tokens 128 and points at the
+        // stable table address, and the K/V base views alias the head arena. This is
+        // the SAME staging machinery the trunk's certified paged decode (D4a) reads,
+        // so the head restore-before-attend is byte-exact by construction.
+        {
+            let views = driver.head_layer_views().expect("head layer views");
+            let (k_view, v_view) = driver.head_arena_views().expect("head arena views");
+            let head = driver.head.as_ref().expect("head attached");
+            let hphys = head.arena.pool_ref().compact_slots(0).unwrap()[0];
+            let visible = head_view.visible_tokens;
+            assert_eq!(visible, FX_BT as u64, "one full restored page");
+            // ctx_len = head_n_slots(3) × 128, the page-rounded upper bound.
+            assert_eq!(views.ctx_len, 3 * FX_BT as usize);
+            // positions[]: width 1 → [seq_len - 1] = [127] (compacted causal bound).
+            let mut pos_bytes = vec![0u8; 4];
+            gpu.hip
+                .memcpy_dtoh_at(&mut pos_bytes, &views.positions.buf, 0)
+                .expect("head positions d2h");
+            assert_eq!(
+                i32::from_le_bytes([pos_bytes[0], pos_bytes[1], pos_bytes[2], pos_bytes[3]]),
+                visible as i32 - 1,
+                "head compacted causal bound"
+            );
+            // row_slot: width 1 → [0] (single sequence).
+            let mut rs_bytes = vec![0u8; 4];
+            gpu.hip
+                .memcpy_dtoh_at(&mut rs_bytes, &views.row_slot.buf, 0)
+                .expect("head row_slot d2h");
+            assert_eq!(
+                i32::from_le_bytes([rs_bytes[0], rs_bytes[1], rs_bytes[2], rs_bytes[3]]),
+                0
+            );
+            // Block table: [2*hphys, -1, -1] — one mapped stripe, no suffix page.
+            let mut bt_bytes = vec![0u8; 12];
+            gpu.hip
+                .memcpy_dtoh_at(&mut bt_bytes, &head.staging.block_table(0).unwrap().buf, 0)
+                .expect("head block table d2h");
+            let bt: Vec<i32> = bt_bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            assert_eq!(bt, vec![2 * hphys as i32, -1, -1], "head stripe 2*slot, no suffix");
+            // Descriptor: seq_len = visible, page_tokens 128, stable table pointer.
+            let mut desc_buf = vec![0u8; std::mem::size_of::<KvSlotDesc>()];
+            gpu.hip
+                .memcpy_dtoh_at(&mut desc_buf, &views.descs.buf, 0)
+                .expect("head desc d2h");
+            let desc: KvSlotDesc =
+                unsafe { std::ptr::read_unaligned(desc_buf.as_ptr() as *const KvSlotDesc) };
+            assert_eq!(desc.seq_len, visible as i32);
+            assert_eq!(desc.page_tokens, FX_BT as i32);
+            assert_eq!(
+                desc.block_table,
+                head.staging.block_table(0).unwrap().buf.as_ptr() as u64
+            );
+            // K/V base views alias the head arena allocation (non-owning).
+            assert_eq!(k_view.numel(), head.arena.arena().numel());
+            assert!(v_view.numel() > 0);
+        }
+
+        // (4) Head draft-scratch suffix: restore the partial boundary page (dense
+        // ordinal 2, 64 fed tokens) into the reserved scratch slot and bind it as
+        // the staging suffix. The compacted causal bound extends by partial+rows
+        // (128+64+1=193); the block table maps the history stripe THEN the scratch
+        // stripe (2*slot, layer 0 / n_layers 1); the scratch stripe holds the
+        // boundary page's AUX K/V first 64 rows byte-exact. This is the head
+        // write+attend working set (ninfer rebuild_auxiliary_boundary + compact
+        // write pos, NL:10205-10339).
+        {
+            let suffix = HeadSuffix { page: 2, partial_tokens: 64, rows: 1 };
+            let hv = driver
+                .restore_head_plane_with_suffix(&mut gpu, &head_plan, &suffix)
+                .expect("head suffix restore");
+            assert_eq!(hv.visible_tokens, head_view.visible_tokens, "history view unchanged");
+            assert_eq!(driver.sealed_records(), 2, "boundary page sealed a second composite record");
+            let views = driver.head_layer_views().expect("head layer views (suffix)");
+            let head = driver.head.as_ref().expect("head attached");
+            let hphys = head.arena.pool_ref().compact_slots(0).unwrap()[0];
+            let scratch = head.suffix_slot;
+            let extent = head_view.visible_tokens + 64 + 1;
+            assert_eq!(views.ctx_len, 3 * FX_BT as usize);
+            // positions[]: width 1 → [extent-1] = [192] (compacted causal bound).
+            let mut pos_bytes = vec![0u8; 4];
+            gpu.hip
+                .memcpy_dtoh_at(&mut pos_bytes, &views.positions.buf, 0)
+                .expect("head suffix positions d2h");
+            assert_eq!(
+                i32::from_le_bytes([pos_bytes[0], pos_bytes[1], pos_bytes[2], pos_bytes[3]]),
+                extent as i32 - 1,
+                "head suffix compacted causal bound"
+            );
+            // Block table: [2*hphys, 2*scratch, -1] — history + scratch stripes.
+            let mut bt_bytes = vec![0u8; 12];
+            gpu.hip
+                .memcpy_dtoh_at(&mut bt_bytes, &head.staging.block_table(0).unwrap().buf, 0)
+                .expect("head suffix block table d2h");
+            let bt: Vec<i32> = bt_bytes
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            assert_eq!(bt, vec![2 * hphys as i32, 2 * scratch as i32, -1], "history + scratch stripes");
+            // Descriptor: seq_len = extent (visible + partial + rows).
+            let mut desc_buf = vec![0u8; std::mem::size_of::<KvSlotDesc>()];
+            gpu.hip
+                .memcpy_dtoh_at(&mut desc_buf, &views.descs.buf, 0)
+                .expect("head suffix desc d2h");
+            let desc: KvSlotDesc =
+                unsafe { std::ptr::read_unaligned(desc_buf.as_ptr() as *const KvSlotDesc) };
+            assert_eq!(desc.seq_len, extent as i32);
+            // Scratch stripe AUX K/V first 64 rows byte-exact (partial boundary page).
+            let sk_off = head.arena.layout().layer_k_offset(scratch as usize, 0).unwrap();
+            let sv_off = head.arena.layout().layer_v_offset(scratch as usize, 0).unwrap();
+            let mut sk = vec![0u8; 64 * row_bytes];
+            let mut sv = vec![0u8; 64 * row_bytes];
+            gpu.hip
+                .memcpy_dtoh_at(&mut sk, &head.arena.arena().buf, sk_off)
+                .expect("scratch K d2h");
+            gpu.hip
+                .memcpy_dtoh_at(&mut sv, &head.arena.arena().buf, sv_off)
+                .expect("scratch V d2h");
+            assert_eq!(sk, fx_pack(2, aux, false)[..64 * row_bytes], "scratch aux K partial rows");
+            assert_eq!(sv, fx_pack(2, aux, true)[..64 * row_bytes], "scratch aux V partial rows");
+        }
+
+        driver.free(&mut gpu).expect("free driver");
     }
 
     /// Full layerwise transaction on device (mirrors the core
@@ -4276,7 +5677,7 @@ mod tests {
         ];
         carrier.driver.begin_query(identity, specs, FX_BT as u64).expect("begin_query");
 
-        // Attach the activation subsystem (the engine_carrier wiring under test).
+        // Attach the activation subsystem (the carrier activation wiring under test).
         carrier
             .attach_activation(&mut gpu, &LayerwiseQuotas::default(), q_row_bytes)
             .expect("attach_activation");
@@ -6538,7 +7939,7 @@ mod tests {
         let mut carrier1 = LayerwiseQuery::build_with_pressure(
             &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35"),
             layerwise_capabilities(CTX as u32), bootstrap1, n_slots, archive_bytes,
-            None, Some(mass1),
+            None, Some(mass1), None,
         )
         .expect("build query carrier");
         assert!(!carrier1.is_pressure(), "phase 1 is a scorer Query step");
@@ -6591,7 +7992,8 @@ mod tests {
             let sel_val = l.values.iter().find(|v| v.original_start == sel_start).expect("selected page accepted");
             assert!(sel_val.mass > 0.0, "selected page carries positive mass");
         }
-        // Query keep-set == the scorer's restored selection; UNION with empty prev.
+        // Query keep-set == the scorer's restored selection; UNION with an empty
+        // prev pool publishes it unchanged.
         let restored1 = carrier1.restored_keep_set().expect("keep1");
         assert_eq!(restored1, keep1, "query keep-set == scorer selection");
         let combined1 = combine_keep_set(&[], &restored1, false, NL);
@@ -6650,7 +8052,7 @@ mod tests {
         let mut carrier2 = LayerwiseQuery::build_with_pressure(
             &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35"),
             layerwise_capabilities(CTX as u32), bootstrap2, n_slots, archive_bytes,
-            Some(step2), Some(mass2),
+            Some(step2), Some(mass2), None,
         )
         .expect("build pressure carrier");
         assert!(carrier2.is_pressure(), "phase 2 is a Pressure step");
@@ -6680,11 +8082,12 @@ mod tests {
         assert!(!carrier2.accept_pressure(&mut pressure).expect("pressure accept no-op"), "mid-page must not accept");
         let snap2 = pressure.snapshot().expect("snapshot2").read().expect("read snap2");
         assert_eq!(snap2, snap1, "Pressure step leaves the accepted state unchanged");
-        // Pressure keep-set == the refined selection; TRUNCATE replaces the pool.
+        // Pressure keep-set == the refined selection; REPLACE (truncate) publishes
+        // it regardless of the previous pool.
         let restored2 = carrier2.restored_keep_set().expect("keep2");
         assert_eq!(restored2, selected2, "pressure keep-set == selection");
         let combined2 = combine_keep_set(&combined1, &restored2, true, NL);
-        assert_eq!(combined2, selected2, "pressure truncate to budget");
+        assert_eq!(combined2, selected2, "pressure truncate to refined selection");
         carrier2.free(&mut gpu).expect("free carrier2");
 
         gpu.free_tensor(q_dev).expect("free q");
@@ -6831,7 +8234,7 @@ mod tests {
         let mut carrier = LayerwiseQuery::build_with_pressure(
             &mut gpu, &keys, &policy, &q8, layerwise_backend("qwen35"),
             layerwise_capabilities(CTX as u32), bootstrap, n_slots, archive_bytes,
-            None, Some(mass),
+            None, Some(mass), None,
         )
         .expect("build carrier");
         let suffix_phys = carrier.suffix_slot.expect("suffix slot");
@@ -6876,6 +8279,184 @@ mod tests {
             assert!((sum - 1.0).abs() <= 0.005, "accepted row mass conserved: {sum}");
         }
         carrier.free(&mut gpu).expect("free carrier");
+        gpu.free_tensor(q_dev).expect("free q");
+    }
+
+    /// P4.1② G1: `engine_carrier_rows` end-to-end (GPU). The multi-row MTP-verify
+    /// carrier builder wires the width-param bootstrap + the consumed-frontier
+    /// OutputPressure window (`begin_scope`/`prepare_scope`) around the SAME
+    /// `build_with_pressure` mechanics the ① fixture above proves. This routes
+    /// through the production `engine_carrier_rows` entry (ctl-borrowed statistics
+    /// store + fresh page-aligned policy + activation quotas in Query mode) and
+    /// confirms a width-4 verify span admits a PARTIAL prefix (1 of 4) into the
+    /// persistent output owner: `accepted_end` advances to `fed + 1`, one accepted
+    /// sample per FA layer, mass conserved. gfx1100-only (ported scorer + mass).
+    ///
+    /// Run with `HIPFIRE_KVMEM_SINK_BLOCKS=0 HIPFIRE_KVMEM_RECENT_BLOCKS=0` in the
+    /// PROCESS environment (the controller config is a start-time `OnceLock`
+    /// snapshot, so a runtime `set_var` is invisible — same rationale as the
+    /// strategy injection in `kvmem_ctl`). The one-page resident budget
+    /// (`budget_blocks = 1`) requires sink + recent == 0 to pass the residency
+    /// gate; the layerwise selection itself ignores sink/recent (`mandatory = []`,
+    /// `selected_pages = full_pages.min(budget_blocks)`), so this only admits the
+    /// constructor. Example:
+    /// `HIPFIRE_KVMEM_SINK_BLOCKS=0 HIPFIRE_KVMEM_RECENT_BLOCKS=0 \`
+    /// `cargo test -p hipfire-arch-qwen35 --features kvmem \`
+    /// `engine_carrier_rows_multi_row_partial_accept -- --ignored --test-threads=1`
+    #[test]
+    #[ignore]
+    fn engine_carrier_rows_multi_row_partial_accept() {
+        use crate::kvmem_ctl::{KvMemGeometry, KvMemPlan, RecallStrategy};
+        use hipfire_kvmem::{OutputOptions, OutputPressure, OutputScope, PrefillOptions};
+        use path_fixture::*;
+        use rdna_compute::kvmem_page_mass::PageMassScalar;
+
+        let mut gpu = Gpu::init().expect("gpu");
+        if gpu.arch != "gfx1100" {
+            return;
+        }
+
+        let full_pages = 3u32;
+        let frontier = full_pages * BT as u32; // 384 (page boundary ⇒ fed == frontier)
+        let width = 4u64;
+        let geom = KvMemGeometry {
+            n_fa_layers: NL,
+            n_heads: NH,
+            n_kv_heads: KVH,
+            head_dim: HD,
+            per_pos_bytes: SEG,
+            per_pos_v_bytes: SEG,
+            max_rows: 512,
+            mtp_head: false,
+        };
+        let plan = KvMemPlan { pages_total: 16, budget_blocks: 1, grow_blocks: 2, interval: 1 };
+        let mut ctl = KvMemCtl::new_with_strategy(1, &plan, &geom, RecallStrategy::Layerwise)
+            .expect("layerwise ctl");
+
+        // Populate the slot's statistics store directly (the &self core writes),
+        // mirroring the ① fixture: 3 sealed pages, mean-K sign trick selects one.
+        let q8 = LayerwiseQ8Layout::resolve(NL, KVH, HD, &[0, 1]).expect("q8 layout");
+        let record_bytes = q8.payload_layout().expect("manifest").record_bytes();
+        {
+            let (keys, _kv) = ctl.layerwise_stores(0).expect("slot stores");
+            keys.ensure_blocks(full_pages + 1).expect("ensure blocks");
+            for b in 0..full_pages {
+                for il in 0..NL {
+                    keys.write_layer_k_gpu(b * BT as u32, BT as u32, il as u32, &pack(b, il as u32, false))
+                        .expect("feed K");
+                    keys.write_layer_v_gpu(b * BT as u32, BT as u32, il as u32, &pack(b, il as u32, true))
+                        .expect("feed V");
+                }
+            }
+            for il in 0..NL {
+                for b in 0..full_pages {
+                    let sign = if b == (2 - il as u32) { 1.0f32 } else { -1.0f32 };
+                    let tile = vec![sign; BT * KVDIM];
+                    keys.write_layer_mean_k(b * BT as u32, BT as u32, il as u32, &tile).expect("mean-k");
+                }
+            }
+        }
+        ctl.test_set_fed(0, frontier).expect("seed fed");
+        let _ = record_bytes; // sizing is derived inside engine_carrier_rows
+
+        // Persistent OutputPressure owner (engine session 0/0 → core 1/1).
+        let prefill_opts = PrefillOptions {
+            block_tokens: BT as u32,
+            select_tokens: BT as u64,
+            reserve_tokens: BT as u64,
+            interval: 1024,
+            stride: 32,
+            half_life: 8192.0,
+        };
+        let mut output = OutputPressure::new_external(
+            SessionIdentity { id: 1, incarnation: 1 },
+            &[0, 1],
+            &prefill_opts,
+            &OutputOptions {
+                scope: OutputScope::NonThinking as u32,
+                interval: 1,
+                decay: 0.5,
+                commit_max_bytes: 16_777_216,
+            },
+        )
+        .expect("output owner");
+
+        let policy = ctl.layerwise_policy(frontier).expect("policy");
+        let mut carrier = engine_carrier_rows(
+            &mut gpu, &ctl, &policy, 0, 0, NL, NH, KVH, HD, CTX as u32, "qwen35",
+            width, None, &mut output, None, false,
+        )
+        .expect("engine_carrier_rows")
+        .expect("admitted carrier");
+        assert_eq!(carrier.staging.width(), width as usize, "width-4 verify staging");
+        assert!(!carrier.is_pressure(), "cold output owner + new page ⇒ scorer Query mode");
+        let suffix_phys = carrier.suffix_slot.expect("suffix slot");
+
+        // 4-row all-+1 Q tile (scorer pre-RoPE + mass post-RoPE).
+        let q_dev = upload_f32(&mut gpu, &vec![1.0f32; width as usize * QDIM]);
+        let native_q = NativeCurrentLayerQuery {
+            data: q_dev.buf.as_ptr() as *const std::ffi::c_void,
+            bytes: width as usize * QDIM * 4,
+            layer: 0,
+            rows: width as u32,
+            query_heads: NH as u32,
+            kv_heads: KVH as u32,
+            head_dim: HD as u32,
+            attention_scale: 0.0,
+            scalar: 0,
+            row_stride: QDIM * 4,
+            head_stride: HD * 4,
+            dimension_stride: 4,
+        };
+        let mass_q = PageMassQuery {
+            data: q_dev.buf.as_ptr() as *const std::ffi::c_void,
+            rows: width as u32,
+            query_heads: NH as u32,
+            kv_heads: KVH as u32,
+            head_dim: HD as u32,
+            attention_scale: 0.0,
+            scalar: PageMassScalar::F32,
+        };
+        for ordinal in 0..NL {
+            let layer_q = NativeCurrentLayerQuery { layer: ordinal as u32, ..native_q };
+            carrier.restore_layer(&mut gpu, ordinal, &layer_q).expect("restore");
+            let pages = carrier.driver.arena().pool_ref().canonical_pages(ordinal).unwrap();
+            assert_eq!(pages.len(), 1, "layer {ordinal}: budget selects one page");
+            assert_eq!(pages[0], 2 - ordinal as u32, "layer {ordinal} mean-K selection");
+            let k_off = carrier.driver.arena().layout().layer_k_offset(suffix_phys as usize, ordinal).unwrap();
+            let v_off = carrier.driver.arena().layout().layer_v_offset(suffix_phys as usize, ordinal).unwrap();
+            gpu.hip.memcpy_htod_offset(&carrier.driver.arena().arena().buf, k_off, &pack(full_pages, ordinal as u32, false)[..width as usize * SEG]).expect("suffix K write");
+            gpu.hip.memcpy_htod_offset(&carrier.driver.arena().arena().buf, v_off, &pack(full_pages, ordinal as u32, true)[..width as usize * SEG]).expect("suffix V write");
+            carrier.capture_mass_layer(&mut gpu, ordinal, &mass_q).expect("capture mass");
+            carrier.attend_complete_layer(ordinal).expect("attend complete");
+        }
+        // P4.1② DECOUPLED acceptance (the production flow): extract the OWNED
+        // snapshot BEFORE freeing the carrier, then publish AFTER free at the
+        // scheduler-confirmed prefix (request = session_id+1 = 1, begin = fed = 384,
+        // accepted = 1 of 4). Proves the snapshot outlives the carrier's `&ctl`
+        // borrow (the verify accept count is known only post-sampling, outside the
+        // orchestration's scoped take) and that extract+publish reproduces the
+        // in-scope `accept_output_pressure` (① template fixture above). The core
+        // validates history.frontier == begin + accepted atomically.
+        let snap = carrier
+            .extract_output_acceptance(1, frontier as u64)
+            .expect("extract snapshot")
+            .expect("mass captured ⇒ snapshot present");
+        assert_eq!(snap.eval_rows, width, "snapshot carries the physical verify width");
+        assert!(!snap.mass_rows.is_empty(), "snapshot carries the sample schedule");
+        assert_eq!(snap.layers.len(), NL, "one mass packet per FA layer");
+        carrier.free(&mut gpu).expect("free carrier BEFORE publish");
+        let newly = publish_output_acceptance(&mut output, snap, 1).expect("decoupled publish");
+        assert_eq!(newly, 0b1, "only the accepted prefix row newly published");
+        let osnap = output.snapshot().expect("snapshot").read().expect("read snap");
+        assert_eq!(osnap.accepted_end, frontier as u64 + 1, "consumed frontier fed + accepted");
+        assert_eq!(osnap.layers.len(), NL);
+        for l in &osnap.layers {
+            assert_eq!(l.samples, 1, "one accepted output row");
+            assert!(!l.pending.is_empty(), "accepted pending mass");
+            let sum: f64 = l.pending.iter().map(|(_, m)| m).sum();
+            assert!((sum - 1.0).abs() <= 0.005, "accepted row mass conserved: {sum}");
+        }
         gpu.free_tensor(q_dev).expect("free q");
     }
 }
