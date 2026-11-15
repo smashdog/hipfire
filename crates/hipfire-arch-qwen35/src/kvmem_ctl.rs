@@ -892,6 +892,9 @@ pub struct KvMemCtl {
     /// on); an empty catalog allocates nothing and no default path reads it,
     /// so the Legacy serve stays byte-neutral.
     prefix_catalog: PrefixCatalog,
+    /// P3.4 retention policy `(count, bytes, interval, min_gap)` when the spread
+    /// checkpoint policy is active; `None` keeps the historical LRU-only catalog.
+    checkpoint_retention: Option<(usize, u64, u64, u64)>,
     /// Observability counters (`KvMemCtl::stats`). Pure bookkeeping: no path
     /// reads them back into selection/residency, so they cannot change KV
     /// bytes; `/metrics` exports them via `EngineStats.kvmem`.
@@ -968,6 +971,16 @@ impl KvMemCtl {
         if gen_reserve == 0 {
             return Err("kvmem: HIPFIRE_KVMEM_GEN_RESERVE must be positive".to_string());
         }
+        let checkpoint_retention = match env_raw("HIPFIRE_KVMEM_CHECKPOINT_POLICY").as_deref() {
+            Some("spread") => {
+                let count = env_usize("HIPFIRE_KVMEM_CHECKPOINT_COUNT").unwrap_or(4).clamp(1, 64);
+                let mib = env_u64("HIPFIRE_KVMEM_CHECKPOINT_MIB").unwrap_or(512).max(1);
+                let interval = env_u64("HIPFIRE_KVMEM_CHECKPOINT_INTERVAL").unwrap_or(4096).max(1);
+                let min_gap = env_u64("HIPFIRE_KVMEM_CHECKPOINT_MIN_GAP").unwrap_or(0);
+                Some((count, mib << 20, interval, min_gap))
+            }
+            _ => None,
+        };
 
         // ── opt-in policy knobs (defaults reproduce the historical behaviour) ──
         // LRFU replaces the raw retrieval score with a decaying heavy-hitter
@@ -1207,6 +1220,7 @@ impl KvMemCtl {
             aux_ordinal: geom.n_fa_layers as u32,
             n_record_layers,
             gen_reserve,
+            checkpoint_retention,
             // P4.3: bounded frozen-prefix catalog; empty until the engine
             // freezes a prefix (PREFIX_PIN on). The bound is the retention
             // count ceiling (H5 exposes the env knob).
@@ -1486,7 +1500,13 @@ impl KvMemCtl {
         if inserted.is_some() {
             self.prefix_freezes_total += 1;
         }
-        self.prefix_evictions_total += displaced.len() as u64;
+        let mut displaced = displaced;
+        if let Some((count, bytes, interval, min_gap)) = self.checkpoint_retention {
+            let pruned = self.prefix_catalog.prune_policy(count, bytes, interval, min_gap);
+            self.prefix_evictions_total += pruned.len() as u64;
+            displaced.extend(pruned);
+        }
+        self.prefix_evictions_total += 0;
         Ok((inserted.unwrap_or(id), displaced, false))
     }
 

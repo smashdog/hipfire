@@ -328,6 +328,53 @@ impl PrefixCatalog {
         self.entries.iter().find(|e| e.id == id)
     }
 
+    /// P3.4: prune the catalog with the core coverage-retention policy
+    /// (count/byte caps + interval/min_gap). Returns the removed entries so the
+    /// engine can release their GPU cache refs. A policy error falls back to
+    /// keeping every entry (never silently drops a reusable prefix).
+    pub fn prune_policy(
+        &mut self,
+        count: usize,
+        bytes: u64,
+        interval: u64,
+        min_gap: u64,
+    ) -> Vec<PrefixCheckpoint> {
+        use hipfire_kvmem::{retain_checkpoint_coverage, CoverageInfo, CoveragePurpose};
+        let infos: Vec<CoverageInfo> = self
+            .entries
+            .iter()
+            .map(|e| CoverageInfo {
+                frontier: e.frontier as u64,
+                bytes: e.canonical.payload_bytes(),
+                used: e.last_used,
+                identity: e.id,
+                purpose: CoveragePurpose::Periodic as u32,
+                protections: 0,
+            })
+            .collect();
+        let keep = match retain_checkpoint_coverage(
+            &infos,
+            count as u64,
+            bytes,
+            interval,
+            min_gap,
+        ) {
+            Ok(k) => k,
+            Err(_) => return Vec::new(),
+        };
+        let mut removed = Vec::new();
+        let mut kept = Vec::with_capacity(self.entries.len());
+        for (index, entry) in std::mem::take(&mut self.entries).into_iter().enumerate() {
+            if keep.contains(&index) {
+                kept.push(entry);
+            } else {
+                removed.push(entry);
+            }
+        }
+        self.entries = kept;
+        removed
+    }
+
     /// Exact-frontier dedup probe: an entry with the same frontier AND
     /// fingerprint already exists (touch it). The engine uses this BEFORE
     /// sealing GPU pages so a deduped freeze never doubles cache refs.
@@ -544,6 +591,26 @@ mod tests {
         bad[10] ^= 1;
         assert_eq!(cat.lookup_at_most(&bad, layout, 512), None);
         assert_eq!(cat.lookup_at_most(&toks, layout ^ 1, 512), None);
+    }
+
+    #[test]
+    fn catalog_prune_policy_keeps_the_policy_selected_entries() {
+        let st = storage();
+        let toks = tokens(512);
+        let mut cat = PrefixCatalog::new(4);
+        for frontier in [128u32, 256, 384] {
+            let ckpt = checkpoint(&st, cat.mint_id(), frontier, &toks[..frontier as usize]);
+            cat.insert(ckpt).expect("insert");
+        }
+        assert_eq!(cat.len(), 3);
+        // Count=1 keeps the newest frontier under the core cost heuristic.
+        let removed = cat.prune_policy(1, 1 << 30, 4096, 0);
+        assert_eq!(removed.len(), 2);
+        assert_eq!(cat.len(), 1);
+        let remaining = cat.lookup(&toks[..384], layout_fingerprint(&raw_config()));
+        assert!(remaining.is_some(), "the newest (longest) prefix survives");
+        // The same selection is idempotent.
+        assert!(cat.prune_policy(1, 1 << 30, 4096, 0).is_empty());
     }
 
     #[test]
