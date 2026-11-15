@@ -36,6 +36,43 @@ pub const Q8_MAIN_MTP_FORMAT: &str = "hipfire-q8-main-mtp-v1";
 /// `PAGE_TOKENS`). Kept as a literal here so the adapter has no legacy import.
 pub const LAYERWISE_BLOCK_TOKENS: u32 = 128;
 
+/// P4.4: per-tier packed-page format identity (ninfer `layout_name` pattern,
+/// ninfer-kvmem.patch:8597-8609). The core treats the tag as an opaque
+/// provenance/admission key, so each KV tier registers its own identity and a
+/// record sealed under one tier can never seed another (format isolation).
+/// Q8 keeps the sealed-chain tag byte-for-byte (`hipfire-q8-packed-v1`).
+pub fn packed_format_tag(mode: KvMode) -> &'static str {
+    match mode {
+        KvMode::Q8 => Q8_PACKED_FORMAT,
+        KvMode::Bf16 => "hipfire-bf16-page-v1",
+        KvMode::F16 => "hipfire-f16-page-v1",
+        KvMode::Asym2 => "hipfire-asym2-page-v1",
+        KvMode::Asym3 => "hipfire-asym3-page-v1",
+        KvMode::Asym4 => "hipfire-asym4-page-v1",
+        KvMode::Fwht2 => "hipfire-fwht2-page-v1",
+        KvMode::Fwht3 => "hipfire-fwht3-page-v1",
+        KvMode::Fwht4 => "hipfire-fwht4-page-v1",
+        KvMode::Fp8 => "hipfire-fp8-page-v1",
+    }
+}
+
+/// P4.4: per-tier Main+aux MTP composite format identity (the head shares the
+/// trunk's KV tier geometry). Q8 keeps the sealed-chain tag (`hipfire-q8-main-mtp-v1`).
+pub fn composite_format_tag(mode: KvMode) -> &'static str {
+    match mode {
+        KvMode::Q8 => Q8_MAIN_MTP_FORMAT,
+        KvMode::Bf16 => "hipfire-bf16-main-mtp-v1",
+        KvMode::F16 => "hipfire-f16-main-mtp-v1",
+        KvMode::Asym2 => "hipfire-asym2-main-mtp-v1",
+        KvMode::Asym3 => "hipfire-asym3-main-mtp-v1",
+        KvMode::Asym4 => "hipfire-asym4-main-mtp-v1",
+        KvMode::Fwht2 => "hipfire-fwht2-main-mtp-v1",
+        KvMode::Fwht3 => "hipfire-fwht3-main-mtp-v1",
+        KvMode::Fwht4 => "hipfire-fwht4-main-mtp-v1",
+        KvMode::Fp8 => "hipfire-fp8-main-mtp-v1",
+    }
+}
+
 /// Resolved Q8 packed-page geometry: the core [`RawStoreConfig`] bridge inputs,
 /// the per-position K/V strides, and the fa-layer manifest list.
 ///
@@ -49,15 +86,21 @@ pub struct LayerwiseQ8Layout {
     k_stride: usize,
     v_stride: usize,
     fa_layers: Vec<u32>,
+    /// P4.4: per-tier packed format identity ([`packed_format_tag`]). The struct
+    /// name is historical (Q8); the adapter is now multi-format — the strides
+    /// come from the tier plan and the tag isolates each tier's records.
+    packed_format: &'static str,
 }
 
 impl LayerwiseQ8Layout {
     /// Resolve from model geometry. `n_layer_total` is the core store's layer
     /// count (`cfg.n_layer`); `fa_layers` the attention-layer IDs to manifest
     /// (non-empty, unique, each `< n_layer_total`). K/V strides come from the
-    /// engine's Q8 tier plan (`n_kv_heads * (head_dim / 32) * 34`, scales inline).
-    /// Fails closed on bad geometry — never silently defaults.
+    /// engine's tier plan for `kv_mode` (P4.4: Q8 scales inline; flat F16/BF16
+    /// 2B/elem; rotated asym/fwht K with static Q8 V). Fails closed on bad
+    /// geometry — never silently defaults.
     pub fn resolve(
+        kv_mode: KvMode,
         n_layer_total: usize,
         n_kv_heads: usize,
         head_dim: usize,
@@ -82,8 +125,8 @@ impl LayerwiseQ8Layout {
                 return Err(format!("layerwise Q8 layout: duplicate fa layer {layer}"));
             }
         }
-        // The engine's own Q8 stride authority (validates head_dim % 32, etc.).
-        let plan = SlotKvTierPlan::resolve(KvMode::Q8, n_kv_heads, head_dim)
+        // The engine's own tier stride authority (validates head_dim, etc.).
+        let plan = SlotKvTierPlan::resolve(kv_mode, n_kv_heads, head_dim)
             .map_err(|e| format!("layerwise Q8 layout: {e}"))?;
         let k_stride = plan.k_bytes_per_pos;
         let v_stride = plan.v_bytes_per_pos;
@@ -105,12 +148,17 @@ impl LayerwiseQ8Layout {
             k_stride,
             v_stride,
             fa_layers: fa_layers.to_vec(),
+            packed_format: packed_format_tag(kv_mode),
         })
     }
 
     /// The core store bridge config (matches the legacy controller's convention).
     pub fn raw_config(&self) -> &RawStoreConfig {
         &self.raw_cfg
+    }
+    /// P4.4: the per-tier packed format identity this layout registers.
+    pub fn packed_format(&self) -> &'static str {
+        self.packed_format
     }
     pub fn k_stride(&self) -> usize {
         self.k_stride
@@ -125,7 +173,7 @@ impl LayerwiseQ8Layout {
     /// Build the core generic `PayloadLayout` manifest (layer-major {Key, Value}
     /// per fa layer). One record == one canonical page == one composite slot.
     pub fn payload_layout(&self) -> Result<PayloadLayout, String> {
-        self.payload_layout_with_format(Q8_PACKED_FORMAT)
+        self.payload_layout_with_format(self.packed_format)
     }
 
     /// Build the core generic `PayloadLayout` manifest under an explicit backend
@@ -172,14 +220,17 @@ pub struct LayerwiseMtpQ8Layout {
     /// The head's auxiliary-plane layer ordinal (== `n_fa_layers`).
     head_layer: u32,
     n_fa_layers: usize,
+    /// P4.4: per-tier composite format identity ([`composite_format_tag`]).
+    composite_format: &'static str,
 }
 
 impl LayerwiseMtpQ8Layout {
     /// Resolve from model geometry. `n_fa_layers` is the trunk FA-layer count
     /// (>= 1); the head adds ONE auxiliary plane at ordinal `n_fa_layers`. K/V
-    /// strides come from the engine's Q8 tier plan (shared by trunk and head).
-    /// Fails closed on bad geometry — never silently defaults.
+    /// strides come from the engine's tier plan for `kv_mode` (shared by trunk
+    /// and head). Fails closed on bad geometry — never silently defaults.
     pub fn resolve(
+        kv_mode: KvMode,
         n_fa_layers: usize,
         n_kv_heads: usize,
         head_dim: usize,
@@ -188,19 +239,20 @@ impl LayerwiseMtpQ8Layout {
             return Err("layerwise MTP Q8 layout: n_fa_layers == 0".to_string());
         }
         let main_ordinals: Vec<u32> = (0..n_fa_layers as u32).collect();
-        let main = LayerwiseQ8Layout::resolve(n_fa_layers, n_kv_heads, head_dim, &main_ordinals)
+        let main = LayerwiseQ8Layout::resolve(kv_mode, n_fa_layers, n_kv_heads, head_dim, &main_ordinals)
             .map_err(|e| format!("layerwise MTP Q8 layout (main): {e}"))?;
         let head_layer = n_fa_layers as u32;
         let mut composite_ordinals = main_ordinals;
         composite_ordinals.push(head_layer);
         let composite = LayerwiseQ8Layout::resolve(
+            kv_mode,
             n_fa_layers + 1,
             n_kv_heads,
             head_dim,
             &composite_ordinals,
         )
         .map_err(|e| format!("layerwise MTP Q8 layout (composite): {e}"))?;
-        Ok(Self { main, composite, head_layer, n_fa_layers })
+        Ok(Self { main, composite, head_layer, n_fa_layers, composite_format: composite_format_tag(kv_mode) })
     }
 
     /// The trunk Main-plane adapter (ordinals `0..n_fa`, standalone Q8 format).
@@ -223,6 +275,10 @@ impl LayerwiseMtpQ8Layout {
     pub fn k_stride(&self) -> usize {
         self.composite.k_stride()
     }
+    /// P4.4: the per-tier composite format identity this layout registers.
+    pub fn composite_format(&self) -> &'static str {
+        self.composite_format
+    }
     /// Per-position V row bytes (shared trunk/head Q8 geometry).
     pub fn v_stride(&self) -> usize {
         self.composite.v_stride()
@@ -232,7 +288,7 @@ impl LayerwiseMtpQ8Layout {
     /// layer-major {Key, Value} for every trunk FA layer THEN the head's aux
     /// plane. One record == one canonical page == one composite slot.
     pub fn payload_layout(&self) -> Result<PayloadLayout, String> {
-        self.composite.payload_layout_with_format(Q8_MAIN_MTP_FORMAT)
+        self.composite.payload_layout_with_format(self.composite_format)
     }
 
     /// The crate-agnostic packed arena geometry for `n_slots` composite slots
@@ -259,7 +315,7 @@ mod tests {
 
     /// Q8 geometry: 4 KV heads × head_dim 256 → 4 * 8 * 34 = 1088 bytes/pos.
     fn resolved() -> LayerwiseQ8Layout {
-        LayerwiseQ8Layout::resolve(2, 4, 256, &[0, 1]).unwrap()
+        LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 4, 256, &[0, 1]).unwrap()
     }
 
     #[test]
@@ -281,15 +337,15 @@ mod tests {
     #[test]
     fn rejects_bad_geometry() {
         // head_dim not divisible by 32 (engine Q8 gate).
-        assert!(LayerwiseQ8Layout::resolve(2, 4, 100, &[0, 1]).is_err());
+        assert!(LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 4, 100, &[0, 1]).is_err());
         // zero KV heads.
-        assert!(LayerwiseQ8Layout::resolve(2, 0, 256, &[0, 1]).is_err());
+        assert!(LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 0, 256, &[0, 1]).is_err());
         // empty / out-of-range / duplicate fa-layer list.
-        assert!(LayerwiseQ8Layout::resolve(2, 4, 256, &[]).is_err());
-        assert!(LayerwiseQ8Layout::resolve(2, 4, 256, &[0, 2]).is_err());
-        assert!(LayerwiseQ8Layout::resolve(2, 4, 256, &[1, 1]).is_err());
+        assert!(LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 4, 256, &[]).is_err());
+        assert!(LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 4, 256, &[0, 2]).is_err());
+        assert!(LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 4, 256, &[1, 1]).is_err());
         // zero layer count.
-        assert!(LayerwiseQ8Layout::resolve(0, 4, 256, &[0]).is_err());
+        assert!(LayerwiseQ8Layout::resolve(KvMode::Q8, 0, 4, 256, &[0]).is_err());
     }
 
     #[test]
@@ -340,7 +396,7 @@ mod tests {
     // ── P4.1① Main+aux MTP composite ──────────────────────────────────────
     /// MTP composite fixture: 2 trunk FA layers + 1 head aux layer, Q8 geometry.
     fn mtp_resolved() -> LayerwiseMtpQ8Layout {
-        LayerwiseMtpQ8Layout::resolve(2, 4, 256).unwrap()
+        LayerwiseMtpQ8Layout::resolve(KvMode::Q8, 2, 4, 256).unwrap()
     }
 
     #[test]
@@ -424,8 +480,59 @@ mod tests {
 
     #[test]
     fn mtp_rejects_bad_geometry() {
-        assert!(LayerwiseMtpQ8Layout::resolve(0, 4, 256).is_err()); // no trunk
-        assert!(LayerwiseMtpQ8Layout::resolve(2, 4, 100).is_err()); // head_dim % 32
-        assert!(LayerwiseMtpQ8Layout::resolve(2, 0, 256).is_err()); // zero KV heads
+        assert!(LayerwiseMtpQ8Layout::resolve(KvMode::Q8, 0, 4, 256).is_err()); // no trunk
+        assert!(LayerwiseMtpQ8Layout::resolve(KvMode::Q8, 2, 4, 100).is_err()); // head_dim % 32
+        assert!(LayerwiseMtpQ8Layout::resolve(KvMode::Q8, 2, 0, 256).is_err()); // zero KV heads
+    }
+
+    // ── P4.4 multi-format adapter (ninfer layout-identity pattern) ──────────
+
+    #[test]
+    fn per_mode_format_tags_isolate_tiers() {
+        // Q8 keeps the sealed-chain tags byte-for-byte.
+        assert_eq!(packed_format_tag(KvMode::Q8), "hipfire-q8-packed-v1");
+        assert_eq!(composite_format_tag(KvMode::Q8), "hipfire-q8-main-mtp-v1");
+        // Every tier registers a distinct packed + composite identity.
+        let modes = [
+            KvMode::Q8, KvMode::Bf16, KvMode::F16, KvMode::Asym2, KvMode::Asym3,
+            KvMode::Asym4, KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4, KvMode::Fp8,
+        ];
+        let mut packed = std::collections::HashSet::new();
+        let mut composite = std::collections::HashSet::new();
+        for m in modes {
+            assert!(packed.insert(packed_format_tag(m)), "dup packed tag {m:?}");
+            assert!(composite.insert(composite_format_tag(m)), "dup composite tag {m:?}");
+        }
+        assert_eq!(packed.len(), modes.len());
+    }
+
+    #[test]
+    fn per_mode_resolve_strides_and_manifest() {
+        // head_dim 256, 4 KV heads — valid for q8/f16/bf16/asym3/fwht4.
+        let fa = [0u32, 1];
+        let q8 = LayerwiseQ8Layout::resolve(KvMode::Q8, 2, 4, 256, &fa).expect("q8");
+        let f16 = LayerwiseQ8Layout::resolve(KvMode::F16, 2, 4, 256, &fa).expect("f16");
+        let bf16 = LayerwiseQ8Layout::resolve(KvMode::Bf16, 2, 4, 256, &fa).expect("bf16");
+        let asym3 = LayerwiseQ8Layout::resolve(KvMode::Asym3, 2, 4, 256, &fa).expect("asym3");
+        let fwht4 = LayerwiseQ8Layout::resolve(KvMode::Fwht4, 2, 4, 256, &fa).expect("fwht4");
+        // Q8: 4 * (256/32) * 34 = 1088 B/pos. Flat F16/BF16: 4 * 256 * 2 = 2048.
+        assert_eq!(q8.k_stride(), 1088);
+        assert_eq!(f16.k_stride(), 2048);
+        assert_eq!(bf16.k_stride(), 2048);
+        assert_eq!(f16.k_stride(), f16.v_stride(), "flat tier V == K");
+        // Rotated tiers: V is static Q8 (1088), K differs from Q8.
+        assert_eq!(asym3.v_stride(), 1088);
+        assert_eq!(fwht4.v_stride(), 1088);
+        assert_ne!(asym3.k_stride(), q8.k_stride());
+        assert_ne!(fwht4.k_stride(), q8.k_stride());
+        // Manifests carry the per-tier tag and resolve cleanly.
+        for (layout, mode) in [(&q8, KvMode::Q8), (&f16, KvMode::F16), (&asym3, KvMode::Asym3), (&fwht4, KvMode::Fwht4)] {
+            let _manifest = layout.payload_layout().expect("manifest");
+            assert_eq!(layout.packed_format(), packed_format_tag(mode));
+        }
+        // Composite per-tier manifest.
+        let mtp_f16 = LayerwiseMtpQ8Layout::resolve(KvMode::F16, 2, 4, 256).expect("mtp f16");
+        let _composite = mtp_f16.payload_layout().expect("composite");
+        assert_eq!(mtp_f16.composite_format(), composite_format_tag(KvMode::F16));
     }
 }

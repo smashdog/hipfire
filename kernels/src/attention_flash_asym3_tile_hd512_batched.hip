@@ -176,6 +176,12 @@ __global__ void attention_flash_asym3_tile_hd512_batched(
     // Phase A: Q·K — both chunks accumulated into a single scalar partial.
     for (int t_local = 0; t_local < tile_len; t_local++) {
         int t = tile_start + t_local;
+        // KVMem residency (P4.4): a spilled page holds no K bytes. Mask the
+        // score; Phase D skips the V load for the same pages. Wave-uniform.
+        if (!kv_page_present(desc, t)) {
+            if (tid == 0) scores[t_local] = -INFINITY;
+            continue;
+        }
         const bool out_of_window = sliding && (t < t_lo);
         float partial = 0.0f;
         if (!out_of_window) {
@@ -246,6 +252,7 @@ __global__ void attention_flash_asym3_tile_hd512_batched(
     for (int t_local = 0; t_local < tile_len; t_local++) {
         float w = scores[t_local];
         int t = tile_start + t_local;
+        if (!kv_page_present(desc, t)) continue;  // KVMem P4.4: skip spilled V
         const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_row_stride);
         #pragma unroll
         for (int i = 0; i < 8; i++) {
