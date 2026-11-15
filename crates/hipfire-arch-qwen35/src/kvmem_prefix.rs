@@ -190,6 +190,16 @@ impl PrefixCatalog {
         self.entries.len()
     }
 
+    /// GPU pages pinned resident across every cataloged checkpoint (one count
+    /// per shared page-reference; a page pinned by two checkpoints counts
+    /// twice, matching the cache-ref bookkeeping the engine releases).
+    pub fn pinned_pages(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|e| e.gpu_pages.len() as u64)
+            .sum()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

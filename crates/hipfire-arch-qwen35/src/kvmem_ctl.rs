@@ -50,6 +50,7 @@ use hipfire_kvmem::{
     OutputPressure, OutputScope, PrefillOptions, PrefillPressure, RawStore, RawStoreConfig,
     SessionIdentity, Storage,
 };
+use hipfire_runtime::serve::KvMemStats;
 use rdna_compute::layerwise_pool::{mtp_auxiliary_capacity, mtp_head_pool, LayerwisePagePool};
 use rdna_compute::page_pool::SPILLED_PAGE;
 use rdna_compute::slot_pool::{SlotId, SlotPool};
@@ -877,6 +878,15 @@ pub struct KvMemCtl {
     /// on); an empty catalog allocates nothing and no default path reads it,
     /// so the Legacy serve stays byte-neutral.
     prefix_catalog: PrefixCatalog,
+    /// Observability counters (`KvMemCtl::stats`). Pure bookkeeping: no path
+    /// reads them back into selection/residency, so they cannot change KV
+    /// bytes; `/metrics` exports them via `EngineStats.kvmem`.
+    spill_pages_total: u64,
+    restore_pages_total: u64,
+    prefix_freezes_total: u64,
+    prefix_hits_total: u64,
+    prefix_misses_total: u64,
+    prefix_evictions_total: u64,
 }
 
 impl KvMemCtl {
@@ -1181,6 +1191,12 @@ impl KvMemCtl {
             // freezes a prefix (PREFIX_PIN on). The bound is the retention
             // count ceiling (H5 exposes the env knob).
             prefix_catalog: PrefixCatalog::new(4),
+            spill_pages_total: 0,
+            restore_pages_total: 0,
+            prefix_freezes_total: 0,
+            prefix_hits_total: 0,
+            prefix_misses_total: 0,
+            prefix_evictions_total: 0,
         })
     }
 
@@ -1394,14 +1410,25 @@ impl KvMemCtl {
             .prefix_catalog
             .insert_displacing(entry)
             .map_err(|e| format!("kvmem freeze_prefix catalog: {e}"))?;
+        if inserted.is_some() {
+            self.prefix_freezes_total += 1;
+        }
+        self.prefix_evictions_total += displaced.len() as u64;
         Ok((inserted.unwrap_or(id), displaced, false))
     }
 
     /// Look up the longest cataloged prefix fully proven by `prompt`.
     /// Returns the checkpoint id (engine then validates + forks).
     pub fn prefix_lookup(&mut self, prompt: &[u32]) -> Option<u64> {
-        self.prefix_catalog
-            .lookup(prompt, layout_fingerprint(&self.raw_cfg))
+        let hit = self
+            .prefix_catalog
+            .lookup(prompt, layout_fingerprint(&self.raw_cfg));
+        if hit.is_some() {
+            self.prefix_hits_total += 1;
+        } else {
+            self.prefix_misses_total += 1;
+        }
+        hit
     }
 
     /// Read a cataloged checkpoint (engine attaches GPU pages / reads the
@@ -1424,7 +1451,46 @@ impl KvMemCtl {
     /// Pop the LRU checkpoint (admission pressure reclaim); the engine
     /// releases its GPU cache refs. `None` when the catalog is empty.
     pub fn pop_lru_prefix(&mut self) -> Option<PrefixCheckpoint> {
-        self.prefix_catalog.pop_lru()
+        let popped = self.prefix_catalog.pop_lru();
+        if popped.is_some() {
+            self.prefix_evictions_total += 1;
+        }
+        popped
+    }
+
+    /// Live observability snapshot (`/metrics` via `EngineStats.kvmem`).
+    /// Cheap integer reads from the host stores: no device work, no
+    /// allocation, and no path reads it back into selection/residency, so it
+    /// cannot change KV bytes.
+    pub fn stats(&self) -> KvMemStats {
+        let mut payload_bytes = 0u64;
+        let mut blocks = 0u64;
+        let mut tokens = 0u64;
+        for st in &self.slots {
+            payload_bytes += st.raw.payload_bytes();
+            blocks += u64::from(st.kv.block_count());
+            tokens += u64::from(st.kv.total_tokens());
+        }
+        let page_bytes = (self.k_page_bytes + self.v_page_bytes) as u64;
+        KvMemStats {
+            enabled: true,
+            layerwise: self.strategy.is_layerwise(),
+            host_charged_bytes: self.storage.charged_bytes(),
+            disk_bytes: self.storage.disk_bytes(),
+            payload_bytes,
+            blocks,
+            tokens,
+            spill_pages: self.spill_pages_total,
+            restore_pages: self.restore_pages_total,
+            spill_bytes: self.spill_pages_total.saturating_mul(page_bytes),
+            restore_bytes: self.restore_pages_total.saturating_mul(page_bytes),
+            prefix_entries: self.prefix_catalog.len() as u64,
+            prefix_pinned_pages: self.prefix_catalog.pinned_pages(),
+            prefix_freezes: self.prefix_freezes_total,
+            prefix_hits: self.prefix_hits_total,
+            prefix_misses: self.prefix_misses_total,
+            prefix_evictions: self.prefix_evictions_total,
+        }
     }
 
     /// P4.3 fed coordination: truncate slot `slot`'s host store to a
@@ -2951,6 +3017,9 @@ impl KvMemCtl {
             &mut t_restore,
             &mut n_restored,
         )?;
+        // Observability counters (pure bookkeeping; no path reads them back).
+        self.spill_pages_total += n_spilled as u64;
+        self.restore_pages_total += n_restored as u64;
         if timed && (n_spilled > 0 || n_restored > 0 || t_select > std::time::Duration::ZERO) {
             eprintln!(
                 "[kvmem-time] prepare: total {:.1} ms (select {:.1} ms, spill {} pages \

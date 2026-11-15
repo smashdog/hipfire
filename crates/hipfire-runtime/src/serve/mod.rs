@@ -203,6 +203,40 @@ pub fn send_event(tx: &Sender<Event>, e: Event) -> Result<(), String> {
         .map_err(|_| "client receiver dropped".to_string())
 }
 
+/// KVMem host-offload telemetry, refreshed from the live controller once per
+/// engine step. All fields are scalars (the snapshot is `Copy`) and every
+/// counter is monotonic since engine start. `enabled == false` carries zeros
+/// and the gateway exports no KVMem series for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct KvMemStats {
+    pub enabled: bool,
+    /// Layerwise recall strategy active (per-layer selection) vs Legacy.
+    pub layerwise: bool,
+    /// Host KV storage charged bytes (live + sealed payload + metadata).
+    pub host_charged_bytes: u64,
+    /// Host KV storage spilled to the disk tier.
+    pub disk_bytes: u64,
+    /// Packed KV payload bytes held by the per-slot host stores.
+    pub payload_bytes: u64,
+    /// Logical blocks / tokens across every slot's policy store.
+    pub blocks: u64,
+    pub tokens: u64,
+    /// Paged spill/restore volume since start (pages and packed bytes).
+    pub spill_pages: u64,
+    pub restore_pages: u64,
+    pub spill_bytes: u64,
+    pub restore_bytes: u64,
+    /// P4.3 frozen-prefix catalog: entries, pinned GPU pages, and the
+    /// freeze/lookup/eviction counters that explain a hit ratio.
+    pub prefix_entries: u64,
+    pub prefix_pinned_pages: u64,
+    pub prefix_freezes: u64,
+    pub prefix_hits: u64,
+    pub prefix_misses: u64,
+    pub prefix_evictions: u64,
+}
+
 /// Serialized as the `engine_stats` object of every multi-slot `done` event;
 /// the serve gateway exports it on `/metrics`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -241,6 +275,8 @@ pub struct EngineStats {
     pub swap_disk_used: u64,
     pub swap_host_budget: u64,
     pub swap_disk_budget: u64,
+    /// KVMem host-offload snapshot (zeroed when the engine runs without it).
+    pub kvmem: KvMemStats,
 }
 
 impl EngineStats {
@@ -273,6 +309,13 @@ impl EngineStats {
     }
     pub fn note_slot_released(&mut self) {
         self.active_slots = self.active_slots.saturating_sub(1);
+    }
+
+    /// Refresh the live KVMem snapshot (cheap integer reads from the host
+    /// stores; no allocation, no device work). Engines without KVMem leave
+    /// the default zero snapshot, whose series the gateway suppresses.
+    pub fn note_kvmem(&mut self, kvmem: KvMemStats) {
+        self.kvmem = kvmem;
     }
 
     /// Refresh the swap-tier snapshot from the live manager. Cheap: reads
