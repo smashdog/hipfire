@@ -1124,11 +1124,6 @@ mod ffi {
 
         // 期3 G4: immutable core KvSnapshot over sealed packed records.
         pub fn hk_raw_store_has_packed(st: *const HkRawStore, blocks: u32) -> c_int;
-        pub fn hk_raw_store_copy_prefix_to(
-            dst: *mut HkRawStore,
-            src: *const HkRawStore,
-            blocks: u32,
-        ) -> c_int;
 
         // 期3 G3 P1.1: persistent prefix packs.
         pub fn hk_raw_store_write_prefix_pack(
@@ -2312,19 +2307,6 @@ impl RawStore {
     /// 期3 G4: any sealed packed record in blocks `[0, blocks)`.
     pub fn has_packed(&self, blocks: u32) -> bool {
         unsafe { ffi::hk_raw_store_has_packed(self.ptr.as_ptr(), blocks) != 0 }
-    }
-
-    /// 期3 G3-SSD: copy this store's sealed packed prefix of `blocks` complete
-    /// blocks (all layers, K and V) plus exact Mean-K sums into the EMPTY store
-    /// `dst` in a DIFFERENT storage account (content-cache SSD copy). Packed
-    /// bytes and the retrieval index are reproduced exactly; the session
-    /// account and the content account stay separately billed.
-    pub fn copy_prefix_to(&self, dst: &RawStore, blocks: u32) -> Result<()> {
-        let src = self.ptr.as_ptr();
-        let out = dst.ptr.as_ptr();
-        checked(|| unsafe {
-            let _ = ffi::hk_raw_store_copy_prefix_to(out, src, blocks);
-        })
     }
 
     /// 期3 G3 P1.1: write this store's `blocks`-block packed prefix (K/V +
