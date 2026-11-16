@@ -971,10 +971,31 @@ pub struct OutputSnapshot {
 mod ffi {
     use super::*;
 
+    /// C mirror of `kvmem::SpeculativeStatistics` (completed-request scope).
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct HkSpeculativeStatistics {
+        pub requests: u64,
+        pub rounds: u64,
+        pub drafted_tokens: u64,
+        pub accepted_tokens: u64,
+        pub generated_tokens: u64,
+        pub fallback_steps: u64,
+    }
+
     extern "C" {
         pub fn hk_last_error() -> *const c_char;
         pub fn hk_clear_error();
         pub fn hk_version() -> *const c_char;
+
+        // 期4 speculative contract (kvmem/include/kvmem/speculative.hpp).
+        pub fn hk_speculative_schema_version() -> u32;
+        pub fn hk_speculative_algorithm_name(algorithm: u32) -> *const c_char;
+        pub fn hk_speculative_statistics_reset(out: *mut HkSpeculativeStatistics);
+        pub fn hk_speculative_statistics_add(
+            dst: *mut HkSpeculativeStatistics,
+            src: *const HkSpeculativeStatistics,
+        );
 
         pub fn hk_storage_create(
             capacity_bytes: u64,
@@ -1926,6 +1947,51 @@ pub fn version() -> String {
     } else {
         unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
     }
+}
+
+// ── Speculative contract (期4, KVMem/nInfer integration pattern) ──────────
+//
+// Configuration/capability/statistics schema shared by every backend. The
+// engine owns proposal/verify/KV/rollback; these wrappers only expose the
+// core `speculative.hpp` contract (ordinals, names, statistics arithmetic) so
+// hipfire's `/props` restates none of the semantics.
+
+pub use ffi::HkSpeculativeStatistics;
+
+/// `kvmem::SpeculativeAlgorithm` ordinals.
+pub const SPECULATIVE_NONE: u32 = 0;
+pub const SPECULATIVE_MTP: u32 = 1;
+pub const SPECULATIVE_DFLASH: u32 = 2;
+pub const SPECULATIVE_DFLASH2: u32 = 3;
+
+/// Schema version stamped by `speculative.hpp` (`"schema_version": 1`).
+pub fn speculative_schema_version() -> u32 {
+    unsafe { ffi::hk_speculative_schema_version() }
+}
+
+/// Canonical algorithm name (`"none" | "mtp" | "dflash" | "dflash2"`).
+pub fn speculative_algorithm_name(algorithm: u32) -> &'static str {
+    let p = unsafe { ffi::hk_speculative_algorithm_name(algorithm) };
+    if p.is_null() {
+        "none"
+    } else {
+        unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("none")
+    }
+}
+
+/// `dst += src` through the core type (so scope/accept semantics stay there).
+pub fn speculative_statistics_add(
+    dst: &mut HkSpeculativeStatistics,
+    src: &HkSpeculativeStatistics,
+) {
+    unsafe { ffi::hk_speculative_statistics_add(dst, src) }
+}
+
+/// Zeroed accumulator.
+pub fn speculative_statistics_reset() -> HkSpeculativeStatistics {
+    let mut out = HkSpeculativeStatistics::default();
+    unsafe { ffi::hk_speculative_statistics_reset(&mut out) };
+    out
 }
 
 /// Host payload storage backing packed Q8 KV rows: `capacity_bytes` of RAM and,

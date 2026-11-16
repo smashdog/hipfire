@@ -1068,6 +1068,53 @@ async fn handle_request(
             }
             json_response(body, 200)
         }
+        (Method::GET, "/props") => {
+            // 期4: the KVMem/nInfer speculative contract object
+            // (`kvmem/include/kvmem/speculative.hpp`, schema v1). The
+            // configuration describes the running engine; statistics
+            // accumulate over completed requests (cancellations included,
+            // admission failures excluded). Shape and field names are shared
+            // with the other backends' `/props.speculative`.
+            let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
+            let stats = meta.engine_stats.unwrap_or_default();
+            let s = stats.speculative;
+            let name = hipfire_runtime::serve::speculative_algorithm_name(s.algorithm);
+            let capabilities = if s.enabled {
+                serde_json::json!([{
+                    "algorithm": name,
+                    "max_draft_tokens": s.draft_tokens,
+                    "adaptive": false,
+                    "ngram": false,
+                    "max_concurrency": stats.total_slots.max(1),
+                    "max_devices": 1,
+                    "draft_asset": if s.algorithm == 3 { "paired_hfq" } else { "embedded" },
+                }])
+            } else {
+                serde_json::json!([])
+            };
+            let body = serde_json::json!({
+                "speculative": {
+                    "schema_version": s.schema_version,
+                    "enabled": s.enabled,
+                    "algorithm": name,
+                    "draft_tokens": s.draft_tokens,
+                    "adaptive": false,
+                    "ngram_draft_tokens": s.ngram_draft_tokens,
+                    "capabilities": capabilities,
+                    "statistics": {
+                        "scope": "completed_requests",
+                        "requests": s.requests,
+                        "rounds": s.rounds,
+                        "drafted_tokens": s.drafted_tokens,
+                        "accepted_tokens": s.accepted_tokens,
+                        "generated_tokens": s.generated_tokens,
+                        "fallback_steps": s.fallback_steps,
+                        "acceptance_rate": s.acceptance_rate(),
+                    },
+                },
+            });
+            json_response(body, 200)
+        }
         (Method::GET, "/metrics") => {
             let body = {
                 let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
