@@ -386,11 +386,23 @@ impl PrefixCheckpoint {
         }
     }
 
-    /// Host bytes charged for retention (canonical packed archive + the
-    /// optional draft image).
+    /// Host bytes charged for retention (canonical packed archive + full
+    /// snapshot metadata + the optional draft image). Gross view: snapshot
+    /// origins shared with another catalog entry are charged again.
     pub fn host_bytes(&self) -> u64 {
         self.canonical.payload_bytes()
             + self.kv_snapshot.as_ref().map_or(0, |snap| snap.metadata_bytes() as u64)
+            + self.draft_image.as_ref().map_or(0, |img| img.nbytes())
+    }
+
+    /// The part of [`Self::host_bytes`] this entry owns exclusively: canonical
+    /// payload, draft image, and the snapshot's private manifest. The remaining
+    /// charge is per-origin (`SealedKvBlock`) and is attributed once by
+    /// [`PrefixCatalog::host_accounting`] because successive freezes of one
+    /// session inherit the same origins.
+    pub fn own_host_bytes(&self) -> u64 {
+        self.canonical.payload_bytes()
+            + self.kv_snapshot.as_ref().map_or(0, |snap| snap.manifest_bytes() as u64)
             + self.draft_image.as_ref().map_or(0, |img| img.nbytes())
     }
 
@@ -446,6 +458,16 @@ pub struct PrefixCatalog {
     /// Displaced entries awaiting handoff (see `insert` / `insert_displacing`).
     /// Production always drains immediately via `insert_displacing`.
     pending_displaced: Vec<PrefixCheckpoint>,
+}
+
+/// Host-byte views of the catalog (see [`PrefixCatalog::host_accounting`]).
+pub struct HostAccounting {
+    /// Sum of every entry's gross [`PrefixCheckpoint::host_bytes`].
+    pub gross: u64,
+    /// Origin-shared view: each `SealedKvBlock` charged once across entries.
+    pub unique: u64,
+    /// Per-entry unique charge, aligned with the catalog's entry order.
+    pub per_entry_unique: Vec<u64>,
 }
 
 impl PrefixCatalog {
@@ -676,6 +698,40 @@ impl PrefixCatalog {
         self.entries.iter().find(|e| e.id == id)
     }
 
+    /// Catalog-wide host-byte accounting. `gross` sums every entry's
+    /// [`PrefixCheckpoint::host_bytes`]; `unique` charges a `SealedKvBlock`
+    /// origin once across entries that share it (a session's successive
+    /// freezes inherit origins, patch 39). Shared origins are attributed to
+    /// the first entry referencing them in catalog order, so the per-entry
+    /// vector stays deterministic for the retention byte cap.
+    pub fn host_accounting(&self) -> HostAccounting {
+        let origin_charge = hipfire_kvmem::KvSnapshot::origin_charge_bytes();
+        let mut seen = std::collections::HashSet::new();
+        let mut gross = 0u64;
+        let mut unique = 0u64;
+        let mut per_entry_unique = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            gross = gross.saturating_add(entry.host_bytes());
+            let mut cost = entry.own_host_bytes();
+            if let Some(snap) = entry.kv_snapshot.as_ref() {
+                for block in 0..snap.block_count() {
+                    if let Some(origin) = snap.origin_id(block) {
+                        if seen.insert(origin) {
+                            cost = cost.saturating_add(origin_charge);
+                        }
+                    }
+                }
+            }
+            unique = unique.saturating_add(cost);
+            per_entry_unique.push(cost);
+        }
+        HostAccounting {
+            gross,
+            unique,
+            per_entry_unique,
+        }
+    }
+
     /// P3.4: prune the catalog with the core coverage-retention policy
     /// (count/byte caps + interval/min_gap). Returns the removed entries so the
     /// engine can release their GPU cache refs. A policy error falls back to
@@ -688,12 +744,14 @@ impl PrefixCatalog {
         min_gap: u64,
     ) -> Vec<PrefixCheckpoint> {
         use hipfire_kvmem::{retain_checkpoint_coverage, CoverageInfo, CoveragePurpose};
+        let accounting = self.host_accounting();
         let infos: Vec<CoverageInfo> = self
             .entries
             .iter()
-            .map(|e| CoverageInfo {
+            .zip(accounting.per_entry_unique.iter())
+            .map(|(e, unique)| CoverageInfo {
                 frontier: e.frontier as u64,
-                bytes: e.host_bytes(),
+                bytes: *unique,
                 used: e.last_used,
                 identity: e.id,
                 purpose: CoveragePurpose::Periodic as u32,
@@ -965,6 +1023,77 @@ mod tests {
         assert!(remaining.is_some(), "the newest (longest) prefix survives");
         // The same selection is idempotent.
         assert!(cat.prune_policy(1, 1 << 30, 4096, 0).is_empty());
+    }
+
+    /// 期3 G3 follow-up: catalog accounting charges a `SealedKvBlock` origin
+    /// once across entries that inherited it, and the retention byte cap sees
+    /// that unique total (gross per-entry bytes would prune a sharer).
+    #[test]
+    fn catalog_accounting_dedups_shared_snapshot_origins() {
+        let st = storage();
+        let toks = tokens(256);
+        let mut cat = PrefixCatalog::new(4);
+        let source = RawStore::new(raw_config(), Some(&st)).expect("source");
+        fill(&source, 2);
+        let mut first = checkpoint(&st, cat.mint_id(), 128, &toks[..128]);
+        first.canonical = source.fork_prefix(128).expect("canonical 128");
+        let snap1 = first
+            .canonical()
+            .capture_snapshot(1, None)
+            .expect("snapshot 128");
+        let shared_origin = snap1.origin_id(0).expect("origin 0");
+        assert_eq!(snap1.block_count(), 4, "1 block x 2 layers x (K,V)");
+        first.kv_snapshot = Some(snap1);
+        let mut second = checkpoint(&st, cat.mint_id(), 256, &toks);
+        second.canonical = source.fork_prefix(256).expect("canonical 256");
+        let snap2 = second
+            .canonical()
+            .capture_snapshot(2, first.kv_snapshot.as_ref())
+            .expect("snapshot 256");
+        assert_eq!(snap2.block_count(), 8);
+        assert_eq!(
+            snap2.origin_id(0),
+            Some(shared_origin),
+            "block 0 origins inherited from the first snapshot"
+        );
+        assert_eq!(snap2.origin_id(2), first.kv_snapshot.as_ref().unwrap().origin_id(2));
+        assert_ne!(snap2.origin_id(4), Some(shared_origin), "block 1 is a new origin");
+        second.kv_snapshot = Some(snap2);
+        let (first_id, second_id) = (first.id, second.id);
+        cat.insert(first).expect("insert first");
+        cat.insert(second).expect("insert second");
+
+        let origin_charge = hipfire_kvmem::KvSnapshot::origin_charge_bytes();
+        let first_entry = cat.get(first_id).expect("first entry");
+        let second_entry = cat.get(second_id).expect("second entry");
+        let gross = first_entry.host_bytes() + second_entry.host_bytes();
+        let accounting = cat.host_accounting();
+        assert_eq!(accounting.gross, gross);
+        // 4 shared origins out of 12 are charged once.
+        assert_eq!(accounting.gross - accounting.unique, 4 * origin_charge);
+        assert_eq!(accounting.per_entry_unique.len(), 2);
+        assert_eq!(
+            accounting.per_entry_unique[0],
+            first_entry.own_host_bytes() + 4 * origin_charge
+        );
+        assert_eq!(
+            accounting.per_entry_unique[1],
+            second_entry.own_host_bytes() + 4 * origin_charge
+        );
+        assert_eq!(
+            accounting.unique,
+            accounting.per_entry_unique.iter().sum::<u64>()
+        );
+
+        // A byte cap between the unique and gross totals retains both entries:
+        // the shared origins must not be double-charged (gross would prune).
+        assert!(gross > accounting.unique + 1, "test cap must discriminate");
+        let removed = cat.prune_policy(4, accounting.unique + 1, u64::MAX / 2, 0);
+        assert!(
+            removed.is_empty(),
+            "unique accounting keeps origin-sharing checkpoints under the byte cap"
+        );
+        assert_eq!(cat.len(), 2);
     }
 
     #[test]

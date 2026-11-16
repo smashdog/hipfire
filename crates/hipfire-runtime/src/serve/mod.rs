@@ -239,6 +239,11 @@ pub struct KvMemStats {
     /// freeze/lookup/eviction counters that explain a hit ratio.
     pub prefix_entries: u64,
     pub prefix_pinned_pages: u64,
+    /// Host bytes charged to the catalog for retention. `prefix_host_bytes`
+    /// charges a snapshot origin shared across entries once (inherited
+    /// origins, patch 39); `_gross` repeats it per entry.
+    pub prefix_host_bytes: u64,
+    pub prefix_host_bytes_gross: u64,
     pub prefix_freezes: u64,
     pub prefix_hits: u64,
     pub prefix_misses: u64,

@@ -1960,6 +1960,7 @@ impl KvMemCtl {
             tokens += u64::from(st.kv.total_tokens());
         }
         let page_bytes = (self.k_page_bytes + self.v_page_bytes) as u64;
+        let prefix_host = self.prefix_catalog.host_accounting();
         KvMemStats {
             enabled: true,
             layerwise: self.strategy.is_layerwise(),
@@ -1974,6 +1975,8 @@ impl KvMemCtl {
             restore_bytes: self.restore_pages_total.saturating_mul(page_bytes),
             prefix_entries: self.prefix_catalog.len() as u64,
             prefix_pinned_pages: self.prefix_catalog.pinned_pages(),
+            prefix_host_bytes: prefix_host.unique,
+            prefix_host_bytes_gross: prefix_host.gross,
             prefix_freezes: self.prefix_freezes_total,
             prefix_hits: self.prefix_hits_total,
             prefix_misses: self.prefix_misses_total,
