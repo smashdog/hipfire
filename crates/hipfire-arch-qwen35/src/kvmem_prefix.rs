@@ -817,6 +817,22 @@ impl PrefixCatalog {
         Some(self.entries.remove(victim))
     }
 
+    /// Residency demotion (G3 follow-up): drain the LRU entry's pinned pages
+    /// and KEEP the entry in the catalog, so a later reuse restores pages from
+    /// the sealed archive (Layerwise). Entries already demoted (no pages) are
+    /// skipped. Returns `(id, pages)` or `None` when nothing is pinned.
+    pub fn demote_lru(&mut self) -> Option<(u64, Vec<u32>)> {
+        let victim = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !e.gpu_pages.is_empty())
+            .min_by_key(|(_, e)| e.last_used)
+            .map(|(i, _)| i)?;
+        let entry = &mut self.entries[victim];
+        Some((entry.id, std::mem::take(&mut entry.gpu_pages)))
+    }
+
     fn touch(&mut self, id: u64) {
         self.clock += 1;
         if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
@@ -1150,6 +1166,32 @@ mod tests {
         assert_eq!(removed.frontier, 128);
         assert!(cat.is_empty());
         assert!(cat.remove(1).is_none());
+    }
+
+    /// G3 follow-up: admission-pressure demotion drops the LRU entry's pinned
+    /// pages but keeps the catalog entry; already-demoted entries are skipped.
+    #[test]
+    fn catalog_demote_keeps_entry_and_drains_lru_pages() {
+        let st = storage();
+        let toks = tokens(256);
+        let mut cat = PrefixCatalog::new(4);
+        let mut first = checkpoint(&st, cat.mint_id(), 128, &toks[..128]);
+        first.gpu_pages = vec![1, 2];
+        let mut second = checkpoint(&st, cat.mint_id(), 256, &toks);
+        second.gpu_pages = vec![3];
+        cat.insert(first).expect("insert first");
+        cat.insert(second).expect("insert second");
+        // Touch the longer prefix so the shorter one is the LRU victim.
+        assert!(cat.lookup(&toks, layout_fingerprint(&raw_config())).is_some());
+        let (id, pages) = cat.demote_lru().expect("demote first");
+        assert_eq!((id, pages), (1, vec![1, 2]));
+        let kept = cat.get(1).expect("demoted entry stays cataloged");
+        assert!(kept.gpu_pages.is_empty());
+        assert_eq!(cat.len(), 2);
+        let (id, pages) = cat.demote_lru().expect("demote second");
+        assert_eq!((id, pages), (2, vec![3]));
+        assert!(cat.demote_lru().is_none(), "nothing left pinned");
+        assert_eq!(cat.len(), 2, "demotion never removes entries");
     }
 
     /// 期3 G3: group-aware publication retires the whole least-recently-used

@@ -940,6 +940,9 @@ pub struct KvMemCtl {
     prefix_hits_total: u64,
     prefix_misses_total: u64,
     prefix_evictions_total: u64,
+    /// G3 follow-up: admission-pressure residency demotions (entry retained,
+    /// pinned pages dropped; Layerwise restores them from the archive).
+    prefix_demotions_total: u64,
     /// 期4: DFlash2 draft conditioning images captured with prefix
     /// checkpoints, restored on reuse, and missing/unrestorable (reseed).
     draft_images_total: u64,
@@ -1334,6 +1337,7 @@ impl KvMemCtl {
             prefix_hits_total: 0,
             prefix_misses_total: 0,
             prefix_evictions_total: 0,
+            prefix_demotions_total: 0,
             draft_images_total: 0,
             draft_image_hits_total: 0,
             draft_image_misses_total: 0,
@@ -1946,6 +1950,20 @@ impl KvMemCtl {
         popped
     }
 
+    /// G3 follow-up: admission-pressure residency demotion. Drops the LRU
+    /// checkpoint's pinned pages but KEEPS its catalog entry (nInfer: the
+    /// directory and GPU residency are separate), so a later reuse restores
+    /// the pages from the sealed archive under Layerwise. Returns the entry id
+    /// and the released page indices, or `None` when no entry pins any page.
+    /// Legacy keeps [`Self::pop_lru_prefix`] (its reuse needs resident pages).
+    pub fn demote_lru_prefix(&mut self) -> Option<(u64, Vec<u32>)> {
+        let demoted = self.prefix_catalog.demote_lru();
+        if demoted.is_some() {
+            self.prefix_demotions_total += 1;
+        }
+        demoted
+    }
+
     /// Live observability snapshot (`/metrics` via `EngineStats.kvmem`).
     /// Cheap integer reads from the host stores: no device work, no
     /// allocation, and no path reads it back into selection/residency, so it
@@ -1981,6 +1999,7 @@ impl KvMemCtl {
             prefix_hits: self.prefix_hits_total,
             prefix_misses: self.prefix_misses_total,
             prefix_evictions: self.prefix_evictions_total,
+            prefix_demotions: self.prefix_demotions_total,
             content_groups: self.prefix_catalog.group_count() as u64,
             content_retirements: self.content_retirements_total,
             content_cache_bytes: self
