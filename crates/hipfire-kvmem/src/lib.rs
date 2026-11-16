@@ -1167,6 +1167,8 @@ mod ffi {
         pub fn hk_kv_snapshot_ready(snap: *const HkKvSnapshot) -> c_int;
         pub fn hk_kv_snapshot_missing_bytes(snap: *const HkKvSnapshot) -> u64;
         pub fn hk_kv_snapshot_metadata_bytes(snap: *const HkKvSnapshot) -> usize;
+        pub fn hk_kv_snapshot_manifest_bytes(snap: *const HkKvSnapshot) -> usize;
+        pub fn hk_kv_snapshot_origin_charge_bytes() -> usize;
         pub fn hk_kv_snapshot_origin_id(snap: *const HkKvSnapshot, block: usize) -> u64;
         pub fn hk_kv_snapshot_covers_packed(
             snap: *const HkKvSnapshot,
@@ -2490,6 +2492,16 @@ impl KvSnapshot {
     /// Manifest + origin metadata (payload is accounted by the source store).
     pub fn metadata_bytes(&self) -> usize {
         unsafe { ffi::hk_kv_snapshot_metadata_bytes(self.ptr.as_ptr()) }
+    }
+    /// This snapshot's private manifest bytes. `metadata_bytes` additionally
+    /// charges `block_count() * origin_charge_bytes()` for the origins, which a
+    /// catalog deduplicates across snapshots that inherited the same origin.
+    pub fn manifest_bytes(&self) -> usize {
+        unsafe { ffi::hk_kv_snapshot_manifest_bytes(self.ptr.as_ptr()) }
+    }
+    /// Bytes charged per distinct snapshot origin (`SealedKvBlock`).
+    pub fn origin_charge_bytes() -> u64 {
+        unsafe { ffi::hk_kv_snapshot_origin_charge_bytes() as u64 }
     }
     /// Identity of one block origin (`SealedKvBlock` object), or 0. A capture
     /// that inherited a previous snapshot's origin reports the same id.

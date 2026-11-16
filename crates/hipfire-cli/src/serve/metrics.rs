@@ -623,6 +623,18 @@ impl Metrics {
                     "GPU pages pinned resident by frozen KVMem prefix checkpoints.",
                     s.kvmem.prefix_pinned_pages as f64,
                 );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_prefix_host_bytes",
+                    "Host bytes charged to the KVMem prefix catalog; snapshot origins shared across entries are charged once.",
+                    s.kvmem.prefix_host_bytes as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_prefix_host_bytes_gross",
+                    "Host bytes charged to the KVMem prefix catalog, repeating shared snapshot origins per entry.",
+                    s.kvmem.prefix_host_bytes_gross as f64,
+                );
                 counter(
                     &mut out,
                     "hipfire_kvmem_prefix_freezes_total",
@@ -1124,6 +1136,7 @@ mod tests {
                 "spill_pages": 3, "restore_pages": 2,
                 "spill_bytes": 6144, "restore_bytes": 4096,
                 "prefix_entries": 2, "prefix_pinned_pages": 16,
+                "prefix_host_bytes": 3000, "prefix_host_bytes_gross": 5000,
                 "prefix_freezes": 5, "prefix_hits": 4,
                 "prefix_misses": 6, "prefix_evictions": 1,
                 "draft_images": 2, "draft_image_hits": 1, "draft_image_misses": 1,
@@ -1151,6 +1164,8 @@ mod tests {
             "hipfire_kvmem_restore_bytes_total 4096\n",
             "hipfire_kvmem_prefix_entries 2\n",
             "hipfire_kvmem_prefix_pinned_pages 16\n",
+            "hipfire_kvmem_prefix_host_bytes 3000\n",
+            "hipfire_kvmem_prefix_host_bytes_gross 5000\n",
             "hipfire_kvmem_prefix_freezes_total 5\n",
             "hipfire_kvmem_prefix_hits_total 4\n",
             "hipfire_kvmem_prefix_misses_total 6\n",
