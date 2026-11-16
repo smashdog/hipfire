@@ -9326,11 +9326,21 @@ fn admit(
     let mut prefix_hit = false;
     #[cfg(feature = "kvmem")]
     if rig.kvmem_prefix_pin && req.visual_data.is_none() {
-        let hit = rig
-            .model
-            .kvmem
-            .as_mut()
-            .and_then(|ctl| ctl.prefix_lookup(&req.prompt_tokens));
+        // 期3 G3 P1.1: a cold pack hit publishes a catalog entry and may
+        // displace others; release their GPU cache refs outside the borrow.
+        let mut cold_displaced = Vec::new();
+        let hit = rig.model.kvmem.as_mut().and_then(|ctl| {
+            let hit = ctl.prefix_lookup(&req.prompt_tokens);
+            cold_displaced = ctl.take_cold_displaced();
+            hit
+        });
+        for d in cold_displaced {
+            if let Some(pp) = rig.pool.page_pool_mut() {
+                for &phys in &d.gpu_pages {
+                    let _ = pp.release_cache_ref(phys);
+                }
+            }
+        }
         if let Some(ckpt_id) = hit {
             let reuse = (|| -> Result<usize, String> {
                 let ctl = rig
@@ -9485,9 +9495,20 @@ fn admit(
                     return Err("kvmem reuse: DeltaNet checkpoint restore failed".to_string());
                 }
                 // 3. Share the pinned pages into the (empty) block table.
-                if gpu_pages.is_empty()
-                    || rig.pool.share_published_pages(slot, &gpu_pages).is_err()
-                {
+                // 期3 G3 P1.1: a restart-loaded pack carries no pinned GPU
+                // pages. Layerwise restores pages from the sealed archive on
+                // demand (carrier restore), so the share is skipped; Legacy
+                // has no cold restore path and fails closed to a cold prefill.
+                if gpu_pages.is_empty() {
+                    if !ctl.strategy().is_layerwise() {
+                        let _ = ctl.reset_slot(slot.0);
+                        let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+                        return Err(
+                            "kvmem reuse: no pinned pages (restart) and Legacy has no cold restore"
+                                .to_string(),
+                        );
+                    }
+                } else if rig.pool.share_published_pages(slot, &gpu_pages).is_err() {
                     let _ = ctl.reset_slot(slot.0);
                     let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
                     return Err("kvmem reuse: GPU page share failed".to_string());

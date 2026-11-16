@@ -269,6 +269,17 @@ impl ColdPackIndex {
         removed
     }
 
+    /// Register one freshly written pack (LRU stamp = newest).
+    pub fn insert(&mut self, mut pack: ColdPack) {
+        self.clock += 1;
+        pack.stamp = self.clock;
+        self.packs.push(pack);
+    }
+
+    pub fn contains_path(&self, path: &std::path::Path) -> bool {
+        self.packs.iter().any(|p| p.path == path)
+    }
+
     pub fn remove(&mut self, index: usize) -> Option<ColdPack> {
         if index < self.packs.len() {
             Some(self.packs.remove(index))
