@@ -7785,6 +7785,22 @@ fn run_loop(
                                  splits a media span"
                             );
                         }
+                        // G7 Stage E probe: the media replay anchor refuses
+                        // this freeze boundary (name the span it would split).
+                        if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+                            .ok()
+                            .is_some_and(|v| v == "1" || v == "on" || v == "true")
+                        {
+                            if let Some(&(b, e)) = all_spans
+                                .iter()
+                                .find(|&&(b, e)| (b as usize) < boundary && boundary < e as usize)
+                            {
+                                eprintln!(
+                                    "[kvmem-media] freeze skip boundary={boundary} \
+                                     splits span=[{b},{e})"
+                                );
+                            }
+                        }
                         continue;
                     }
                     let media_spans: Vec<(u32, u32)> = all_spans
@@ -7792,6 +7808,24 @@ fn run_loop(
                         .copied()
                         .filter(|&(_, e)| (e as usize) <= boundary)
                         .collect();
+                    // G7 Stage E probe: the frozen boundary is media-aligned
+                    // (never inside a span) and carries the identity.
+                    if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+                        .ok()
+                        .is_some_and(|v| v == "1" || v == "on" || v == "true")
+                    {
+                        let fmt = |d: Option<u64>| {
+                            d.map(|x| format!("{x:016x}"))
+                                .unwrap_or_else(|| "none".to_string())
+                        };
+                        eprintln!(
+                            "[kvmem-media] freeze boundary={boundary} digest={} \
+                             spans={} inside={}",
+                            fmt(media_digest),
+                            all_spans.len(),
+                            media_spans.len()
+                        );
+                    }
                     // PIN requires residency: every prefix page must still be
                     // bound (a spilled page has no physical handle to pin).
                     let n_pages = boundary / PAGE_TOKENS;
@@ -8269,7 +8303,20 @@ fn kvmem_freeze_endpoint(rig: &mut Rig, slots: &mut [Option<InFlight>], s: usize
     // G7: the endpoint frontier must not split an image span; carry the
     // session's media identity into the checkpoint.
     let (media_digest, all_spans) = kvmem_session_media(rig, session);
-    if all_spans.iter().any(|&(b, e)| b < boundary && boundary < e) {
+    if let Some(&(b, e)) = all_spans
+        .iter()
+        .find(|&&(b, e)| b < boundary && boundary < e)
+    {
+        // G7 Stage E probe: the endpoint replay anchor refuses this frontier.
+        if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+            .ok()
+            .is_some_and(|v| v == "1" || v == "on" || v == "true")
+        {
+            eprintln!(
+                "[kvmem-media] endpoint freeze skip boundary={boundary} \
+                 splits span=[{b},{e})"
+            );
+        }
         return;
     }
     let media_spans: Vec<(u32, u32)> = all_spans
@@ -8277,6 +8324,22 @@ fn kvmem_freeze_endpoint(rig: &mut Rig, slots: &mut [Option<InFlight>], s: usize
         .copied()
         .filter(|&(_, e)| e <= boundary)
         .collect();
+    // G7 Stage E probe: endpoint frontier carries a media-aligned identity.
+    if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+        .ok()
+        .is_some_and(|v| v == "1" || v == "on" || v == "true")
+    {
+        let fmt = |d: Option<u64>| {
+            d.map(|x| format!("{x:016x}"))
+                .unwrap_or_else(|| "none".to_string())
+        };
+        eprintln!(
+            "[kvmem-media] endpoint freeze boundary={boundary} digest={} spans={} inside={}",
+            fmt(media_digest),
+            all_spans.len(),
+            media_spans.len()
+        );
+    }
     let Some(domain) = rig.cache_domain.as_ref() else {
         return;
     };
@@ -9576,6 +9639,23 @@ fn admit(
             return Err(format!(
                 "kvmem reuse: media anchor moves frontier {frontier} -> {aligned}"
             ));
+        }
+        // G7 Stage E probe: the live media replay anchor accepted this
+        // frontier (block-aligned and not splitting any image span).
+        if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+            .ok()
+            .is_some_and(|v| v == "1" || v == "on" || v == "true")
+        {
+            let fmt = |d: Option<u64>| {
+                d.map(|x| format!("{x:016x}"))
+                    .unwrap_or_else(|| "none".to_string())
+            };
+            eprintln!(
+                "[kvmem-media] reuse anchor accept digest={} spans={} candidate={frontier} \
+                 aligned={aligned}",
+                fmt(req_media),
+                req_media_spans.len()
+            );
         }
         Ok(frontier)
     };

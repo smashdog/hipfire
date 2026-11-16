@@ -1856,6 +1856,31 @@ impl KvMemCtl {
                 }
             }
         }
+        // G7 Stage E probe: distinguish a media-identity refusal from a token
+        // proof miss. The candidate below proves by FULL token equality; only
+        // the image identity gate refused it. Trace-only, read-only.
+        if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+            .ok()
+            .is_some_and(|v| v == "1" || v == "on" || v == "true")
+        {
+            let layout = layout_fingerprint(&self.raw_cfg);
+            let rejected = self
+                .prefix_catalog
+                .probe_media_reject(prompt, layout, media)
+                .or_else(|| self.cold_packs.probe_media_reject(prompt, layout, media));
+            if let Some((frontier, digest)) = rejected {
+                let fmt = |d: Option<u64>| {
+                    d.map(|x| format!("{x:016x}"))
+                        .unwrap_or_else(|| "none".to_string())
+                };
+                eprintln!(
+                    "[kvmem-media] lookup miss: token candidate frontier={frontier} \
+                     digest={} request digest={} -> media identity gate",
+                    fmt(digest),
+                    fmt(media)
+                );
+            }
+        }
         self.prefix_misses_total += 1;
         None
     }
@@ -1945,16 +1970,35 @@ impl KvMemCtl {
         max_frontier: u32,
         media: Option<u64>,
     ) -> Option<u64> {
-        let hit = self.prefix_catalog.lookup_at_most_media(
-            prompt,
-            layout_fingerprint(&self.raw_cfg),
-            max_frontier,
-            media,
-        );
+        let layout = layout_fingerprint(&self.raw_cfg);
+        let hit = self
+            .prefix_catalog
+            .lookup_at_most_media(prompt, layout, max_frontier, media);
         if hit.is_some() {
             self.prefix_catalog_hits_total += 1;
             self.prefix_hits_total += 1;
         } else {
+            // G7 Stage E probe: a capped lookup narrowed to `max_frontier` can
+            // miss on the media identity alone; name the refused candidate.
+            if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+                .ok()
+                .is_some_and(|v| v == "1" || v == "on" || v == "true")
+            {
+                if let Some((frontier, digest)) =
+                    self.prefix_catalog.probe_media_reject(prompt, layout, media)
+                {
+                    let fmt = |d: Option<u64>| {
+                        d.map(|x| format!("{x:016x}"))
+                            .unwrap_or_else(|| "none".to_string())
+                    };
+                    eprintln!(
+                        "[kvmem-media] capped lookup miss: token candidate frontier={frontier} \
+                         digest={} request digest={} cap={max_frontier} -> media identity gate",
+                        fmt(digest),
+                        fmt(media)
+                    );
+                }
+            }
             self.prefix_misses_total += 1;
         }
         hit
