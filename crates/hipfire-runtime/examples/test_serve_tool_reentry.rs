@@ -102,6 +102,7 @@ fn main() {
         let (tx, rx) = channel::<Event>();
         engine
             .submit(SubmitRequest {
+                query: None,
                 prompt_tokens: prompt.clone(),
                 convo,
                 continuation,
