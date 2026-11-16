@@ -7956,6 +7956,40 @@ fn kvmem_catalog_and_pin(
             None => {}
         }
     }
+    // 期3 G3 P1.1 dn-persist: co-locate the recurrent state with the pack.
+    // Only at the LIVE frontier (prefill-boundary freeze); the endpoint freeze
+    // labels an earlier covered frontier whose state the live one no longer
+    // holds, so it carries no sidecar (restart reuse falls back to cold).
+    if !deduped && ctl.fed_tokens(s) == Some(boundary) {
+        if let Some(pack) = ctl.prefix_pack_path(id) {
+            let dn_path = std::path::PathBuf::from(format!("{}.dn", pack.display()));
+            match crate::speculative::DeltaNetSnapshot::export_host_from_state(
+                &rig.gpu,
+                &rig.model.dn_states[s],
+            ) {
+                Ok(bytes) => {
+                    let tmp = std::path::PathBuf::from(format!("{}.tmp", dn_path.display()));
+                    match std::fs::write(&tmp, &bytes)
+                        .and_then(|_| std::fs::rename(&tmp, &dn_path))
+                    {
+                        Ok(()) => {
+                            if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+                                .ok()
+                                .is_some_and(|v| v == "1" || v == "on" || v == "true")
+                            {
+                                eprintln!(
+                                    "[kvmem-pack] DN sidecar {} bytes at frontier {boundary}",
+                                    bytes.len()
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!("[kvmem-pack] DN sidecar skipped: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("[kvmem-pack] DN export skipped: {e}"),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -9473,14 +9507,56 @@ fn admit(
                     .checkpoint_pool
                     .as_mut()
                     .ok_or_else(|| "kvmem reuse: no checkpoint pool".to_string())?;
+                let fp = crate::checkpoint::prefix_fingerprint(
+                    &req.prompt_tokens[..frontier as usize],
+                );
+                // 期3 G3 P1.1 dn-persist: rebuild the recurrent checkpoint from
+                // the pack sidecar when this process has no pool entry (restart).
+                if ckpt_pool.peek(domain, frontier as u64, fp).is_none() {
+                    if let Some(pack) = ctl.prefix_pack_path(reuse_id) {
+                        let dn_path = std::path::PathBuf::from(format!("{}.dn", pack.display()));
+                        match std::fs::read(&dn_path) {
+                            Ok(bytes) => {
+                                match crate::speculative::DeltaNetSnapshot::new_for(
+                                    &mut rig.gpu,
+                                    &rig.model.dn_states[slot.0],
+                                ) {
+                                    Ok(mut snap) => match snap.import_host(&rig.gpu, &bytes) {
+                                        Ok(()) => {
+                                            let (cid, displaced) = ckpt_pool.insert(
+                                                domain.clone(),
+                                                frontier as u64,
+                                                fp,
+                                                snap,
+                                            );
+                                            for d in displaced {
+                                                d.free_gpu(&mut rig.gpu);
+                                            }
+                                            if cid != crate::checkpoint::CheckpointId::NONE
+                                                && hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+                                                    .ok()
+                                                    .is_some_and(|v| v == "1" || v == "on" || v == "true")
+                                            {
+                                                eprintln!(
+                                                    "[kvmem-pack] DN restored from sidecar frontier={frontier}"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[kvmem-pack] DN sidecar rejected: {e}")
+                                        }
+                                    },
+                                    Err(e) => {
+                                        eprintln!("[kvmem-pack] DN sidecar alloc failed: {e:?}")
+                                    }
+                                }
+                            }
+                            Err(e) => eprintln!("[kvmem-pack] DN sidecar missing: {e}"),
+                        }
+                    }
+                }
                 let restored = ckpt_pool
-                    .peek(
-                        domain,
-                        frontier as u64,
-                        crate::checkpoint::prefix_fingerprint(
-                            &req.prompt_tokens[..frontier as usize],
-                        ),
-                    )
+                    .peek(domain, frontier as u64, fp)
                     .map(|snapshot| {
                         snapshot
                             .restore_to(&mut rig.model.dn_states[slot.0], &mut rig.gpu)

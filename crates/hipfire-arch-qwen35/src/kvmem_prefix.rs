@@ -329,6 +329,10 @@ pub struct PrefixCheckpoint {
     /// of sharing records across accounts (core `import_packed` refuses a
     /// foreign account and `fork_prefix` would mix the ledgers).
     pub canonical_on_content: bool,
+    /// 期3 G3 P1.1: persistent pack file backing this checkpoint (set at
+    /// freeze when the live frontier matches, and on a cold load). The DN
+    /// sidecar sits beside it (`<pack>.dn`).
+    pub pack_path: Option<std::path::PathBuf>,
     /// Immutable canonical archive: `source.fork_prefix(frontier)`. Packed
     /// records are sealed shared sources; mean-K is private to this archive
     /// and re-forked private into every branch. Never fed after freeze.
@@ -374,6 +378,7 @@ impl PrefixCheckpoint {
             original_query: None,
             group: 0,
             canonical_on_content: false,
+            pack_path: None,
             canonical,
             kv_snapshot: None,
             draft_image: None,
@@ -826,6 +831,7 @@ mod tests {
             original_query: None,
             group: 0,
             canonical_on_content: false,
+            pack_path: None,
             canonical,
             kv_snapshot: None,
             draft_image: None,
