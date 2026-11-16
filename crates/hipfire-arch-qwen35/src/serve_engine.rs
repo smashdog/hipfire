@@ -649,13 +649,22 @@ impl ModelRig {
 }
 
 /// Decide whether this step is an admissible single-slot Layerwise decode and,
-/// if so, return `(slot, session_id)` (design §3.9g). Layerwise recalls the
-/// compacted selected working set per layer; it admits ONLY a single text-only
-/// q8 paged autoregressive decode row with no speculative-verify / DFlash rows.
-/// Every other step — prefill, multi-slot, VL (image sessions carry M-RoPE
-/// phases the compacted view does not reproduce), spec, non-q8, non-paged, or
-/// Legacy strategy — returns `None` and runs the byte-neutral Legacy path. The
-/// host-store length gate (`fed >= 128`) lives in `engine_carrier_rows`.
+/// if so, return `(slot, session_id, media_pages)` (design §3.9g). Layerwise
+/// recalls the compacted selected working set per layer; it admits ONLY a
+/// single text-only OR uniform-M-RoPE q8 paged autoregressive decode row with
+/// no speculative-verify / DFlash rows. Every other step — prefill, multi-slot,
+/// spec-verify, non-q8, non-paged, or Legacy strategy — returns `None` and runs
+/// the byte-neutral Legacy path. The host-store length gate (`fed >= 128`) lives
+/// in `engine_carrier_rows`.
+///
+/// G7 Stage D (VL): an image-conversation decode row is admissible when its
+/// M-RoPE phases are the uniform past-prompt form `[p+delta; 3]` (in-prompt
+/// phases never reach a decode row) and the image's canonical pages fit the
+/// resident budget. `media_pages` are those pinned pages — MANDATORY in every
+/// per-layer selection, so the vision KV can never be dropped by the keep-set
+/// refinement. VL + native spec stays Legacy (the MTP head-plane draft selection
+/// is text-only), and a media working set that cannot fit the budget keeps the
+/// byte-neutral Legacy path instead of failing closed.
 #[cfg(feature = "kvmem")]
 fn layerwise_admissible(
     rig: &Rig,
@@ -664,7 +673,7 @@ fn layerwise_admissible(
     work: &[PendingWork],
     any_verify: bool,
     any_dflash_rows: bool,
-) -> Option<(usize, u64)> {
+) -> Option<(usize, u64, Vec<u32>)> {
     let ctl = rig.model.kvmem.as_ref()?;
     if !ctl.strategy().is_layerwise() {
         return None;
@@ -685,17 +694,71 @@ fn layerwise_admissible(
     if !work[slot].decoding {
         return None;
     }
-    // Text-only this step: no external (vision-tower) embedding rows and no
-    // M-RoPE phases (the throat requires `!use_ext && !use_mrope`).
-    if !batch.ext_emb.iter().all(|&e| e < 0) || !batch.pos3.is_empty() {
+    // No vision-tower embedding rows this step (decode rows never carry ext_emb;
+    // the image pads live in the prefill). M-RoPE phases are admitted only in
+    // the past-prompt uniform form: a decode row rotates all three axes at the
+    // same shifted position, which the attention seam reproduces bit-for-bit.
+    if !batch.ext_emb.iter().all(|&e| e < 0) {
+        return None;
+    }
+    if batch
+        .pos3
+        .iter()
+        .any(|p| p[0] != p[1] || p[1] != p[2])
+    {
         return None;
     }
     let frame = slots[slot].as_ref()?;
     let sess = rig.sessions.get(frame.session)?;
+    let mut media_pages: Vec<u32> = Vec::new();
     if sess.has_image {
-        return None;
+        // The MTP head plane restores an aux selection without media semantics;
+        // keep VL+MTP on the Legacy path (out of Stage D scope). Escha-trellis
+        // dense decode lowers to a program executor with no M-RoPE arm.
+        if work[slot].spec.active()
+            || crate::qwen35::forward::has_escha_layers(&rig.model.weights)
+        {
+            return None;
+        }
+        let fed = ctl.fed_tokens(slot).unwrap_or(0) as u64;
+        let block = crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u64;
+        let full_pages = fed / block;
+        let (_, ranges) = kvmem_session_media(rig, frame.session);
+        let spans: Vec<crate::kvmem_media::MediaSpan> = ranges
+            .iter()
+            .map(|&(begin, end)| crate::kvmem_media::MediaSpan {
+                begin: begin as u64,
+                end: end as u64,
+            })
+            .collect();
+        let pages = crate::kvmem_media::pages_from_spans(&spans, block, full_pages);
+        // The core Query selection charges the sink pages and every mandatory
+        // pin inside the same budget and fails closed when they do not fit. An
+        // image that cannot be represented keeps the Legacy path (the strategy
+        // is opt-in; a normal request must not poison).
+        let budget = ctl.budget_blocks() as u64;
+        if full_pages > budget && pages.len() as u64 + ctl.sink_blocks() as u64 > budget {
+            if rig.gpu.slot_trace() {
+                eprintln!(
+                    "[kvmem-layerwise] slot {slot} VL decode stays Legacy: media pages {} \
+                     + sink {} exceed the resident budget {budget}",
+                    pages.len(),
+                    ctl.sink_blocks()
+                );
+            }
+            return None;
+        }
+        media_pages = pages.into_iter().map(|p| p as u32).collect();
+        if rig.gpu.slot_trace() {
+            eprintln!(
+                "[kvmem-layerwise] slot {slot} VL decode admitted: media pages {} {:?} \
+                 (fed {fed}, budget {budget})",
+                media_pages.len(),
+                media_pages
+            );
+        }
     }
-    Some((slot, frame.session.0))
+    Some((slot, frame.session.0, media_pages))
 }
 
 /// Layerwise spec-verify admission (P4.1② design §A.6 / §B D1.4②; 期4 DFlash2).
@@ -6172,7 +6235,7 @@ fn run_loop(
             let fwd = {
                 match layerwise_admissible(&rig, &batch, &slots, &work, any_verify, any_dflash_rows)
                 {
-                    Some((slot, session_id)) => {
+                    Some((slot, session_id, media_pages)) => {
                         let mut kvmem = rig.model.kvmem.take();
                         let n_fa = rig
                             .model
@@ -6262,6 +6325,7 @@ fn run_loop(
                                 .expect("admissible layerwise AR step has an output owner"),
                             None,
                             force_query,
+                            &media_pages,
                         );
                         match built {
                             Ok(Some(mut carrier)) => {
@@ -6507,6 +6571,7 @@ fn run_loop(
                                     .expect("admissible layerwise verify has an output owner"),
                                 None,
                                 force_query,
+                                &[],
                             );
                             match built {
                                 Ok(Some(mut carrier)) => {

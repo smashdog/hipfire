@@ -4057,6 +4057,7 @@ fn paged_decode_reference_layers(
         pbs.kvmem_taps.as_ref(),
         &desc_staging.row_slot_dev,
         /* layerwise */ None,
+        /* use_mrope */ false,
         layer_end,
     )?;
     // Back into the [n_slots × dim] batch buffer the head reads.
@@ -4097,6 +4098,16 @@ fn paged_decode_layerwise(
     gpu.memcpy_dtod_at_auto(&s.x.buf, 0, &pbs.x_batch.buf, 0, row_bytes)?;
     let pos = batch.positions[0] as usize;
     gpu.hip.memcpy_htod(&s.pos_buf, &(pos as i32).to_ne_bytes())?;
+    // G7 Stage D: a VL decode row (image conversation, past the prompt) carries
+    // uniform M-RoPE phases `[p+delta; 3]` from the batch. Upload them to the
+    // single-row scratch so the attention prep can run the 3D RoPE kernel; the
+    // KV write below still uses the carrier's COMPACT positions, and the phases
+    // are the absolute ones the prefill stored keys under.
+    let use_mrope = batch.pos3.len() == batch.positions.len() && !batch.pos3.is_empty();
+    if use_mrope {
+        let bytes: Vec<u8> = batch.pos3[0].iter().flat_map(|v| v.to_ne_bytes()).collect();
+        gpu.hip.memcpy_htod(&s.pos_buf3, &bytes)?;
+    }
 
     // Composite arena views: non-owning aliases (the carrier's arena owns the
     // allocation). K base = arena base; V base = arena shifted by one K plane.
@@ -4163,6 +4174,7 @@ fn paged_decode_layerwise(
         pbs.kvmem_taps.as_ref(),
         &desc_staging.row_slot_dev,
         Some(lq),
+        use_mrope,
         layer_end,
     )?;
     // Back into the [n_slots × dim] batch buffer the head reads.
@@ -5691,12 +5703,17 @@ pub fn forward_batch_slots_opts(
     // path also falls through).
     #[cfg(all(feature = "deltanet", feature = "kvmem"))]
     let layerwise_handled = if let Some(lq) = layerwise.as_deref_mut() {
-        // P4.1② G1: two admissible Layerwise shapes, both single-slot text-only
-        // q8 paged. (a) AR single-row decode (D4b-3): n == 1, unspec, the paged
-        // GQA decode tile engaged. (b) MTP multi-row verify span (②): n == width
-        // > 1, spec-captured. The width-param staging (①-F1) supplies per-row
-        // compacted causal bounds `[seq_len - width + i]`; the verify span rides
-        // Path B `run_layers_slots` (width-aware) for BOTH dense and MoE — the
+        // P4.1② G1: two admissible Layerwise shapes, both single-slot q8 paged.
+        // (a) AR single-row decode (D4b-3): n == 1, unspec, the paged GQA decode
+        // tile engaged. G7 Stage D admits the uniform past-prompt M-RoPE form
+        // here: the FA seam rotates with the real phases (s.pos_buf3 on the
+        // dense reference path, pbs.pos3 on the slots ladder) while the compact
+        // carrier staging keeps driving the KV write / causal bound, and no
+        // decode row carries vision-tower ext_emb rows. (b) MTP multi-row verify
+        // span (②): n == width > 1, spec-captured, text-only. The width-param
+        // staging (①-F1) supplies per-row compacted causal bounds
+        // `[seq_len - width + i]`; the verify span rides Path B
+        // `run_layers_slots` (width-aware) for BOTH dense and MoE — the
         // reference single-row sibling is not width-aware. Verify admission is
         // deliberately INDEPENDENT of the legacy `paged_verify` WMMA envelope
         // (which caps n at 4..=32 past a per-token ctx crossover): the Layerwise
@@ -5705,15 +5722,16 @@ pub fn forward_batch_slots_opts(
         // so short-context / small-width verify spans still ride Layerwise.
         // Any other shape with a `Some` handle fails closed here, ahead of any
         // attention — never a silent legacy fallback.
-        let text_only = !use_mrope && !use_ext;
+        let no_ext = !use_ext;
         let ar_admissible = paged_decode.is_some()
             && n == 1
             && active_slots == 1
-            && text_only
+            && no_ext
             && spec_capture.is_none();
         let verify_admissible = n > 1
             && active_slots == 1
-            && text_only
+            && no_ext
+            && !use_mrope
             && spec_capture.is_some()
             && pool.is_paged()
             && kv.is_q8();

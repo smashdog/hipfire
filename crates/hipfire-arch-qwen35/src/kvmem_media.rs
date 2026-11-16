@@ -66,6 +66,33 @@ pub fn spans_from_pad_runs(tokens: &[u32], pad: u32, n_visual: usize) -> Vec<Med
     spans
 }
 
+/// Canonical page ids (`block`-sized) any of `spans` touches, restricted to
+/// the sealed history `[0, frontier_pages)`. Sorted and deduped. A media span
+/// is indivisible (nInfer media group): every page it intersects must be
+/// pinned in the per-layer keep-set, and a page past the sealed frontier is
+/// the suffix stripe (always attended), not a canonical pin.
+pub fn pages_from_spans(spans: &[MediaSpan], block: u64, frontier_pages: u64) -> Vec<u64> {
+    let mut pages: Vec<u64> = Vec::new();
+    if block == 0 {
+        return pages;
+    }
+    for span in spans {
+        if span.begin >= span.end {
+            continue;
+        }
+        let first = span.begin / block;
+        let last = (span.end - 1) / block;
+        for id in first..=last {
+            if id < frontier_pages {
+                pages.push(id);
+            }
+        }
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    pages
+}
+
 /// nInfer `validate_layerwise_media` for one flat, ordered span list.
 pub fn validate_spans(prompt_len: u64, spans: &[MediaSpan], block: u64) -> Result<(), String> {
     if block == 0 {
@@ -288,5 +315,37 @@ mod tests {
         let b = media_anchored_frontier(0, 768, 1000, &spans, BLOCK).unwrap();
         assert_eq!(a, b);
         assert_eq!(a, 640);
+    }
+
+    #[test]
+    fn pages_cover_every_touched_page() {
+        // One span spanning a page boundary: both pages.
+        let spans = [MediaSpan { begin: 100, end: 200 }];
+        assert_eq!(pages_from_spans(&spans, BLOCK, 10), vec![0, 1]);
+        // Page-aligned span: exactly its pages, both ends inclusive.
+        let spans = [MediaSpan { begin: 128, end: 384 }];
+        assert_eq!(pages_from_spans(&spans, BLOCK, 10), vec![1, 2]);
+        // End on a boundary does not touch the next page.
+        let spans = [MediaSpan { begin: 100, end: 128 }];
+        assert_eq!(pages_from_spans(&spans, BLOCK, 10), vec![0]);
+        // Two spans on the same page dedup.
+        let spans = [
+            MediaSpan { begin: 10, end: 20 },
+            MediaSpan { begin: 30, end: 40 },
+        ];
+        assert_eq!(pages_from_spans(&spans, BLOCK, 10), vec![0]);
+    }
+
+    #[test]
+    fn pages_are_clamped_to_the_sealed_frontier() {
+        // A span reaching past the sealed history keeps only sealed pages; the
+        // rest is the suffix stripe (always attended, never a canonical pin).
+        let spans = [MediaSpan { begin: 200, end: 600 }];
+        assert_eq!(pages_from_spans(&spans, BLOCK, 3), vec![1, 2]);
+        assert_eq!(pages_from_spans(&spans, BLOCK, 0), Vec::<u64>::new());
+        // Degenerate spans are ignored; block 0 yields nothing.
+        let spans = [MediaSpan { begin: 5, end: 5 }];
+        assert!(pages_from_spans(&spans, BLOCK, 3).is_empty());
+        assert!(pages_from_spans(&[MediaSpan { begin: 0, end: 5 }], 0, 3).is_empty());
     }
 }

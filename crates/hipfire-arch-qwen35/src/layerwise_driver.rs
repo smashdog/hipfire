@@ -2058,7 +2058,7 @@ pub fn bootstrap_layerwise(
 ) -> Result<LayerwiseBootstrap, String> {
     bootstrap_layerwise_rows(
         fed, session_id, incarnation, seq, fa_layers, n_heads, n_kv_heads, head_dim,
-        budget_blocks, record_bytes, resident, 1, None,
+        budget_blocks, record_bytes, resident, 1, None, &[],
     )
 }
 
@@ -2072,6 +2072,14 @@ pub fn bootstrap_layerwise(
 /// `query` outside the evaluation span. The canonical history, specs, suffix page
 /// and `native_history_tokens` are width-independent (the verify span rides the
 /// single physical suffix stripe, `width ≤ block_tokens`).
+///
+/// `mandatory` are canonical page ids the per-layer selection must keep (G7
+/// Stage D media pins): every spec gets the SAME list, so the image's pages
+/// survive layer selection while the remaining pages compete for the budget.
+/// Ids beyond the sealed history are filtered defensively (the suffix stripe
+/// covers them); the core fails closed when the mandatory set cannot fit the
+/// selection budget.
+#[allow(clippy::too_many_arguments)]
 pub fn bootstrap_layerwise_rows(
     fed: u32,
     session_id: u64,
@@ -2086,6 +2094,7 @@ pub fn bootstrap_layerwise_rows(
     resident: &[Vec<u64>],
     width: u64,
     query: Option<QueryRange>,
+    mandatory: &[u32],
 ) -> Result<LayerwiseBootstrap, String> {
     let bt = LAYERWISE_BLOCK_TOKENS;
     if width == 0 {
@@ -2147,6 +2156,15 @@ pub fn bootstrap_layerwise_rows(
         .collect();
     let mut canonical = Vec::with_capacity(fa_layers.len());
     let mut specs = Vec::with_capacity(fa_layers.len());
+    // G7 Stage D: media pins are canonical ids inside the sealed history; a
+    // stale id past the frontier would be rejected by the core, so clamp to the
+    // same defensive filter the resident keep-set uses (dedup preserving order).
+    let mut mandatory_ids: Vec<u32> = Vec::with_capacity(mandatory.len());
+    for &id in mandatory {
+        if (id as u64) < full_pages as u64 && !mandatory_ids.contains(&id) {
+            mandatory_ids.push(id);
+        }
+    }
     for (ordinal, &model_layer) in fa_layers.iter().enumerate() {
         // Decision A (§3.10a): the persistent PER-LAYER keep-set drives each
         // layer's canonical resident list. Keep only ids within the current
@@ -2180,7 +2198,7 @@ pub fn bootstrap_layerwise_rows(
                 device_tokens: (selected_pages as u64 + 1) * bt as u64,
                 host_payload_bytes: full_pages as u64 * record_bytes,
             },
-            mandatory: Vec::new(),
+            mandatory: mandatory_ids.clone(),
         });
     }
     // The core ties the evaluation span to the committed logical frontier:
@@ -2296,6 +2314,12 @@ pub fn engine_carrier_rows<'a>(
     output: &mut OutputPressure,
     prefill: Option<&PrefillPressure>,
     force_query: bool,
+    // G7 Stage D: canonical pages holding a media (image) span. They are
+    // MANDATORY in every per-layer selection (Query spec and Pressure seed), so
+    // the image's KV survives the keep-set refinement; empty for text
+    // (byte-neutral). The caller already filtered them to sealed pages and
+    // verified they fit the resident budget.
+    media_pages: &[u32],
 ) -> Result<Option<LayerwiseQuery<'a>>, String> {
     if !ctl.strategy().is_layerwise() || width == 0 {
         return Ok(None);
@@ -2353,6 +2377,7 @@ pub fn engine_carrier_rows<'a>(
         ctl.layerwise_keep_set(slot).unwrap_or(&[]),
         width,
         query,
+        media_pages,
     )?;
     let selected_pages =
         (bootstrap.native_history_tokens / LAYERWISE_BLOCK_TOKENS as u64) as usize;
@@ -2451,8 +2476,9 @@ pub fn engine_carrier_rows<'a>(
             let catalog = MemoryCatalog::new(&descriptor, &bootstrap.canonical)
                 .map_err(|e| format!("layerwise engine rows: catalog: {e}"))?;
             let budget_tokens = budget_blocks as u64 * LAYERWISE_BLOCK_TOKENS as u64;
+            let media_pages_u64: Vec<u64> = media_pages.iter().map(|&p| p as u64).collect();
             let choices = output
-                .select(&catalog, pf, &[], budget_tokens, 0)
+                .select(&catalog, pf, &media_pages_u64, budget_tokens, 0)
                 .map_err(|e| format!("layerwise engine rows: output select: {e}"))?;
             let all = choices
                 .read_all()
@@ -2582,6 +2608,7 @@ pub fn engine_carrier_head<'a>(
         ctl.layerwise_keep_set(slot).unwrap_or(&[]),
         width,
         None,
+        &[],
     )?;
     let selected_pages =
         (bootstrap.native_history_tokens / LAYERWISE_BLOCK_TOKENS as u64) as usize;
@@ -4300,6 +4327,7 @@ mod tests {
         let rows = |width: u64, query: Option<QueryRange>| {
             bootstrap_layerwise_rows(
                 fed, 0, 0, 5, &fa, Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, width, query,
+                &[],
             )
         };
 
@@ -4315,6 +4343,18 @@ mod tests {
         assert_eq!(one.suffix_page, ar.suffix_page);
         assert_eq!(one.partial_tokens, ar.partial_tokens);
         assert_eq!(one.native_history_tokens, ar.native_history_tokens);
+        // G7 Stage D: media pins ride EVERY layer's spec, clamped to the sealed
+        // history (4 pages here) and deduped; the id past the frontier is dropped
+        // (it is the suffix stripe, never a canonical pin). Empty by default.
+        assert!(one.specs.iter().all(|s| s.mandatory.is_empty()));
+        let pinned = bootstrap_layerwise_rows(
+            fed, 0, 0, 5, &fa, Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, 1, None,
+            &[1, 2, 2, 99],
+        )
+        .unwrap();
+        for spec in &pinned.specs {
+            assert_eq!(spec.mandatory, vec![1, 2], "media pins per layer");
+        }
 
         // width=4 MTP verify span: evaluation rides [frontier, frontier+4).
         let four = rows(4, None).unwrap();
@@ -4349,11 +4389,11 @@ mod tests {
         assert!(rows(4, Some(QueryRange { begin: frontier, end: frontier + 5 })).is_err()); // end > evaluation.end
         assert!(rows(4, Some(QueryRange { begin: frontier + 2, end: frontier + 1 })).is_err()); // begin > end
         assert!(bootstrap_layerwise_rows(
-            fed, 0, 0, 5, &[], Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, 1, None
+            fed, 0, 0, 5, &[], Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, 1, None, &[]
         )
         .is_err()); // empty fa_layers
         assert!(bootstrap_layerwise_rows(
-            64, 0, 0, 5, &fa, Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, 1, None
+            64, 0, 0, 5, &fa, Q_HEADS, KV_HEADS, HEAD_DIM, 4, 278528, &resident, 1, None, &[]
         )
         .is_err()); // fed < 128: no sealed history page
     }
@@ -7033,6 +7073,7 @@ mod tests {
             Some(&taps),
             &ref_row_slot,
             Some(&mut carrier),
+            /* use_mrope */ false,
             NL,
         )
         .expect("layerwise Path A forward");
@@ -7110,6 +7151,7 @@ mod tests {
             Some(&taps),
             &ref_row_slot,
             None,
+            /* use_mrope */ false,
             NL,
         )
         .expect("legacy Path A forward");
@@ -8284,7 +8326,7 @@ mod tests {
         // width-4 verify span bootstrap (engine session 0/0 → core 1/1 == owner).
         let bootstrap = bootstrap_layerwise_rows(
             frontier as u32, 0, 0, 0, &[0, 1], NH as u32, KVH as u32, HD as u32,
-            budget_blocks, record_bytes, &[], width, None,
+            budget_blocks, record_bytes, &[], width, None, &[],
         )
         .expect("bootstrap rows");
         assert_eq!(
@@ -8486,7 +8528,7 @@ mod tests {
         let policy = ctl.layerwise_policy(frontier).expect("policy");
         let mut carrier = engine_carrier_rows(
             &mut gpu, &ctl, &policy, 0, 0, NL, NH, KVH, HD, CTX as u32, "qwen35",
-            width, None, &mut output, None, false,
+            width, None, &mut output, None, false, &[],
         )
         .expect("engine_carrier_rows")
         .expect("admitted carrier");
