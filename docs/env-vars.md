@@ -3,7 +3,7 @@
 **Owner:** environment-variable inventory (`docs/INDEX.md`).
 **Machine sources:** `HIPFIRE_*` token scan of Rust, Python, and shell sources under the repo (excluding `target/`, `.git/`, etc.).
 **Config schema owner:** [`CONFIG.md`](CONFIG.md) (`crates/hipfire-config/src/lib.rs` + `crates/hipfire-runtime/src/config.rs`).
-**Last checked:** 2026-07-31.
+**Last checked:** 2026-11-16.
 
 For persistent user configuration, prefer `hipfire config set ...` and
 `~/.hipfire/config.toml`. Schema-declared environment variables are retained as
@@ -1093,6 +1093,36 @@ All developer-only, read once at load through the `[developer]` namespace (`hipf
 | `HIPFIRE_RAON_RDA_SEGMENT` | **`1`**; `0` | With the chunked RDA core (`HIPFIRE_GATED_DELTA_VECTOR_CHUNKED`), an ordinary prefill chunk of more than 256 rows runs each RDA layer as consecutive 256-row segments (producer, chunked core, gated norm per segment, state and conv history chained through the in-place tensors) instead of three whole-chunk passes, so the planes the core consumes are still cache-resident and the core workspace stays small. Segments are whole C64 chunks, so every output and state is bit-identical to the single pass. `0` restores the single pass (`crates/hipfire-arch-raon/src/rda.rs`). |
 | `HIPFIRE_RAON_SHARED_FFN` | **unset → `qt44`**; `q8f16`, `bf16` | Quantizer only (`crates/hipfire-quantize/src/raon.rs`): storage of the always-active FFN weights (shared-expert gate/up/down of every MoE layer and the dense layer-0 gate/up/down). `q8f16` stores them as Q8F16 (qt3, group 32), `bf16` as source-exact BF16 (qt16); neither carries an AWQ sidecar, and the shared `down_proj` keeps physical K 1280 (zero-padded columns) for both. Recorded as `hipfire_raon.shared_ffn` in the artifact metadata (`q8f16`/`bf16`, or `<storage>:shared` / `<storage>:shared-gateup` / `<storage>:dense` for a partial-scope swap). An unknown value is a conversion error. `hipfire-quantize --raon-shared-ffn <q8f16\|bf16> --input <shipped.hfq> --raon-source <checkpoint dir> --output <out.hfq>` builds the same variant from a shipped qt44 artifact without re-running calibration; `--raon-shared-ffn-scope <all\|shared\|shared-gateup\|dense>` (default `all`) restricts it to the MoE layers' shared experts (or only their gate/up weights) or to the dense layer-0 MLP, and `--raon-shared-ffn-verify` takes the same scope flag. |
 | `HIPFIRE_RAON_TOKENIZER` | unset → test skips | Test-only: HF `tokenizer.json` path (or its directory) for the `#[ignore]`d Raon tokenizer HF-parity check in `crates/hipfire-runtime/src/tokenizer.rs`; never read by runtime code. |
+
+### KVMem host offload (serve, opt-in)
+
+KVMem keeps a small per-slot paged KV pool and spills the rest to a host store; layerwise recall, prefix pinning, checkpoints and content packs are opt-in subsystems on top of it. All knobs are read once at controller construction through the process snapshot (schema fields or `hipfire_config::developer_var`); a malformed or out-of-range value is a named error, never a silent fallback. Source: `crates/hipfire-arch-qwen35/src/kvmem_ctl.rs` unless noted.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HIPFIRE_KVMEM_BUDGET_TOKENS` | pool/slot minus headroom | Per-slot GPU residency budget in tokens (blocks = tokens/128, at least 2). Everything past it lives in the host store. |
+| `HIPFIRE_KVMEM_SINK_BLOCKS` / `HIPFIRE_KVMEM_RECENT_BLOCKS` | `1` / `1` | Always-resident sink/recent blocks kept by selection. |
+| `HIPFIRE_KVMEM_SELECT_INTERVAL` | `4` (clamp 1..256) | Blocks written between selection rounds. |
+| `HIPFIRE_KVMEM_GPU_HIGH_WATERMARK` / `HIPFIRE_KVMEM_GPU_LOW_WATERMARK` | unset (single threshold) | Residency hysteresis band as fractions of the budget; setting either enables it. |
+| `HIPFIRE_KVMEM_QUERY_SPAN` | `1` (1..512) | Retrieval query rows scored by page-softmax over a per-slot host Q ring; `1` is the single tapped row (byte-identical). |
+| `HIPFIRE_KVMEM_SELECT_METHOD` | `retrieval` | `retrieval` or `recency`; `h2o` is rejected until the attention-heat tap ships. |
+| `HIPFIRE_KVMEM_LRFU` / `_LRFU_LAMBDA` / `_LRFU_TOP` | `0` / `0.5` / `0.9` | Decaying heavy-hitter history replaces the raw retrieval score (requires `retrieval`). |
+| `HIPFIRE_KVMEM_BATCH_XFER` | `1` | Batched pinned-slab spill/restore; `0` is the per-page blocking path (byte-identical). |
+| `HIPFIRE_KVMEM_GQA_DECODE` | `1` | Native q8 GQA decode kernel; `0` is the generic route. |
+| `HIPFIRE_KVMEM_HOST_BYTES` | 16 GiB | Host KV storage account (RAM tier). |
+| `HIPFIRE_KVMEM_SPILL_DIR` / `HIPFIRE_KVMEM_SPILL_BYTES` | unset (RAM only) / 64 GiB | Disk spill tier directory and capacity (tiered storage instead of RAM-only). |
+| `HIPFIRE_KVMEM_RECALL_STRATEGY` | `legacy` | `legacy` (global page policy, default) or `layerwise` (per-layer selection with import/checkpoint semantics; fail-closed rejects the global policy knobs). |
+| `HIPFIRE_KVMEM_GEN_RESERVE` | `1024` | Generation reserve tokens added to the import capacity (`budget + reserve`). |
+| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_RAM_MIB` / `_DISK_MIB` / `_STAGING_MIB` / `_METADATA_MIB` / `_ACTIVATION_METADATA_MIB` | 64 / 32 / 8 / 1024 / 96 MiB | Layerwise activation quotas (ninfer seeds; malformed values are errors). |
+| `HIPFIRE_KVMEM_PREFIX_PIN` / `HIPFIRE_KVMEM_PREFIX_PIN_BYTES` | off / 512 MiB | KVMem-native cross-session prefix sharing; the bytes cap the DeltaNet checkpoint pool. |
+| `HIPFIRE_KVMEM_PREFIX_COVERAGE` / `HIPFIRE_KVMEM_PREFIX_COVERAGE_INTERVAL` | off / `1024` | Decode-side coverage checkpoint captures (endpoint freezes) and their token interval. |
+| `HIPFIRE_KVMEM_CHECKPOINT_POLICY` | unset (`spread` opt-in) | `spread` enables the coverage-retention policy below; unset keeps every cataloged checkpoint. |
+| `HIPFIRE_KVMEM_CHECKPOINT_COUNT` / `_MIB` / `_INTERVAL` / `_MIN_GAP` | `4` / `512` / `4096` / `0` | Retention caps for the spread policy: count, unique host bytes, frontier spacing, minimum gap. |
+| `HIPFIRE_KVMEM_CONTENT_GROUPS` | `0` (off, 0..1024) | Internal content groups in the prefix directory; whole-group LRU retirement and dedup before entry trimming. |
+| `HIPFIRE_KVMEM_CACHE_DIR` / `HIPFIRE_KVMEM_CACHE_BYTES` | unset / 2 GiB | Persistent content-pack tier (named `*.hkpack` files + DN sidecars). Must differ from `SPILL_DIR`; packs are the only persistent copy (single-tier). |
+| `HIPFIRE_KVMEM_CACHE_RAM_BYTES` | unset | Legacy second content account; no effect after single-tier (kept for old harnesses). |
+| `HIPFIRE_KVMEM_TRACE` / `_TRACE_PAGES` / `_TRACE_KEEP` | off | Per-step residency / picked-page / keep-set traces (diagnostics, zero effect on bytes). |
+| `HIPFIRE_KVMEM_VERIFY` / `HIPFIRE_KVMEM_TIME` / `HIPFIRE_KVMEM_TAP_COPY` | off / off / `1` | Page checksums + block-table readback, per-step timing lines, and the tap-copy kill switch (timing only). |
 
 ## Manual — tokenizer differential test (dev-only, not runtime)
 
@@ -2217,6 +2247,49 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_KLD_NGL` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/eval_gguf.rs | harness |
 | `HIPFIRE_KLD_TEACHER` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_KV` | crates/saddle-lab/examples/oracle_xcheck.rs | harness |
+| `HIPFIRE_KVMEM_BATCH_XFER` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_BUDGET_TOKENS` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_CACHE_BYTES` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_CACHE_DIR` | crates/hipfire-arch-qwen35/src/kvmem_prefix.rs, crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_CACHE_RAM_BYTES` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
+| `HIPFIRE_KVMEM_CHECKPOINT_COUNT` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_CHECKPOINT_INTERVAL` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | stable |
+| `HIPFIRE_KVMEM_CHECKPOINT_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_CHECKPOINT_MIN_GAP` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | stable |
+| `HIPFIRE_KVMEM_CHECKPOINT_POLICY` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | stable |
+| `HIPFIRE_KVMEM_CONTENT_GROUPS` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_GEN_RESERVE` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_GPU_HIGH` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
+| `HIPFIRE_KVMEM_GPU_HIGH_WATERMARK` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_GPU_LOW_WATERMARK` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_GQA_DECODE` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-arch-qwen35/src/forward_slots.rs | developer |
+| `HIPFIRE_KVMEM_HOST_BYTES` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_DISK_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | stable |
+| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | stable |
+| `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_RAM_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_LAYERWISE_METADATA_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | stable |
+| `HIPFIRE_KVMEM_LAYERWISE_STAGING_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | stable |
+| `HIPFIRE_KVMEM_LRFU` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_LRFU_LAMBDA` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_LRFU_TOP` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_PREFIX_COVERAGE` | crates/hipfire-arch-qwen35/src/serve_engine.rs | stable |
+| `HIPFIRE_KVMEM_PREFIX_COVERAGE_INTERVAL` | crates/hipfire-arch-qwen35/src/serve_engine.rs | stable |
+| `HIPFIRE_KVMEM_PREFIX_PIN` | crates/hipfire-arch-qwen35/src/kvmem_prefix.rs, crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_PREFIX_PIN_BYTES` | crates/hipfire-arch-qwen35/src/serve_engine.rs | stable |
+| `HIPFIRE_KVMEM_QUERY_SPAN` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_RECALL_STRATEGY` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_RECENT_BLOCKS` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | stable |
+| `HIPFIRE_KVMEM_SELECT_INTERVAL` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_SELECT_METHOD` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_SINK_BLOCKS` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | stable |
+| `HIPFIRE_KVMEM_SPILL_BYTES` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | stable |
+| `HIPFIRE_KVMEM_SPILL_DIR` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | stable |
+| `HIPFIRE_KVMEM_TAP_COPY` | crates/hipfire-arch-qwen35/src/kvmem_taps.rs | developer |
+| `HIPFIRE_KVMEM_TIME` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
+| `HIPFIRE_KVMEM_TRACE` | crates/hipfire-daemon/src/slots.rs, crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
+| `HIPFIRE_KVMEM_TRACE_KEEP` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
+| `HIPFIRE_KVMEM_TRACE_PAGES` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs | developer |
+| `HIPFIRE_KVMEM_VERIFY` | crates/hipfire-arch-qwen35/src/kvmem_ctl.rs, crates/hipfire-arch-qwen35/src/forward_slots.rs | developer |
 | `HIPFIRE_KV_ADAPTIVE` | crates/hipfire-arch-qwen35/src/carrier.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_KV_BACKEND` | crates/hipfire-loader/src/admission.rs, scripts/guard_gfx1201_baseline.py | developer |
 | `HIPFIRE_KV_BF16` | crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-dispatch/src/families/kv_tier.rs | developer |
