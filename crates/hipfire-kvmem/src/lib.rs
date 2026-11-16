@@ -1167,6 +1167,7 @@ mod ffi {
         pub fn hk_kv_snapshot_ready(snap: *const HkKvSnapshot) -> c_int;
         pub fn hk_kv_snapshot_missing_bytes(snap: *const HkKvSnapshot) -> u64;
         pub fn hk_kv_snapshot_metadata_bytes(snap: *const HkKvSnapshot) -> usize;
+        pub fn hk_kv_snapshot_origin_id(snap: *const HkKvSnapshot, block: usize) -> u64;
         pub fn hk_kv_snapshot_covers_packed(
             snap: *const HkKvSnapshot,
             blocks: u32,
@@ -2490,6 +2491,13 @@ impl KvSnapshot {
     pub fn metadata_bytes(&self) -> usize {
         unsafe { ffi::hk_kv_snapshot_metadata_bytes(self.ptr.as_ptr()) }
     }
+    /// Identity of one block origin (`SealedKvBlock` object), or 0. A capture
+    /// that inherited a previous snapshot's origin reports the same id.
+    pub fn origin_id(&self, block: usize) -> Option<u64> {
+        let id = unsafe { ffi::hk_kv_snapshot_origin_id(self.ptr.as_ptr(), block) };
+        (id != 0).then_some(id)
+    }
+
     /// Complete `blocks`×`layers` k+v record coverage (hipfire grid layout).
     pub fn covers_packed(&self, blocks: u32, layers: u32) -> bool {
         unsafe { ffi::hk_kv_snapshot_covers_packed(self.ptr.as_ptr(), blocks, layers) != 0 }
