@@ -276,6 +276,45 @@ impl ColdPackIndex {
         best
     }
 
+    /// G7 Stage E probe: the longest token-proven pack the media identity
+    /// gate rejected (`None` when the token-best pack is eligible or nothing
+    /// proves). Read-only — no LRU touch, no counters; trace evidence only.
+    pub fn probe_media_reject(
+        &self,
+        prompt: &[u32],
+        layout_id: u64,
+        media: Option<u64>,
+    ) -> Option<(u32, Option<u64>)> {
+        let mut best: Option<&ColdPack> = None;
+        for p in &self.packs {
+            if p.meta.layout_id != layout_id || p.meta.frontier as usize > prompt.len() {
+                continue;
+            }
+            if meta_media_eligible(
+                p.meta.frontier,
+                &p.meta.media_spans,
+                p.meta.media_digest,
+                media,
+            ) {
+                continue;
+            }
+            let f = p.meta.frontier as usize;
+            if prefix_fingerprint(&prompt[..f]) != p.fingerprint {
+                continue;
+            }
+            if prompt[..f] != p.meta.tokens[..] {
+                continue;
+            }
+            if best
+                .map(|b| p.meta.frontier > b.meta.frontier)
+                .unwrap_or(true)
+            {
+                best = Some(p);
+            }
+        }
+        best.map(|p| (p.meta.frontier, p.meta.media_digest))
+    }
+
     /// Delete the oldest packs until the index fits `max_bytes`. Returns the
     /// removed files so callers can log/metrics them.
     pub fn prune_to(&mut self, max_bytes: u64) -> Vec<std::path::PathBuf> {
@@ -773,6 +812,37 @@ impl PrefixCatalog {
 
     pub fn get(&self, id: u64) -> Option<&PrefixCheckpoint> {
         self.entries.iter().find(|e| e.id == id)
+    }
+
+    /// G7 Stage E probe: the longest token-proven checkpoint the media
+    /// identity gate rejected. Read-only — no LRU touch, no counters; trace
+    /// evidence for the cross-image miss gate.
+    pub fn probe_media_reject(
+        &self,
+        prompt: &[u32],
+        dst_layout: u64,
+        media: Option<u64>,
+    ) -> Option<(u32, Option<u64>)> {
+        let mut best: Option<&PrefixCheckpoint> = None;
+        for e in &self.entries {
+            if e.layout_id != dst_layout || e.frontier as usize > prompt.len() {
+                continue;
+            }
+            if e.media_eligible(media) {
+                continue;
+            }
+            let f = e.frontier as usize;
+            if prefix_fingerprint(&prompt[..f]) != e.fingerprint {
+                continue;
+            }
+            if prompt[..f] != e.prefix_tokens[..] {
+                continue;
+            }
+            if best.map(|b| e.frontier > b.frontier).unwrap_or(true) {
+                best = Some(e);
+            }
+        }
+        best.map(|e| (e.frontier, e.media_digest))
     }
 
     /// Catalog-wide host-byte accounting. `gross` sums every entry's
@@ -1371,6 +1441,73 @@ mod tests {
         t.media_spans = vec![(64, 128)];
         assert!(!t.media_eligible(Some(0xA)));
         assert!(!t.media_eligible(None));
+    }
+
+    /// G7 Stage E: the trace probe names the token-proven candidate that the
+    /// media identity gate refused, so a cross-image miss is attributable in
+    /// live logs (and is provably NOT a token-proof miss).
+    #[test]
+    fn media_probe_reports_identity_rejected_candidates() {
+        let st = storage();
+        let toks = tokens(256);
+        let layout = layout_fingerprint(&raw_config());
+        let mut cat = PrefixCatalog::new(4);
+        let mut a = checkpoint(&st, cat.mint_id(), 128, &toks[..128]);
+        a.media_digest = Some(0xA);
+        a.media_spans = vec![(64, 128)];
+        let (ida, _) = cat.insert_displacing(a).expect("insert a");
+        assert!(ida.is_some());
+        // Different image: the token proof matches, the media gate refuses.
+        assert_eq!(
+            cat.probe_media_reject(&toks[..128], layout, Some(0xB)),
+            Some((128, Some(0xA)))
+        );
+        // Text continuation (no media identity) is refused the same way.
+        assert_eq!(
+            cat.probe_media_reject(&toks[..128], layout, None),
+            Some((128, Some(0xA)))
+        );
+        // Same image (or an eligible text checkpoint) is not a rejection.
+        assert_eq!(cat.probe_media_reject(&toks[..128], layout, Some(0xA)), None);
+        // A broken token proof is a token miss, not a media rejection.
+        let mut bad = toks[..128].to_vec();
+        bad[7] ^= 1;
+        assert_eq!(cat.probe_media_reject(&bad, layout, Some(0xB)), None);
+    }
+
+    /// G7 Stage E: the cold-index probe mirrors the hot one (packs can carry
+    /// the media identity too, so a restart miss is attributable as well).
+    #[test]
+    fn media_probe_reports_cold_identity_rejects() {
+        let toks = tokens(128);
+        let layout = 0x5151_5151_5151_5151;
+        let meta = ContentPackMeta {
+            version: ContentPackMeta::VERSION,
+            layout_id: layout,
+            frontier: 128,
+            tokens: toks.clone(),
+            mean_tail: None,
+            group: 0,
+            original_query: None,
+            n_record_layers: LAYERS,
+            media_digest: Some(0xA),
+            media_spans: vec![(64, 128)],
+        };
+        let mut idx = ColdPackIndex::default();
+        idx.clock = 1;
+        idx.packs.push(ColdPack {
+            path: std::path::PathBuf::from("probe.hkpack"),
+            fingerprint: prefix_fingerprint(&toks),
+            meta,
+            bytes: 1,
+            stamp: 1,
+        });
+        assert_eq!(
+            idx.probe_media_reject(&toks, layout, Some(0xB)),
+            Some((128, Some(0xA)))
+        );
+        assert_eq!(idx.probe_media_reject(&toks, layout, Some(0xA)), None);
+        assert_eq!(idx.probe_media_reject(&toks, layout ^ 1, Some(0xB)), None);
     }
 
     /// 期3 G3 P1.1: the cold index scans pack files, proves by full token
