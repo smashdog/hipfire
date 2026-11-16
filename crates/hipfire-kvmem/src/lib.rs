@@ -132,6 +132,12 @@ struct HkPackedSnapshot {
     _private: [u8; 0],
 }
 
+/// Opaque `kvmem::KvSnapshot` handle (期3 G4).
+#[repr(C)]
+struct HkKvSnapshot {
+    _private: [u8; 0],
+}
+
 #[repr(C)]
 struct HkKvStore {
     _private: [u8; 0],
@@ -1100,6 +1106,26 @@ mod ffi {
         pub fn hk_packed_snapshot_destroy(snap: *mut HkPackedSnapshot);
         pub fn hk_packed_snapshot_entry_count(snap: *const HkPackedSnapshot) -> usize;
         pub fn hk_packed_snapshot_metadata_bytes(snap: *const HkPackedSnapshot) -> usize;
+
+        // 期3 G4: immutable core KvSnapshot over sealed packed records.
+        pub fn hk_raw_store_has_packed(st: *const HkRawStore, blocks: u32) -> c_int;
+        pub fn hk_raw_store_capture_snapshot(
+            st: *const HkRawStore,
+            blocks: u32,
+            previous: *const HkKvSnapshot,
+        ) -> *mut HkKvSnapshot;
+        pub fn hk_kv_snapshot_destroy(snap: *mut HkKvSnapshot);
+        pub fn hk_kv_snapshot_bytes(snap: *const HkKvSnapshot) -> u64;
+        pub fn hk_kv_snapshot_block_count(snap: *const HkKvSnapshot) -> usize;
+        pub fn hk_kv_snapshot_span_count(snap: *const HkKvSnapshot) -> usize;
+        pub fn hk_kv_snapshot_ready(snap: *const HkKvSnapshot) -> c_int;
+        pub fn hk_kv_snapshot_missing_bytes(snap: *const HkKvSnapshot) -> u64;
+        pub fn hk_kv_snapshot_metadata_bytes(snap: *const HkKvSnapshot) -> usize;
+        pub fn hk_kv_snapshot_covers_packed(
+            snap: *const HkKvSnapshot,
+            blocks: u32,
+            layers: u32,
+        ) -> c_int;
 
         // P4.3 prefix reuse anchors (core prefix_checkpoint).
         pub fn hk_prefix_anchor(
@@ -2233,6 +2259,30 @@ impl RawStore {
         std::mem::forget(snapshot);
         checked(|| unsafe { ffi::hk_raw_store_import_packed(p, snap, metadata_limit) })
     }
+
+    /// 期3 G4: any sealed packed record in blocks `[0, blocks)`.
+    pub fn has_packed(&self, blocks: u32) -> bool {
+        unsafe { ffi::hk_raw_store_has_packed(self.ptr.as_ptr(), blocks) != 0 }
+    }
+
+    /// 期3 G4: capture one immutable core `KvSnapshot` over the sealed packed
+    /// records of blocks `[0, blocks)` (block-major, layer-major, K then V).
+    /// `previous` lets the capture inherit a block origin when the record's
+    /// storage identity matches (no byte copy, quota charged once). The caller
+    /// has drained native writers — `fork_prefix` sealed the records.
+    pub fn capture_snapshot(
+        &self,
+        blocks: u32,
+        previous: Option<&KvSnapshot>,
+    ) -> Result<KvSnapshot> {
+        clear_error();
+        let prev = previous.map_or(ptr::null(), |s| s.ptr.as_ptr() as *const _);
+        let ptr =
+            unsafe { ffi::hk_raw_store_capture_snapshot(self.ptr.as_ptr(), blocks, prev) };
+        NonNull::new(ptr)
+            .map(|ptr| KvSnapshot { ptr })
+            .ok_or_else(err_from_last)
+    }
 }
 
 /// P4.3 packed-record selection descriptor (mirrors `hk_packed_selection`).
@@ -2261,6 +2311,46 @@ impl PackedSnapshot {
 impl Drop for PackedSnapshot {
     fn drop(&mut self) {
         unsafe { ffi::hk_packed_snapshot_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+/// 期3 G4: one immutable, native-proven KV image (core `KvSnapshot`): sealed
+/// block origins + exact spans. Copies of the handle are not needed; the
+/// catalog owns it alongside the fast `fork_prefix` path.
+pub struct KvSnapshot {
+    ptr: NonNull<HkKvSnapshot>,
+}
+
+impl KvSnapshot {
+    /// Total image bytes (the mapped payload; shared with the source records).
+    pub fn bytes(&self) -> u64 {
+        unsafe { ffi::hk_kv_snapshot_bytes(self.ptr.as_ptr()) }
+    }
+    pub fn block_count(&self) -> usize {
+        unsafe { ffi::hk_kv_snapshot_block_count(self.ptr.as_ptr()) }
+    }
+    pub fn span_count(&self) -> usize {
+        unsafe { ffi::hk_kv_snapshot_span_count(self.ptr.as_ptr()) }
+    }
+    pub fn ready(&self) -> bool {
+        unsafe { ffi::hk_kv_snapshot_ready(self.ptr.as_ptr()) != 0 }
+    }
+    pub fn missing_bytes(&self) -> u64 {
+        unsafe { ffi::hk_kv_snapshot_missing_bytes(self.ptr.as_ptr()) }
+    }
+    /// Manifest + origin metadata (payload is accounted by the source store).
+    pub fn metadata_bytes(&self) -> usize {
+        unsafe { ffi::hk_kv_snapshot_metadata_bytes(self.ptr.as_ptr()) }
+    }
+    /// Complete `blocks`×`layers` k+v record coverage (hipfire grid layout).
+    pub fn covers_packed(&self, blocks: u32, layers: u32) -> bool {
+        unsafe { ffi::hk_kv_snapshot_covers_packed(self.ptr.as_ptr(), blocks, layers) != 0 }
+    }
+}
+
+impl Drop for KvSnapshot {
+    fn drop(&mut self) {
+        unsafe { ffi::hk_kv_snapshot_destroy(self.ptr.as_ptr()) };
     }
 }
 

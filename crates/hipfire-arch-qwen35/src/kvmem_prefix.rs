@@ -129,6 +129,12 @@ pub struct PrefixCheckpoint {
     /// records are sealed shared sources; mean-K is private to this archive
     /// and re-forked private into every branch. Never fed after freeze.
     canonical: RawStore,
+    /// 期3 G4: the same canonical bytes as a core `KvSnapshot` (native-proven
+    /// sealed block origins + exact spans). The fast reuse path stays
+    /// `fork_prefix`; the snapshot is the catalog-visible immutable object the
+    /// G2/G3 directories share. `None` when the store had no packed archive
+    /// (host-only fixtures) — production q8/non-q8 archives always carry one.
+    pub kv_snapshot: Option<hipfire_kvmem::KvSnapshot>,
     /// 期4: DFlash2 draft conditioning image captured with this checkpoint
     /// (`None` for AR/MTP sessions, non-windowed drafts, or a frontier that
     /// did not equal the draft's live seeded frontier — those reseed).
@@ -163,6 +169,7 @@ impl PrefixCheckpoint {
             gpu_pages: Vec::new(),
             original_query: None,
             canonical,
+            kv_snapshot: None,
             draft_image: None,
             last_used: 0,
         }
@@ -172,6 +179,7 @@ impl PrefixCheckpoint {
     /// optional draft image).
     pub fn host_bytes(&self) -> u64 {
         self.canonical.payload_bytes()
+            + self.kv_snapshot.as_ref().map_or(0, |snap| snap.metadata_bytes() as u64)
             + self.draft_image.as_ref().map_or(0, |img| img.nbytes())
     }
 
@@ -538,6 +546,7 @@ mod tests {
             gpu_pages: Vec::new(),
             original_query: None,
             canonical,
+            kv_snapshot: None,
             draft_image: None,
             last_used: 0,
         }
