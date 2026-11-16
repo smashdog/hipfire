@@ -940,6 +940,10 @@ pub struct KvMemCtl {
     prefix_hits_total: u64,
     prefix_misses_total: u64,
     prefix_evictions_total: u64,
+    /// G3 follow-up: hot catalog hits (never read a pack) and reuse
+    /// conversions that restored a demoted/restart entry from the archive.
+    prefix_catalog_hits_total: u64,
+    prefix_restore_hits_total: u64,
     /// G3 follow-up: admission-pressure residency demotions (entry retained,
     /// pinned pages dropped; Layerwise restores them from the archive).
     prefix_demotions_total: u64,
@@ -1337,6 +1341,8 @@ impl KvMemCtl {
             prefix_hits_total: 0,
             prefix_misses_total: 0,
             prefix_evictions_total: 0,
+            prefix_catalog_hits_total: 0,
+            prefix_restore_hits_total: 0,
             prefix_demotions_total: 0,
             draft_images_total: 0,
             draft_image_hits_total: 0,
@@ -1787,6 +1793,7 @@ impl KvMemCtl {
     pub fn prefix_lookup(&mut self, prompt: &[u32]) -> Option<u64> {
         let layout = layout_fingerprint(&self.raw_cfg);
         if let Some(hit) = self.prefix_catalog.lookup(prompt, layout) {
+            self.prefix_catalog_hits_total += 1;
             self.prefix_hits_total += 1;
             return Some(hit);
         }
@@ -1904,6 +1911,7 @@ impl KvMemCtl {
             .prefix_catalog
             .lookup_at_most(prompt, layout_fingerprint(&self.raw_cfg), max_frontier);
         if hit.is_some() {
+            self.prefix_catalog_hits_total += 1;
             self.prefix_hits_total += 1;
         } else {
             self.prefix_misses_total += 1;
@@ -1927,6 +1935,12 @@ impl KvMemCtl {
     }
     pub fn note_draft_image_miss(&mut self) {
         self.draft_image_misses_total += 1;
+    }
+
+    /// G3 follow-up: a reuse conversion proceeded without pinned pages and
+    /// restored them from the sealed archive (demoted or restart entry).
+    pub fn note_prefix_restore_hit(&mut self) {
+        self.prefix_restore_hits_total += 1;
     }
 
     /// Mutable access (engine attaches `gpu_pages` after sealing + cache refs).
@@ -2000,6 +2014,8 @@ impl KvMemCtl {
             prefix_misses: self.prefix_misses_total,
             prefix_evictions: self.prefix_evictions_total,
             prefix_demotions: self.prefix_demotions_total,
+            prefix_catalog_hits: self.prefix_catalog_hits_total,
+            prefix_restore_hits: self.prefix_restore_hits_total,
             content_groups: self.prefix_catalog.group_count() as u64,
             content_retirements: self.content_retirements_total,
             content_cache_bytes: self
@@ -2010,6 +2026,7 @@ impl KvMemCtl {
             content_packs: self.cold_packs.len() as u64,
             content_pack_bytes: self.cold_packs.total_bytes(),
             cold_pack_hits: self.cold_pack_hits_total,
+            cold_pack_misses: self.cold_pack_misses_total,
             draft_images: self.draft_images_total,
             draft_image_hits: self.draft_image_hits_total,
             draft_image_misses: self.draft_image_misses_total,
