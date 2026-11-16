@@ -250,3 +250,46 @@ fn copy_prefix_to_reproduces_packed_bytes_and_mean_and_separates_accounts() {
         .expect("dst write");
     assert_eq!(a.charged_bytes(), before, "writes stay in the destination account");
 }
+
+#[test]
+fn prefix_pack_roundtrips_packed_bytes_mean_and_metadata() {
+    let dir = std::env::temp_dir().join(format!("kvmem-pack-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join("p.hkpack");
+    let a = Storage::new_ram(1 << 30).expect("a");
+    let src = RawStore::new(raw_config(), Some(&a)).expect("src");
+    fill(&src, 3);
+    let canonical = src.fork_prefix(2 * BLOCK).expect("fork");
+    let meta = b"proof:frontier=256,layout=7,group=42".to_vec();
+    canonical.write_prefix_pack(2, &path, &meta).expect("write pack");
+    let info = RawStore::prefix_pack_info(&path).expect("info");
+    assert_eq!(info.blocks, 2);
+    assert_eq!(info.n_layer, LAYERS);
+    assert_eq!(info.block_tokens, BLOCK);
+    assert_eq!(info.meta_bytes, meta.len() as u64);
+    assert!(info.file_bytes > 0);
+
+    let b = Storage::new_ram(1 << 30).expect("b");
+    let dst = RawStore::new(raw_config(), Some(&b)).expect("dst");
+    let loaded = dst.read_prefix_pack(&path).expect("read pack");
+    assert_eq!(loaded, meta);
+    assert!(!dst.has_k_gpu(2, 0, BLOCK), "only two blocks persisted");
+    for blk in 0..2 {
+        for il in 0..LAYERS {
+            let mut x = vec![0u8; BLOCK as usize * ROW_BYTES];
+            let mut y = vec![0u8; BLOCK as usize * ROW_BYTES];
+            assert!(canonical.copy_k_gpu(blk, il, &mut x, BLOCK));
+            assert!(dst.copy_k_gpu(blk, il, &mut y, BLOCK));
+            assert_eq!(x, y, "K block {blk} layer {il}");
+            assert!(canonical.copy_v_gpu(blk, il, &mut x, BLOCK));
+            assert!(dst.copy_v_gpu(blk, il, &mut y, BLOCK));
+            assert_eq!(x, y, "V block {blk} layer {il}");
+            let mut m0 = vec![0f32; K_WIDTH];
+            let mut m1 = vec![0f32; K_WIDTH];
+            canonical.mean_k(blk, il, &mut m0);
+            dst.mean_k(blk, il, &mut m1);
+            assert_eq!(m0, m1, "Mean-K block {blk} layer {il}");
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
