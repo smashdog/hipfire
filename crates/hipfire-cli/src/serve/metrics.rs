@@ -689,6 +689,24 @@ impl Metrics {
                     "Content-cache disk-tier bytes.",
                     s.kvmem.content_cache_disk_bytes as f64,
                 );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_content_packs",
+                    "Persistent content pack files.",
+                    s.kvmem.content_packs as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_content_pack_bytes",
+                    "Persistent content pack bytes.",
+                    s.kvmem.content_pack_bytes as f64,
+                );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_cold_pack_hits_total",
+                    "Prefix lookups served by an on-disk content pack.",
+                    s.kvmem.cold_pack_hits,
+                );
             }
         }
 
@@ -1111,6 +1129,7 @@ mod tests {
                 "draft_images": 2, "draft_image_hits": 1, "draft_image_misses": 1,
                 "content_groups": 2, "content_retirements": 1,
                 "content_cache_bytes": 4096, "content_cache_disk_bytes": 2048,
+                "content_packs": 3, "content_pack_bytes": 8192, "cold_pack_hits": 1,
             },
         });
         let kvmeta = ServeMeta {
@@ -1143,6 +1162,9 @@ mod tests {
             "hipfire_kvmem_content_retirements_total 1\n",
             "hipfire_kvmem_content_cache_bytes 4096\n",
             "hipfire_kvmem_content_cache_disk_bytes 2048\n",
+            "hipfire_kvmem_content_packs 3\n",
+            "hipfire_kvmem_content_pack_bytes 8192\n",
+            "hipfire_kvmem_cold_pack_hits_total 1\n",
         ] {
             assert!(out.contains(sample), "{sample}: {out}");
         }

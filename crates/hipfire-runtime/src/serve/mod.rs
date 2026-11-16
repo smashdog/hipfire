@@ -255,6 +255,10 @@ pub struct KvMemStats {
     /// 期3 G3-SSD: content-cache account bytes (charged) and its disk tier.
     pub content_cache_bytes: u64,
     pub content_cache_disk_bytes: u64,
+    /// 期3 G3 P1.1: persistent pack files and their bytes; cold pack hits.
+    pub content_packs: u64,
+    pub content_pack_bytes: u64,
+    pub cold_pack_hits: u64,
 }
 
 /// Speculative-decoding telemetry (期4, KVMem/nInfer `speculative.hpp`
