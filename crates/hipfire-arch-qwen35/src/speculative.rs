@@ -2025,6 +2025,140 @@ impl DeltaNetSnapshot {
         total
     }
 
+    // ── 期3 G3 P1.1 (dn-persist): host image ────────────────────────────
+    /// One DN state image (LE): magic u32, version u32, shape_fp u64,
+    /// n_fams u32 (4), n_bufs u32, sizes u64×n_bufs, then the payload
+    /// concatenated family-major. The shape fingerprint validates every
+    /// buffer length before any upload.
+    const DN_IMAGE_MAGIC: u32 = 0x4e444b48; // "HKDN"
+    const DN_IMAGE_VERSION: u32 = 1;
+
+    fn dn_image_fp(sizes: &[u64]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &s in sizes {
+            h ^= s;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        h
+    }
+
+    fn dn_image_export(gpu: &Gpu, fams: &[&[&DeviceBuffer]]) -> Result<Vec<u8>, String> {
+        let sizes: Vec<u64> = fams
+            .iter()
+            .flat_map(|f| f.iter().map(|b| b.size() as u64))
+            .collect();
+        let fp = Self::dn_image_fp(&sizes);
+        let total: usize = sizes.iter().map(|s| *s as usize).sum();
+        let mut out = Vec::with_capacity(20 + sizes.len() * 8 + total);
+        out.extend_from_slice(&Self::DN_IMAGE_MAGIC.to_le_bytes());
+        out.extend_from_slice(&Self::DN_IMAGE_VERSION.to_le_bytes());
+        out.extend_from_slice(&fp.to_le_bytes());
+        out.extend_from_slice(&(fams.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(sizes.len() as u32).to_le_bytes());
+        for s in &sizes {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        for fam in fams {
+            for b in fam.iter() {
+                let mut buf = vec![0u8; b.size()];
+                gpu.hip
+                    .memcpy_dtoh(&mut buf, b)
+                    .map_err(|e| format!("dn image dtoh: {e:?}"))?;
+                out.extend_from_slice(&buf);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Host image of this snapshot's device state (checkpoint pool blobs).
+    pub fn export_host(&self, gpu: &Gpu) -> Result<Vec<u8>, String> {
+        let m: Vec<&DeviceBuffer> = self.s_matrix_bufs.iter().collect();
+        let sc: Vec<&DeviceBuffer> = self.s_scale_bufs.iter().collect();
+        let cv: Vec<&DeviceBuffer> = self.conv_state_bufs.iter().collect();
+        let ef: Vec<&DeviceBuffer> = self.s_ef_residual_bufs.iter().collect();
+        let fams: Vec<&[&DeviceBuffer]> = vec![&m[..], &sc[..], &cv[..], &ef[..]];
+        Self::dn_image_export(gpu, &fams)
+    }
+
+    /// Host image of a LIVE DN state (freeze-time capture; the live state sits
+    /// exactly at the checkpoint boundary).
+    pub fn export_host_from_state(gpu: &Gpu, state: &DeltaNetState) -> Result<Vec<u8>, String> {
+        let m: Vec<&DeviceBuffer> = state.s_matrices.iter().map(|t| &t.buf).collect();
+        let sc: Vec<&DeviceBuffer> = state.s_scales.iter().map(|t| &t.buf).collect();
+        let cv: Vec<&DeviceBuffer> = state.conv_states.iter().map(|t| &t.buf).collect();
+        let ef: Vec<&DeviceBuffer> = state.s_ef_residual.iter().map(|t| &t.buf).collect();
+        let fams: Vec<&[&DeviceBuffer]> = vec![&m[..], &sc[..], &cv[..], &ef[..]];
+        Self::dn_image_export(gpu, &fams)
+    }
+
+    /// Load a host image into this snapshot (allocated with matching shapes).
+    pub fn import_host(&mut self, gpu: &Gpu, bytes: &[u8]) -> Result<(), String> {
+        let mut cur = 0usize;
+        let mut take = |n: usize| -> Result<&[u8], String> {
+            if n > bytes.len() - cur {
+                return Err("dn image truncated".to_string());
+            }
+            let s = &bytes[cur..cur + n];
+            cur += n;
+            Ok(s)
+        };
+        let le32 = |b: &[u8]| u32::from_le_bytes(b.try_into().expect("4 bytes"));
+        let le64 = |b: &[u8]| u64::from_le_bytes(b.try_into().expect("8 bytes"));
+        if le32(take(4)?) != Self::DN_IMAGE_MAGIC || le32(take(4)?) != Self::DN_IMAGE_VERSION {
+            return Err("dn image header".to_string());
+        }
+        let fp = le64(take(8)?);
+        let n_fams = le32(take(4)?) as usize;
+        let n_bufs = le32(take(4)?) as usize;
+        if n_fams != 4 {
+            return Err(format!("dn image families {n_fams}"));
+        }
+        let mut sizes = Vec::with_capacity(n_bufs);
+        for _ in 0..n_bufs {
+            sizes.push(le64(take(8)?));
+        }
+        if Self::dn_image_fp(&sizes) != fp {
+            return Err("dn image shape fingerprint".to_string());
+        }
+        let mut expect: Vec<u64> = Vec::new();
+        for fam in [
+            &self.s_matrix_bufs,
+            &self.s_scale_bufs,
+            &self.conv_state_bufs,
+            &self.s_ef_residual_bufs,
+        ] {
+            for b in fam.iter() {
+                expect.push(b.size() as u64);
+            }
+        }
+        if expect != sizes {
+            return Err("dn image shape mismatch".to_string());
+        }
+        let mut off = cur;
+        let mut put = |b: &DeviceBuffer, off: &mut usize| -> Result<(), String> {
+            let end = *off + b.size();
+            if end > bytes.len() {
+                return Err("dn image payload truncated".to_string());
+            }
+            gpu.hip
+                .memcpy_htod(b, &bytes[*off..end])
+                .map_err(|e| format!("dn image htod: {e:?}"))?;
+            *off = end;
+            Ok(())
+        };
+        for fam in [
+            &self.s_matrix_bufs,
+            &self.s_scale_bufs,
+            &self.conv_state_bufs,
+            &self.s_ef_residual_bufs,
+        ] {
+            for b in fam.iter() {
+                put(b, &mut off)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Copy this snapshot's device buffers into `dst` (device-to-device).
     /// `dst` must have been allocated with matching shapes (e.g. via
     /// [`DeltaNetSnapshot::new_for`] against the same state). Used by the

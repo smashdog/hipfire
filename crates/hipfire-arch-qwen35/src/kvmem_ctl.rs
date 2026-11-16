@@ -1692,7 +1692,7 @@ impl KvMemCtl {
         // 期3 G3 P1.1: persist the canonical prefix as a pack file. Failure
         // never blocks the freeze (persistence is an optional tier); the byte
         // cap prunes the oldest packs.
-        if let Some(dir) = self.cold_dir.clone() {
+        if let Some(dir) = self.cold_dir.clone().filter(|_| st.fed == frontier) {
             let meta = ContentPackMeta {
                 version: ContentPackMeta::VERSION,
                 layout_id,
@@ -1716,6 +1716,7 @@ impl KvMemCtl {
                 });
             match written {
                 Ok(()) => {
+                    entry.pack_path = Some(path.clone());
                     if !self.cold_packs.contains_path(&path) {
                         let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                         self.cold_packs.insert(ColdPack {
@@ -1873,6 +1874,7 @@ impl KvMemCtl {
         entry.group = meta.group;
         entry.kv_snapshot = kv_snapshot;
         entry.canonical_on_content = on_content;
+        entry.pack_path = Some(pack.path.clone());
         let (inserted, displaced) = if self.content_groups > 0 && entry.group != 0 {
             let (id, displaced, _deduped) = self
                 .prefix_catalog
@@ -2183,6 +2185,12 @@ impl KvMemCtl {
     /// identity). `None` for checkpoints frozen before a proven span existed.
     pub fn prefix_original_query(&self, id: u64) -> Option<(u64, u64)> {
         self.prefix_catalog.get(id).and_then(|c| c.original_query)
+    }
+
+    /// 期3 G3 P1.1: the pack file backing a cataloged checkpoint (the DN
+    /// sidecar lives beside it as `<pack>.dn`).
+    pub fn prefix_pack_path(&self, id: u64) -> Option<std::path::PathBuf> {
+        self.prefix_catalog.get(id).and_then(|c| c.pack_path.clone())
     }
 
     /// Host-store length of `slot` (tokens whose statistics are recorded).
