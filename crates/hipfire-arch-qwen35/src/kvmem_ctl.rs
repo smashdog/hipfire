@@ -1528,6 +1528,28 @@ impl KvMemCtl {
             .raw
             .mean_checkpoint(frontier)
             .map_err(|e| format!("kvmem freeze_prefix mean checkpoint: {e}"))?;
+        // 期3 G4: the canonical side is also the core `KvSnapshot` over the
+        // sealed packed records `fork_prefix` just shared (block-major,
+        // layer-major, K then V). `fork_prefix` stays the fast reuse path; the
+        // snapshot is the catalog-visible immutable object the G2/G3
+        // directories share. Host-only fixtures without a packed archive carry
+        // no snapshot (missing packed records are not an error there).
+        let blocks = frontier / KV_BLOCK_TOKENS as u32;
+        let kv_snapshot = if st.raw.has_packed(blocks) {
+            let snapshot = st
+                .raw
+                .capture_snapshot(blocks, None)
+                .map_err(|e| format!("kvmem freeze_prefix snapshot: {e}"))?;
+            if !snapshot.covers_packed(blocks, self.n_record_layers as u32) {
+                return Err(format!(
+                    "kvmem freeze_prefix snapshot: incomplete {blocks}×{} packed grid",
+                    self.n_record_layers
+                ));
+            }
+            Some(snapshot)
+        } else {
+            None
+        };
         let id = self.prefix_catalog.mint_id();
         let mut entry = PrefixCheckpoint::new(
             id,
@@ -1539,6 +1561,7 @@ impl KvMemCtl {
             canonical,
         );
         entry.original_query = original_query;
+        entry.kv_snapshot = kv_snapshot;
         let (inserted, displaced) = self
             .prefix_catalog
             .insert_displacing(entry)

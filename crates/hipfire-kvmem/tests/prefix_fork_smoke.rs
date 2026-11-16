@@ -169,3 +169,38 @@ fn prefix_restore_limit_arithmetic() {
     // eval_end 0 stays 0 (no subtraction underflow).
     assert_eq!(prefix_restore_limit(0, 0, 0, true), 0);
 }
+#[test]
+fn capture_snapshot_covers_the_sealed_packed_grid() {
+    let storage = Storage::new_ram(1 << 30).expect("storage");
+    let raw = RawStore::new(raw_config(), Some(&storage)).expect("raw");
+    fill(&raw, 3);
+    assert!(raw.has_packed(2));
+    // The freeze contract seals the records via fork_prefix; capture that
+    // canonical prefix (block-major, layer-major, K then V).
+    let canonical = raw.fork_prefix(2 * BLOCK).expect("fork");
+    let snap = canonical.capture_snapshot(2, None).expect("capture");
+    assert!(snap.ready());
+    assert_eq!(snap.block_count(), (2 * LAYERS * 2) as usize);
+    assert_eq!(snap.span_count(), snap.block_count());
+    assert!(snap.covers_packed(2, LAYERS));
+    assert!(!snap.covers_packed(2, LAYERS + 1));
+    let per_record = BLOCK as u64 * ROW_BYTES as u64;
+    assert_eq!(snap.bytes(), (2 * LAYERS) as u64 * 2 * per_record);
+    assert!(snap.metadata_bytes() > 0);
+    assert_eq!(snap.missing_bytes(), 0);
+    // Origin inheritance: re-capturing the same sealed records reuses the
+    // proven origins (same grid and bytes, no payload copy).
+    let snap2 = canonical.capture_snapshot(2, Some(&snap)).expect("capture 2");
+    assert!(snap2.covers_packed(2, LAYERS));
+    assert_eq!(snap2.bytes(), snap.bytes());
+}
+
+#[test]
+fn snapshot_capture_refuses_a_store_without_packed_records() {
+    let storage = Storage::new_ram(1 << 20).expect("storage");
+    let raw = RawStore::new(raw_config(), Some(&storage)).expect("raw");
+    let k: Vec<f32> = (0..BLOCK as usize * K_WIDTH).map(|i| i as f32).collect();
+    raw.write_layer_mean_k(0, BLOCK, 0, &k).expect("mean k");
+    assert!(!raw.has_packed(1));
+    assert!(raw.capture_snapshot(1, None).is_err());
+}
