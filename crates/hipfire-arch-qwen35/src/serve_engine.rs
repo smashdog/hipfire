@@ -812,6 +812,18 @@ struct SpecCounters {
     fallback: u64,
 }
 
+/// 期3 G3: stable internal content group from the conversation identity.
+/// Fairness hint only (never a reuse proof); an empty convo is unknown (0).
+fn convo_group(convo: &[u64]) -> u64 {
+    if convo.is_empty() {
+        return 0;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    convo.hash(&mut h);
+    h.finish()
+}
+
 struct Rig {
     gpu: Gpu,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -8810,11 +8822,11 @@ fn admit(
                             // `begin_request` decides whether the first
                             // Layerwise step must re-score (Query) or may keep
                             // the already-effective selection.
-                            let _ = rig
-                                .model
-                                .kvmem
-                                .as_mut()
-                                .map(|ctl| ctl.set_request_query(slot.0, req.query));
+                            let _ = rig.model.kvmem.as_mut().map(|ctl| {
+                                ctl.set_request_query(slot.0, req.query).and_then(|_| {
+                                    ctl.set_request_group(slot.0, convo_group(&req.convo))
+                                })
+                            });
                             let fed = rig
                                 .model
                                 .kvmem
@@ -9287,12 +9299,15 @@ fn admit(
         // 期2.3: the fresh session's question identity (the reuse import and
         // any later checkpoint freeze both read it). reset_slot cleared the
         // previous session's spans — this is the first request of a new one.
-        if let Err(e) = ctl.set_request_query(slot.0, req.query) {
+        let request_meta = ctl
+            .set_request_query(slot.0, req.query)
+            .and_then(|_| ctl.set_request_group(slot.0, convo_group(&req.convo)));
+        if let Err(e) = request_meta {
             let _ = send_event(
                 &req.reply,
                 Event::Rejected {
                     class: RejectClass::Internal,
-                    reason: format!("kvmem query span: {e}"),
+                    reason: format!("kvmem request metadata: {e}"),
                 },
             );
             rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
@@ -11236,5 +11251,18 @@ mod speculative_contract_tests {
         assert_eq!(dst.requests, 3);
         assert_eq!(dst.drafted_tokens, 15);
         assert_eq!(dst.accepted_tokens, 2);
+    }
+}
+
+#[cfg(test)]
+mod convo_group_tests {
+    /// 期3 G3: the conversation-lineage hash is stable per convo and empty is
+    /// the unknown group (independent, never merged).
+    #[test]
+    fn convo_group_is_stable_and_empty_is_unknown() {
+        assert_eq!(super::convo_group(&[]), 0);
+        let a = vec![1u64, 2, 3, 4];
+        assert_eq!(super::convo_group(&a), super::convo_group(&a));
+        assert_ne!(super::convo_group(&a), super::convo_group(&[1, 2, 3, 5]));
     }
 }

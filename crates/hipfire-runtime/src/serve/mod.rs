@@ -248,6 +248,10 @@ pub struct KvMemStats {
     pub draft_images: u64,
     pub draft_image_hits: u64,
     pub draft_image_misses: u64,
+    /// 期3 G3: distinct content groups retained in the prefix directory.
+    pub content_groups: u64,
+    /// Entries retired by the group-aware publication plan.
+    pub content_retirements: u64,
 }
 
 /// Speculative-decoding telemetry (期4, KVMem/nInfer `speculative.hpp`

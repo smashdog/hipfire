@@ -665,6 +665,18 @@ impl Metrics {
                     "Prefix reuses with no restorable DFlash2 draft image (draft reseeds).",
                     s.kvmem.draft_image_misses,
                 );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_content_groups",
+                    "Distinct content groups retained in the prefix directory.",
+                    s.kvmem.content_groups as f64,
+                );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_content_retirements_total",
+                    "Prefix entries retired by the group-aware publication plan.",
+                    s.kvmem.content_retirements,
+                );
             }
         }
 
@@ -1085,6 +1097,7 @@ mod tests {
                 "prefix_freezes": 5, "prefix_hits": 4,
                 "prefix_misses": 6, "prefix_evictions": 1,
                 "draft_images": 2, "draft_image_hits": 1, "draft_image_misses": 1,
+                "content_groups": 2, "content_retirements": 1,
             },
         });
         let kvmeta = ServeMeta {
@@ -1113,6 +1126,8 @@ mod tests {
             "hipfire_kvmem_draft_images_total 2\n",
             "hipfire_kvmem_draft_image_hits_total 1\n",
             "hipfire_kvmem_draft_image_misses_total 1\n",
+            "hipfire_kvmem_content_groups 2\n",
+            "hipfire_kvmem_content_retirements_total 1\n",
         ] {
             assert!(out.contains(sample), "{sample}: {out}");
         }
