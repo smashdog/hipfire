@@ -1424,6 +1424,13 @@ impl KvMemCtl {
         self.budget_blocks
     }
 
+    /// Always-resident sink pages (`HIPFIRE_KVMEM_SINK_BLOCKS`). The layerwise
+    /// Query selection charges these inside the same budget as any mandatory
+    /// (media) pins, so an admission check must add them.
+    pub fn sink_blocks(&self) -> usize {
+        self.kv_cfg.sink_blocks as usize
+    }
+
     /// P2.2a: generation reserve R (ninfer `reserve_tokens`).
     pub fn gen_reserve(&self) -> u64 {
         self.gen_reserve

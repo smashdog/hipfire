@@ -2776,6 +2776,17 @@ fn forward_scratch_layers(
 /// Dense-FFN models only: the MoE layers keep the slots engine's own MoE
 /// kernels, and the caller gates on `config.num_experts == 0`.
 #[allow(clippy::too_many_arguments)]
+/// True when any layer carries an escha-trellis container. Those dense models
+/// lower the paged decode to the coarse-super-op program executor, whose decode
+/// arm has no M-RoPE path (VL stays on the Legacy slots ladder).
+pub(crate) fn has_escha_layers(weights: &Qwen35Weights) -> bool {
+    weights.layers.iter().any(|layer| match layer {
+        LayerWeights::DeltaNet(l) => l.escha.is_some(),
+        LayerWeights::FullAttn(l) => l.escha.is_some(),
+        _ => false,
+    })
+}
+
 pub(crate) fn forward_scratch_layers_paged(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -2788,6 +2799,7 @@ pub(crate) fn forward_scratch_layers_paged(
     kvmem_taps: Option<&crate::kvmem_taps::KvMemTaps>,
     row_slot: &GpuTensor,
     mut layerwise: crate::LayerwiseFwd<'_, '_>,
+    use_mrope: bool,
     layer_end: usize,
 ) -> HipResult<()> {
     // Escha-trellis dense layers cannot run their projections through the
@@ -2797,13 +2809,16 @@ pub(crate) fn forward_scratch_layers_paged(
     // escha_run_proj/escha_run_resid. The attention core is projection-agnostic
     // and threads `paged`, so the paged KVMem Q8_0 write + GQA tile are
     // identical either way. Non-escha dense models (MQ/Bonsai) keep the
-    // certified dispatch path below untouched.
-    let is_escha = weights.layers.iter().any(|layer| match layer {
-        LayerWeights::DeltaNet(l) => l.escha.is_some(),
-        LayerWeights::FullAttn(l) => l.escha.is_some(),
-        _ => false,
-    });
-    if is_escha {
+    // certified dispatch path below untouched. A VL row cannot ride the
+    // lowered executor (no M-RoPE arm): fail closed rather than rotate 1D.
+    if has_escha_layers(weights) {
+        if use_mrope {
+            return Err(HipError::new(
+                0,
+                "paged dense decode: the escha lowered executor has no M-RoPE arm \
+                 (VL decode stays on the slots ladder)",
+            ));
+        }
         return forward_scratch_layers_paged_lowered(
             gpu, weights, config, pos, kv_cache, dn_state, s, paged, kvmem_taps, row_slot,
             layerwise, layer_end,
@@ -2820,7 +2835,7 @@ pub(crate) fn forward_scratch_layers_paged(
     if let Some(lq) = layerwise.as_deref_mut() {
         return forward_scratch_layers_paged_layerwise(
             gpu, weights, config, pos, kv_cache, dn_state, s, paged, kvmem_taps, row_slot, lq,
-            layer_end,
+            use_mrope, layer_end,
         );
     }
     #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
@@ -3015,6 +3030,10 @@ fn forward_scratch_layers_paged_layerwise(
     kvmem_taps: Option<&crate::kvmem_taps::KvMemTaps>,
     row_slot: &GpuTensor,
     lq: &mut crate::layerwise_driver::LayerwiseQuery<'_>,
+    // G7 Stage D: `true` when the decode row's 3D M-RoPE phases were uploaded to
+    // `s.pos_buf3` by the caller; the FA seam must rotate with them instead of
+    // the 1D `pos_buf`. `false` reproduces the text path byte-for-byte.
+    use_mrope: bool,
     layer_end: usize,
 ) -> HipResult<()> {
     let ctx = DispatchCtx::new(gpu);
@@ -3051,6 +3070,7 @@ fn forward_scratch_layers_paged_layerwise(
                 kvmem_taps,
                 Some(row_slot),
                 lq,
+                use_mrope.then_some(config.mrope_section),
                 |gpu, ctx, binding, tap| {
                     let mixer = binding.mixer(
                         layer,
@@ -5831,6 +5851,7 @@ impl<'a, 'b> Qwen35Bindings<'a, 'b> {
         // fa_q_full; the returned prerotated flag feeds the later RESID_WO op).
         let prerotated = layerwise_fa_attend(
             gpu, ctx, s, config, kv_cache, dn_state, pos, fa, kvmem_taps, row_slot, &mut *lq,
+            None, // the lowered (escha) executor has no M-RoPE arm
             |gpu, ctx, binding, tap| {
                 let step = binding.mixer(
                     layer,
@@ -5881,6 +5902,9 @@ fn layerwise_fa_attend(
     kvmem_taps: Option<&crate::kvmem_taps::KvMemTaps>,
     row_slot: Option<&GpuTensor>,
     lq: &mut crate::layerwise_driver::LayerwiseQuery<'_>,
+    // G7 Stage D: `Some(section)` rotates with the 3D phases in `s.pos_buf3`
+    // (VL decode); `None` keeps the 1D `pos_buf` path byte-identical.
+    mrope_section: Option<[usize; 3]>,
     attend: impl FnOnce(
         &mut Gpu,
         &DispatchCtx,
@@ -5933,7 +5957,7 @@ fn layerwise_fa_attend(
             kv_cache,
             dn_state,
             position: pos,
-            mrope_section: None,
+            mrope_section,
             paged: Some(hybrid::PagedAttentionKv {
                 positions: &views.positions,
                 descs: &views.descs,
