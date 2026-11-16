@@ -642,6 +642,9 @@ struct SlotState {
     /// 期3 G3: this request's internal content group (conversation-lineage
     /// hash). Fairness hint only; a frozen checkpoint carries it as metadata.
     convo_group: u64,
+    /// 期3 G3 follow-up: the slot's last frozen checkpoint — the origin-inherit
+    /// source for the next capture (same sealed records ⇒ shared blocks).
+    last_freeze_id: Option<u64>,
     /// Pending output-scope acceptance snapshot for the in-flight MTP verify
     /// (P4.1②, design §A.6). The orchestration extracts it from the verify carrier
     /// after the forward (mass captured) and stores it here BEFORE freeing the
@@ -1198,6 +1201,7 @@ impl KvMemCtl {
                 request_query: None,
                 last_query: None,
                 convo_group: 0,
+                last_freeze_id: None,
                 lw_import_blocks: Cell::new(None),
                 lw_pending_output: None,
                 lw_head: None,
@@ -1537,6 +1541,7 @@ impl KvMemCtl {
                 request_query: None,
                 last_query: None,
                 convo_group: 0,
+                last_freeze_id: None,
             lw_import_blocks: Cell::new(None),
             lw_pending_output: None,
             // P4.1② G3: a fresh session drops the head resident map and its
@@ -1636,9 +1641,16 @@ impl KvMemCtl {
         // layer-major, K then V). The snapshot is the catalog-visible immutable
         // object the G2/G3 directories share. Host-only fixtures without a
         // packed archive carry no snapshot (missing records are not an error).
+        // 期3 G3 follow-up (nInfer origin inheritance): reuse the SealedKvBlock
+        // objects of this slot's previous checkpoint when the record storage
+        // identity matches (same session, shared sealed records).
+        let previous_snapshot = st
+            .last_freeze_id
+            .and_then(|pid| self.prefix_catalog.get(pid))
+            .and_then(|c| c.kv_snapshot.as_ref());
         let kv_snapshot = if canonical.has_packed(blocks) {
             let snapshot = canonical
-                .capture_snapshot(blocks, None)
+                .capture_snapshot(blocks, previous_snapshot)
                 .map_err(|e| format!("kvmem freeze_prefix snapshot: {e}"))?;
             if !snapshot.covers_packed(blocks, self.n_record_layers as u32) {
                 return Err(format!(
@@ -1745,6 +1757,10 @@ impl KvMemCtl {
         };
         if inserted.is_some() {
             self.prefix_freezes_total += 1;
+        }
+        let frozen_id = inserted.unwrap_or(id);
+        if let Some(st) = self.slots.get_mut(slot) {
+            st.last_freeze_id = Some(frozen_id);
         }
 
         let mut displaced = displaced;
@@ -6094,6 +6110,40 @@ mod tests {
         std::env::remove_var("HIPFIRE_KVMEM_CACHE_DIR");
         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 期3 G3 follow-up: captures inherit the previous checkpoint's sealed
+    /// block origins when the record storage identity matches.
+    #[test]
+    fn snapshots_inherit_origins_across_freezes() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let mut ctl =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
+                .expect("ctl");
+        prefix_fill(&mut ctl, 0, 2, 8);
+        let t1 = prefix_tokens(128, 8);
+        let (id1, _, _) = ctl.freeze_prefix(0, 128, &t1).expect("freeze 128");
+        let o1_0 = {
+            let snap = ctl
+                .prefix_checkpoint(id1)
+                .and_then(|c| c.kv_snapshot.as_ref())
+                .expect("snapshot 1");
+            snap.origin_id(0).expect("origin 0")
+        };
+        let t2 = prefix_tokens(256, 8);
+        let (id2, _, _) = ctl.freeze_prefix(0, 256, &t2).expect("freeze 256");
+        let snap2 = ctl
+            .prefix_checkpoint(id2)
+            .and_then(|c| c.kv_snapshot.as_ref())
+            .expect("snapshot 2");
+        assert_eq!(
+            snap2.origin_id(0),
+            Some(o1_0),
+            "block 0 origin inherited from the previous checkpoint"
+        );
+        assert_ne!(snap2.origin_id(1), Some(o1_0), "block 1 is a new origin");
+        assert!(snap2.origin_id(2).is_some());
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
     }
 }
 
