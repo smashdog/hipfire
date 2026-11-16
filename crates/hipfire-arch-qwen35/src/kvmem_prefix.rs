@@ -128,6 +128,18 @@ impl ContentPackMeta {
     }
 }
 
+/// The recurrent-state sidecar that co-locates with a pack (`<pack>.dn`).
+/// Its fixed header is `magic+version+shape_fp+n_fams+n_bufs` = 24 bytes, so
+/// any file at least this long is a candidate image; `import_host` still
+/// validates the shape and payload before use.
+pub const SIDECAR_MIN_BYTES: u64 = 24;
+
+pub fn sidecar_path(pack: &std::path::Path) -> std::path::PathBuf {
+    let mut path = pack.as_os_str().to_owned();
+    path.push(".dn");
+    std::path::PathBuf::from(path)
+}
+
 /// One pack file discovered in the content directory (metadata only; the
 /// payload is loaded on demand).
 #[derive(Debug, Clone)]
@@ -135,9 +147,24 @@ pub struct ColdPack {
     pub path: std::path::PathBuf,
     pub meta: ContentPackMeta,
     pub fingerprint: u64,
+    /// Pack file bytes (the `hipfire_kvmem_content_pack_bytes` view).
     pub bytes: u64,
+    /// `<path>.dn` bytes (0 when absent). Charged against the same on-disk
+    /// content cap as the pack so the cap bounds the whole cache directory.
+    pub sidecar_bytes: u64,
     /// Monotonic LRU stamp assigned at scan (file mtime order).
     pub stamp: u64,
+}
+
+impl ColdPack {
+    pub fn sidecar_path(&self) -> std::path::PathBuf {
+        sidecar_path(&self.path)
+    }
+
+    /// Complete on-disk artifact (pack + optional recurrent sidecar).
+    pub fn disk_bytes(&self) -> u64 {
+        self.bytes.saturating_add(self.sidecar_bytes)
+    }
 }
 
 /// Cold content index: persistent pack files in `HIPFIRE_KVMEM_CACHE_DIR`.
@@ -158,6 +185,14 @@ impl ColdPackIndex {
     }
     pub fn total_bytes(&self) -> u64 {
         self.packs.iter().map(|p| p.bytes).sum()
+    }
+    /// Recurrent-state sidecars currently on disk (`<pack>.dn`).
+    pub fn sidecar_bytes(&self) -> u64 {
+        self.packs.iter().map(|p| p.sidecar_bytes).sum()
+    }
+    /// Whole cache-directory footprint the byte cap is applied to.
+    pub fn disk_bytes(&self) -> u64 {
+        self.packs.iter().map(|p| p.disk_bytes()).sum()
     }
     pub fn packs(&self) -> &[ColdPack] {
         &self.packs
@@ -208,6 +243,9 @@ impl ColdPackIndex {
                 .metadata()
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::UNIX_EPOCH);
+            let sidecar_bytes = std::fs::metadata(sidecar_path(&path))
+                .map(|m| m.len())
+                .unwrap_or(0);
             raw.push((
                 modified,
                 ColdPack {
@@ -215,6 +253,7 @@ impl ColdPackIndex {
                     path,
                     meta,
                     bytes: info.file_bytes,
+                    sidecar_bytes,
                     stamp: 0,
                 },
             ));
@@ -315,11 +354,12 @@ impl ColdPackIndex {
         best.map(|p| (p.meta.frontier, p.meta.media_digest))
     }
 
-    /// Delete the oldest packs until the index fits `max_bytes`. Returns the
-    /// removed files so callers can log/metrics them.
+    /// Delete the oldest packs (and their sidecars) until the whole cache
+    /// directory fits `max_bytes`. Returns the removed pack paths so callers
+    /// can log/metric them.
     pub fn prune_to(&mut self, max_bytes: u64) -> Vec<std::path::PathBuf> {
         let mut removed = Vec::new();
-        while self.total_bytes() > max_bytes && !self.packs.is_empty() {
+        while self.disk_bytes() > max_bytes && !self.packs.is_empty() {
             let victim = self
                 .packs
                 .iter()
@@ -329,6 +369,8 @@ impl ColdPackIndex {
                 .expect("nonempty");
             let p = self.packs.remove(victim);
             let _ = std::fs::remove_file(&p.path);
+            let _ = std::fs::remove_file(p.sidecar_path());
+            let _ = std::fs::remove_file(format!("{}.tmp", p.path.display()));
             removed.push(p.path);
         }
         removed
@@ -339,6 +381,19 @@ impl ColdPackIndex {
         self.clock += 1;
         pack.stamp = self.clock;
         self.packs.push(pack);
+    }
+
+    /// Update the sidecar charge for a registered pack (the engine writes the
+    /// `.dn` image after the freeze returns). Returns false when the pack is
+    /// no longer indexed (pruned meanwhile) so the caller can drop the orphan.
+    pub fn set_sidecar_bytes(&mut self, path: &std::path::Path, bytes: u64) -> bool {
+        match self.packs.iter_mut().find(|p| p.path == path) {
+            Some(p) => {
+                p.sidecar_bytes = bytes;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn contains_path(&self, path: &std::path::Path) -> bool {
@@ -1500,6 +1555,7 @@ mod tests {
             fingerprint: prefix_fingerprint(&toks),
             meta,
             bytes: 1,
+            sidecar_bytes: 0,
             stamp: 1,
         });
         assert_eq!(
@@ -1545,17 +1601,33 @@ mod tests {
         };
         let (p1, t1) = write(128, 0, "a.hkpack");
         let (p2, t2) = write(256, 1, "b.hkpack");
+        let side1 = sidecar_path(&p1);
+        let side2 = sidecar_path(&p2);
+        std::fs::write(&side1, vec![0u8; 100]).expect("sidecar 1");
+        std::fs::write(&side2, vec![0u8; 200]).expect("sidecar 2");
         let mut idx = ColdPackIndex::scan(&dir, layout, LAYERS, BLOCK, 1 << 20);
         assert_eq!(idx.len(), 2, "two well-formed packs");
+        assert_eq!(idx.sidecar_bytes(), 300, "sidecars are part of the cache footprint");
         assert_eq!(idx.lookup(&t1, layout).map(|i| idx.packs()[i].path.clone()), Some(p1.clone()));
         assert_eq!(idx.lookup(&t2, layout).map(|i| idx.packs()[i].path.clone()), Some(p2.clone()));
         let mut foreign = t1.clone();
         foreign[0] ^= 0xffff;
         assert!(idx.lookup(&foreign, layout).is_none(), "fingerprint alone is no proof");
         assert!(idx.lookup(&t1, layout ^ 1).is_none(), "layout must match");
+        // A cap between the total footprint and the pack-only footprint must
+        // evict the oldest artifact *and* its sidecar (not leave an orphan).
+        let mut idx = ColdPackIndex::scan(&dir, layout, LAYERS, BLOCK, 1 << 20);
+        let cap = idx.disk_bytes() - 1;
+        let removed = idx.prune_to(cap);
+        assert_eq!(removed.len(), 1, "one byte over the cap evicts one artifact");
+        let victim = &removed[0];
+        let survivor = if *victim == p1 { &p2 } else { &p1 };
+        assert!(!victim.exists() && !sidecar_path(victim).exists(), "sidecar follows the pack");
+        assert!(survivor.exists() && sidecar_path(survivor).exists(), "newest artifact retained");
+        assert_eq!(idx.sidecar_bytes(), if *survivor == p1 { 100 } else { 200 });
         let removed = idx.prune_to(0);
-        assert_eq!(removed.len(), 2);
-        assert!(!p1.exists() && !p2.exists());
+        assert_eq!(removed.len(), 1);
+        assert!(!survivor.exists() && !sidecar_path(survivor).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

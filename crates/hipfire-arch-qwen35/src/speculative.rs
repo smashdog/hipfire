@@ -2049,24 +2049,31 @@ impl DeltaNetSnapshot {
             .collect();
         let fp = Self::dn_image_fp(&sizes);
         let total: usize = sizes.iter().map(|s| *s as usize).sum();
-        let mut out = Vec::with_capacity(20 + sizes.len() * 8 + total);
-        out.extend_from_slice(&Self::DN_IMAGE_MAGIC.to_le_bytes());
-        out.extend_from_slice(&Self::DN_IMAGE_VERSION.to_le_bytes());
-        out.extend_from_slice(&fp.to_le_bytes());
-        out.extend_from_slice(&(fams.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(sizes.len() as u32).to_le_bytes());
+        // magic(4) + version(4) + shape_fp(8) + n_fams(4) + n_bufs(4) = 24.
+        let header = 24 + sizes.len() * 8;
+        let mut out = vec![0u8; header + total];
+        out[0..4].copy_from_slice(&Self::DN_IMAGE_MAGIC.to_le_bytes());
+        out[4..8].copy_from_slice(&Self::DN_IMAGE_VERSION.to_le_bytes());
+        out[8..16].copy_from_slice(&fp.to_le_bytes());
+        out[16..20].copy_from_slice(&(fams.len() as u32).to_le_bytes());
+        out[20..24].copy_from_slice(&(sizes.len() as u32).to_le_bytes());
+        let mut off = 24;
         for s in &sizes {
-            out.extend_from_slice(&s.to_le_bytes());
+            out[off..off + 8].copy_from_slice(&s.to_le_bytes());
+            off += 8;
         }
+        // D2H straight into the image tail: the old temporary per-buffer Vec
+        // plus `extend_from_slice` copied the whole state a second time.
         for fam in fams {
             for b in fam.iter() {
-                let mut buf = vec![0u8; b.size()];
+                let end = off + b.size();
                 gpu.hip
-                    .memcpy_dtoh(&mut buf, b)
+                    .memcpy_dtoh(&mut out[off..end], b)
                     .map_err(|e| format!("dn image dtoh: {e:?}"))?;
-                out.extend_from_slice(&buf);
+                off = end;
             }
         }
+        debug_assert_eq!(off, out.len());
         Ok(out)
     }
 
