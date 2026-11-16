@@ -248,6 +248,9 @@ pub struct KvMemStats {
     pub prefix_hits: u64,
     pub prefix_misses: u64,
     pub prefix_evictions: u64,
+    /// Admission-pressure residency demotions: the entry stays cataloged and
+    /// only its pinned pages are dropped (Layerwise restores them later).
+    pub prefix_demotions: u64,
     /// 期4: DFlash2 draft conditioning images captured with prefix
     /// checkpoints, restored on reuse, and missing/unrestorable (reseed).
     pub draft_images: u64,

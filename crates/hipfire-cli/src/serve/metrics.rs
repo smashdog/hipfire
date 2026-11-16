@@ -661,6 +661,12 @@ impl Metrics {
                 );
                 counter(
                     &mut out,
+                    "hipfire_kvmem_prefix_demotions_total",
+                    "Admission-pressure residency demotions: pinned pages dropped, catalog entry retained.",
+                    s.kvmem.prefix_demotions,
+                );
+                counter(
+                    &mut out,
                     "hipfire_kvmem_draft_images_total",
                     "DFlash2 draft conditioning images captured with prefix checkpoints.",
                     s.kvmem.draft_images,
@@ -1138,7 +1144,7 @@ mod tests {
                 "prefix_entries": 2, "prefix_pinned_pages": 16,
                 "prefix_host_bytes": 3000, "prefix_host_bytes_gross": 5000,
                 "prefix_freezes": 5, "prefix_hits": 4,
-                "prefix_misses": 6, "prefix_evictions": 1,
+                "prefix_misses": 6, "prefix_evictions": 1, "prefix_demotions": 2,
                 "draft_images": 2, "draft_image_hits": 1, "draft_image_misses": 1,
                 "content_groups": 2, "content_retirements": 1,
                 "content_cache_bytes": 4096, "content_cache_disk_bytes": 2048,
@@ -1170,6 +1176,7 @@ mod tests {
             "hipfire_kvmem_prefix_hits_total 4\n",
             "hipfire_kvmem_prefix_misses_total 6\n",
             "hipfire_kvmem_prefix_evictions_total 1\n",
+            "hipfire_kvmem_prefix_demotions_total 2\n",
             "hipfire_kvmem_draft_images_total 2\n",
             "hipfire_kvmem_draft_image_hits_total 1\n",
             "hipfire_kvmem_draft_image_misses_total 1\n",

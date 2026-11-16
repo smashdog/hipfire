@@ -9859,9 +9859,12 @@ fn admit(
     // ── P4.3 canonical-prefix reclaim under page pressure ────────────────
     // Pinned canonical prefixes hold pool pages beyond the per-slot working
     // sets. When the free list cannot back one slot's resident budget plus
-    // headroom, release LRU catalog entries (their cache refs drop; pages
-    // still held by live block tables survive). Bounded: the catalog is
-    // finite, and an empty catalog ends the loop.
+    // headroom, Layerwise DEMOTES the LRU catalog entries: pinned pages drop,
+    // the catalog entry survives, and a later reuse restores pages from the
+    // sealed archive (nInfer keeps the directory separate from residency).
+    // Legacy reuse requires resident pages, so it keeps the historical pop
+    // (entry removed). Pages still held by live block tables survive the ref
+    // release. Bounded: an entry demotes once and the catalog is finite.
     #[cfg(feature = "kvmem")]
     if rig.kvmem_prefix_pin {
         let headroom = rig
@@ -9870,25 +9873,54 @@ fn admit(
             .as_ref()
             .map(|ctl| ctl.budget_blocks() + 2)
             .unwrap_or(2);
+        let layerwise = rig
+            .model
+            .kvmem
+            .as_ref()
+            .map(|ctl| ctl.strategy().is_layerwise())
+            .unwrap_or(false);
         loop {
             let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
             if free >= headroom {
                 break;
             }
-            let victim = rig.model.kvmem.as_mut().and_then(|ctl| ctl.pop_lru_prefix());
-            let Some(victim) = victim else { break };
-            if let Some(pp) = rig.pool.page_pool_mut() {
-                for &phys in &victim.gpu_pages {
-                    let _ = pp.release_cache_ref(phys);
+            if layerwise {
+                let Some((id, pages)) = rig
+                    .model
+                    .kvmem
+                    .as_mut()
+                    .and_then(|ctl| ctl.demote_lru_prefix())
+                else {
+                    break;
+                };
+                if let Some(pp) = rig.pool.page_pool_mut() {
+                    for &phys in &pages {
+                        let _ = pp.release_cache_ref(phys);
+                    }
                 }
-            }
-            if rig.gpu.slot_trace() {
-                eprintln!(
-                    "[kvmem-prefix] reclaimed canonical prefix {} ({} pages) under \
-                     admission pressure",
-                    victim.id,
-                    victim.gpu_pages.len()
-                );
+                if rig.gpu.slot_trace() {
+                    eprintln!(
+                        "[kvmem-prefix] demoted canonical prefix {id} ({} pages) under \
+                         admission pressure; catalog entry retained",
+                        pages.len()
+                    );
+                }
+            } else {
+                let victim = rig.model.kvmem.as_mut().and_then(|ctl| ctl.pop_lru_prefix());
+                let Some(victim) = victim else { break };
+                if let Some(pp) = rig.pool.page_pool_mut() {
+                    for &phys in &victim.gpu_pages {
+                        let _ = pp.release_cache_ref(phys);
+                    }
+                }
+                if rig.gpu.slot_trace() {
+                    eprintln!(
+                        "[kvmem-prefix] reclaimed canonical prefix {} ({} pages) under \
+                         admission pressure",
+                        victim.id,
+                        victim.gpu_pages.len()
+                    );
+                }
             }
         }
     }
