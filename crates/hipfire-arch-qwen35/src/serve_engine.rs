@@ -9408,6 +9408,16 @@ fn admit(
                 // fingerprint + token proof) before any mutation.
                 let mut frontier = ctl.fork_prefix_into(slot.0, ckpt_id, &req.prompt_tokens)?;
                 let mut reuse_id = ckpt_id;
+                // G3 cold-reuse fix: a page-less import (restart pack load or an
+                // admission-demoted entry) has no resident prefix pages for a
+                // first-step Query selection to score. A Pressure import with a
+                // NEW question would reselect over empty residency and drop the
+                // whole prefix; keep the source's selected views instead and
+                // suppress the first-step Query.
+                let page_less = ctl
+                    .prefix_checkpoint(reuse_id)
+                    .map(|c| c.gpu_pages.is_empty())
+                    .unwrap_or(false);
                 // 1b. P2.2a/P2.2b fenced-import admission (ninfer
                 // `prepare_import_start`): the restored exact prefix is measured
                 // against the layerwise window capacity B+R. A pressure import
@@ -9425,12 +9435,13 @@ fn admit(
                     let mut keep_selected = false;
                     let admission = (|| -> Result<Option<u32>, String> {
                         let prev = ctl.prefix_original_query(reuse_id);
+                        let query = if page_less { prev } else { req.query };
                         let decision = ctl
                             .import_window(
                                 req.prompt_tokens.len() as u64,
                                 req.max_tokens as u64,
                                 frontier,
-                                req.query,
+                                query,
                                 prev,
                             )
                             .map_err(|e| format!("kvmem reuse: import admission: {e}"))?;
@@ -9452,12 +9463,13 @@ fn admit(
                             frontier = ctl.fork_prefix_into(slot.0, sid, &req.prompt_tokens)?;
                             reuse_id = sid;
                             let prev = ctl.prefix_original_query(reuse_id);
+                            let query = if page_less { prev } else { req.query };
                             let decision = ctl
                                 .import_window(
                                     req.prompt_tokens.len() as u64,
                                     req.max_tokens as u64,
                                     frontier,
-                                    req.query,
+                                    query,
                                     prev,
                                 )
                                 .map_err(|e| format!("kvmem reuse: import retry: {e}"))?;
@@ -9499,19 +9511,21 @@ fn admit(
                     // question. KeepSelected leaves it clear so the source's
                     // selected views stand; an unproven span keeps the
                     // historical (no forced Query on the cold-reuse path).
+                    let due = req.query.is_some() && !keep_selected && !page_less;
                     if req.query.is_some() {
-                        ctl.set_layerwise_query_due(slot.0, !keep_selected);
+                        ctl.set_layerwise_query_due(slot.0, due);
                     }
                     if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
                         .ok()
                         .is_some_and(|v| v == "1" || v == "on" || v == "true")
                     {
                         eprintln!(
-                            "[kvmem-query] reuse slot {} query={:?} keep_selected={} -> due={}",
+                            "[kvmem-query] reuse slot {} query={:?} page_less={} keep_selected={} -> due={}",
                             slot.0,
                             req.query,
+                            page_less,
                             keep_selected,
-                            req.query.is_some() && !keep_selected
+                            due
                         );
                     }
                 }
@@ -9606,9 +9620,55 @@ fn admit(
                                 .to_string(),
                         );
                     }
-                    // G3 follow-up: page-less Layerwise reuse restores pages
-                    // from the sealed archive on demand; count it apart from a
-                    // hot catalog hit (demotion / restart metrics).
+                    // G3 cold-reuse fix: a page-less import has no bound prefix
+                    // pages, so the suffix prefill would attend over unbound
+                    // rows and lose the imported context. Materialize the
+                    // prefix from the archived store into pool pages first,
+                    // then pin them so later reuses are hot.
+                    let staged = ctl.stage_page_less_import(
+                        &rig.gpu,
+                        &mut rig.pool,
+                        &rig.model.k_arenas,
+                        &rig.model.v_arenas,
+                        slot.0,
+                        frontier,
+                    );
+                    let pages = match staged {
+                        Ok(pages) => pages,
+                        Err(e) => {
+                            let _ = ctl.reset_slot(slot.0);
+                            let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+                            return Err(format!("kvmem reuse: cold prefix staging failed: {e}"));
+                        }
+                    };
+                    let mut taken: Vec<u32> = Vec::new();
+                    let mut ref_err = None;
+                    if let Some(pp) = rig.pool.page_pool_mut() {
+                        for &phys in &pages {
+                            match pp.add_cache_ref(phys) {
+                                Ok(()) => taken.push(phys),
+                                Err(e) => {
+                                    ref_err = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        ref_err = Some("not paged".to_string());
+                    }
+                    if let Some(e) = ref_err {
+                        if let Some(pp) = rig.pool.page_pool_mut() {
+                            for &phys in &taken {
+                                let _ = pp.release_cache_ref(phys);
+                            }
+                        }
+                        let _ = ctl.reset_slot(slot.0);
+                        let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+                        return Err(format!("kvmem reuse: cold prefix pin failed: {e}"));
+                    }
+                    if let Some(ckpt) = ctl.prefix_checkpoint_mut(reuse_id) {
+                        ckpt.gpu_pages = pages;
+                    }
                     ctl.note_prefix_restore_hit();
                 } else if rig.pool.share_published_pages(slot, &gpu_pages).is_err() {
                     let _ = ctl.reset_slot(slot.0);
