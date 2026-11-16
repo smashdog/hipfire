@@ -283,7 +283,7 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
             // measuring the fold in isolation, and is how the first folded 27B
             // was benchmarked at PPL 13.91).
             if let Some((bm, bd)) = find(&format!("{proj}.bias")) {
-                if std::env::var("HIPFIRE_ESCHA_FOLD_DROP_BIAS").as_deref() != Ok("1") {
+                if hipfire_config::developer_var("HIPFIRE_ESCHA_FOLD_DROP_BIAS").as_deref() != Ok("1") {
                     return Err(format!(
                         "{proj}: fold mode cannot represent the additive bias, and the runtime \
                          has no bias slot to apply it — the folded model would silently ignore \
@@ -700,7 +700,7 @@ const DENSE_DEFAULT_KEEP_Q8: [&str; 2] = ["mlp.gate", "shared_expert"];
 /// `mq6` (recommended) or `mq4v2`. Unset means the normal escha output,
 /// byte-for-byte unchanged. See `escha_fold` for the algebra and the trade.
 fn fold_format() -> Option<DenseFormat> {
-    match std::env::var("HIPFIRE_ESCHA_FOLD").ok().as_deref() {
+    match hipfire_config::developer_var("HIPFIRE_ESCHA_FOLD").ok().as_deref() {
         Some("mq6") => Some(DenseFormat::Mq6),
         Some("mq4v2") => Some(DenseFormat::Mq4V2),
         // `f16` folds WITHOUT re-quantising. It is an ATTRIBUTION tool, not a
@@ -714,7 +714,7 @@ fn fold_format() -> Option<DenseFormat> {
 }
 
 fn dense_format_for(name: &str) -> DenseFormat {
-    let Ok(spec) = std::env::var("HIPFIRE_ESCHA_DENSE") else {
+    let Ok(spec) = hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE") else {
         return DenseFormat::Q8_0;
     };
     let (fmt, rule) = match spec.find(['!', ':']) {

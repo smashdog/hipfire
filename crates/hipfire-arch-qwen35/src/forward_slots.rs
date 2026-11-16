@@ -5191,7 +5191,7 @@ pub fn upload_step_inputs(
     // and compare it with the host table the kernels are about to index
     // through — a stale upload would silently hide restored pages.
     if pool.is_paged()
-        && std::env::var("HIPFIRE_KVMEM_VERIFY").map(|v| v == "1").unwrap_or(false)
+        && hipfire_config::developer_bool("HIPFIRE_KVMEM_VERIFY", false)
     {
         for slot_idx in 0..pool.descriptors().len() {
             let (Some(bt), Some(dev)) = (
@@ -5476,7 +5476,7 @@ pub fn forward_batch_slots_opts(
         // Diagnostic (`HIPFIRE_KVMEM_VERIFY=1`): device table vs host table
         // immediately before the kernels, to catch stale page mappings.
         if pool.is_paged()
-            && std::env::var("HIPFIRE_KVMEM_VERIFY").map(|v| v == "1").unwrap_or(false)
+            && hipfire_config::developer_bool("HIPFIRE_KVMEM_VERIFY", false)
         {
             for slot_idx in 0..pool.descriptors().len() {
                 let (Some(bt), Some(dev)) = (

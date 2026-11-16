@@ -6877,7 +6877,7 @@ fn run_loop(
                 poison = Some(reason);
                 break 'serve;
             }
-            if std::env::var("HIPFIRE_KVMEM_TIME").map(|v| v == "1").unwrap_or(false) {
+            if hipfire_config::developer_bool("HIPFIRE_KVMEM_TIME", false) {
                 let _ = forward_ns;
                 eprintln!(
                     "[kvmem-time] forward {} rows: {:.1} ms through sync",

@@ -124,7 +124,7 @@ impl KvMemTaps {
         // Diagnostic: HIPFIRE_KVMEM_TAP_COPY=0 skips the copy launch entirely
         // (the tap buffers keep whatever they held). Timing investigations
         // only — never a serving configuration.
-        if std::env::var("HIPFIRE_KVMEM_TAP_COPY").map(|v| v == "0").unwrap_or(false) {
+        if hipfire_config::developer_var("HIPFIRE_KVMEM_TAP_COPY").as_deref() == Ok("0") {
             return Ok(());
         }
         let t = std::time::Instant::now();
@@ -140,7 +140,7 @@ impl KvMemTaps {
             self.head_dim,
             self.n_slots,
         );
-        if std::env::var("HIPFIRE_KVMEM_TIME").map(|v| v == "1").unwrap_or(false) {
+        if hipfire_config::developer_bool("HIPFIRE_KVMEM_TIME", false) {
             eprintln!(
                 "[kvmem-time] tap layer {layer} {n_rows} rows launch {:.2} ms",
                 t.elapsed().as_secs_f64() * 1e3

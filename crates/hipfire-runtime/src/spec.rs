@@ -1561,7 +1561,7 @@ fn mtp_accept_stats_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("HIPFIRE_MTP_ACCEPT_STATS")
+        hipfire_config::developer_var("HIPFIRE_MTP_ACCEPT_STATS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
