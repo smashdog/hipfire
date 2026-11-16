@@ -559,7 +559,9 @@ impl PrefixCatalog {
     /// Returns the displaced entries (caller releases their GPU refs).
     /// Refuses a duplicate frontier+proof already present (the existing
     /// entry is touched instead and returned as `Ok(None)` — no second
-    /// archive for the same prefix).
+    /// archive for the same prefix). The catalog is token-keyed on purpose:
+    /// two images render the same token stream, and the media digest (not the
+    /// catalog slot) decides whether an entry may be served.
     pub fn insert(&mut self, mut entry: PrefixCheckpoint) -> Result<Option<u64>, String> {
         if self.max_entries == 0 {
             return Err("kvmem prefix catalog: disabled (max_entries 0)".to_string());
@@ -859,6 +861,8 @@ impl PrefixCatalog {
     /// Exact-frontier dedup probe: an entry with the same frontier AND
     /// fingerprint already exists (touch it). The engine uses this BEFORE
     /// sealing GPU pages so a deduped freeze never doubles cache refs.
+    /// Exact (frontier, token proof) match. Media identity is checked by the
+    /// caller's [`PrefixCheckpoint::media_eligible`] gate, never here.
     pub fn find_exact(&mut self, frontier: u32, fingerprint: u64) -> Option<u64> {
         let id = self
             .entries
@@ -1335,6 +1339,38 @@ mod tests {
         dup.group = 33;
         let (id, none, deduped) = cat.insert_group_aware(dup, 2).expect("dedup");
         assert!(id.is_none() && none.is_empty() && deduped);
+    }
+
+    /// G7 Stage C: the media digest scopes whether an entry may be served.
+    /// Two images share the `image_pad` token stream, so the token proof alone
+    /// never authorizes a media-covered prefix.
+    #[test]
+    fn media_digest_gates_serving() {
+        let st = storage();
+        let toks = tokens(256);
+        let layout = layout_fingerprint(&raw_config());
+        let mut cat = PrefixCatalog::new(4);
+        let mut a = checkpoint(&st, cat.mint_id(), 128, &toks[..128]);
+        a.media_digest = Some(0xA);
+        a.media_spans = vec![(64, 128)];
+        let (ida, _) = cat.insert_displacing(a).expect("insert a");
+        let ida = ida.expect("stored");
+        assert_eq!(cat.lookup_media(&toks[..128], layout, Some(0xA)), Some(ida));
+        assert_eq!(cat.lookup_media(&toks[..128], layout, Some(0xB)), None);
+        assert_eq!(cat.lookup_media(&toks[..128], layout, None), None);
+        // A checkpoint frozen BEFORE the image carries no covered span and is
+        // reusable by any request (it holds no image rows).
+        let mut pre = checkpoint(&st, cat.mint_id(), 128, &toks[..128]);
+        pre.media_digest = Some(0xA);
+        pre.media_spans = vec![(200, 260)];
+        assert!(pre.media_eligible(Some(0xB)));
+        assert!(pre.media_eligible(None));
+        // A text checkpoint is never eligible for a media-covered span.
+        let mut t = checkpoint(&st, cat.mint_id(), 128, &toks[..128]);
+        t.media_digest = None;
+        t.media_spans = vec![(64, 128)];
+        assert!(!t.media_eligible(Some(0xA)));
+        assert!(!t.media_eligible(None));
     }
 
     /// 期3 G3 P1.1: the cold index scans pack files, proves by full token

@@ -4492,6 +4492,7 @@ fn publish_generated_prefix(
                 domain,
                 new_boundary as u64,
                 &tokens,
+                None, // radix path: text-only (vision is excluded from publishing)
                 &rig.model.dn_states[s],
             ) {
                 Ok(id) if id.is_some() => Some(id),
@@ -6797,6 +6798,7 @@ fn run_loop(
                                     domain,
                                     new_boundary as u64,
                                     &tokens,
+                                    None, // radix path: text-only
                                     &rig.model.dn_states[s],
                                 ) {
                                     Ok(id) if id.is_some() => Some(id),
@@ -7778,6 +7780,7 @@ fn run_loop(
                             domain,
                             boundary as u64,
                             &tokens,
+                            media_digest,
                             &rig.model.dn_states[s],
                         )
                         .map_err(|e| format!("kvmem freeze DN capture: {e:?}"))?;
@@ -8022,8 +8025,9 @@ fn kvmem_catalog_and_pin(
                     .cache_domain
                     .as_ref()
                     .ok_or_else(|| "no cache domain".to_string())?;
-                let fp = crate::checkpoint::prefix_fingerprint(
+                let fp = crate::checkpoint::checkpoint_fingerprint(
                     &tokens[..boundary as usize],
+                    media_digest,
                 );
                 match rig
                     .model
@@ -8109,7 +8113,7 @@ fn kvmem_coverage_capture(rig: &mut Rig, slots: &mut [Option<InFlight>], work: &
             continue;
         }
         let tokens: Vec<u32> = sess.tokens[..boundary as usize].to_vec();
-        let fp = crate::checkpoint::prefix_fingerprint(&tokens);
+        let fp = crate::checkpoint::checkpoint_fingerprint(&tokens, None);
         let model = &mut rig.model;
         let Some(pool) = model.checkpoint_pool.as_mut() else {
             continue;
@@ -8118,7 +8122,15 @@ fn kvmem_coverage_capture(rig: &mut Rig, slots: &mut [Option<InFlight>], work: &
             continue;
         }
         let state = &model.dn_states[s];
-        match crate::checkpoint::capture_checkpoint(&mut rig.gpu, pool, &domain, fed, &tokens, state) {
+        match crate::checkpoint::capture_checkpoint(
+            &mut rig.gpu,
+            pool,
+            &domain,
+            fed,
+            &tokens,
+            None, // coverage is text-only (vision sessions skip it)
+            state,
+        ) {
             Ok(id) if id == crate::checkpoint::CheckpointId::NONE => {
                 // Pool ceiling refused capture; the boundary stays unreusable.
             }
@@ -8207,7 +8219,11 @@ fn kvmem_freeze_endpoint(rig: &mut Rig, slots: &mut [Option<InFlight>], s: usize
         return;
     };
     if pool
-        .peek(domain, boundary as u64, crate::checkpoint::prefix_fingerprint(&tokens))
+        .peek(
+            domain,
+            boundary as u64,
+            crate::checkpoint::checkpoint_fingerprint(&tokens, media_digest),
+        )
         .is_none()
     {
         return;
@@ -8896,8 +8912,15 @@ fn admit(
                                             rig.model.checkpoint_pool.as_mut().ok_or_else(
                                                 || "kvmem truncate: no checkpoint pool".to_string(),
                                             )?;
-                                        let fp = crate::checkpoint::prefix_fingerprint(
+                                        // G7: a visual session's recurrent state
+                                        // is keyed by its sticky media digest.
+                                        let media = rig
+                                            .sessions
+                                            .get(existing)
+                                            .and_then(|s| s.media_digest);
+                                        let fp = crate::checkpoint::checkpoint_fingerprint(
                                             &extended[..plan.reused],
+                                            media,
                                         );
                                         let restored = ckpt_pool
                                             .peek(domain, plan.reused as u64, fp)
@@ -9452,6 +9475,45 @@ fn admit(
         .as_ref()
         .map(|vd| vd.media_digest())
         .or_else(|| rig.sessions.get(id).and_then(|s| s.media_digest));
+    // G7 Stage C: the reuse frontier goes through the Stage A media anchor.
+    // The restored prefix must never split a vision span of the incoming
+    // prompt; a frozen checkpoint already satisfies this by construction, so a
+    // failure here is an invariant violation and the reuse closes to cold.
+    #[cfg(feature = "kvmem")]
+    let req_media_spans: Vec<crate::kvmem_media::MediaSpan> = {
+        let n_visual = req
+            .visual_data
+            .as_ref()
+            .map(|vd| vd.n_visual_tokens)
+            .or_else(|| rig.sessions.get(id).map(|s| s.media_n_visual))
+            .unwrap_or(0);
+        match (req_media, rig.tokenizer.special_token_id("<|image_pad|>")) {
+            (Some(_), Some(pad)) if n_visual > 0 => {
+                crate::kvmem_media::spans_from_pad_runs(&req.prompt_tokens, pad, n_visual)
+            }
+            _ => Vec::new(),
+        }
+    };
+    #[cfg(feature = "kvmem")]
+    let anchor_reuse = |frontier: u32| -> Result<u32, String> {
+        if req_media_spans.is_empty() {
+            return Ok(frontier);
+        }
+        let aligned = crate::kvmem_media::media_anchored_frontier(
+            0,
+            frontier as u64,
+            req.prompt_tokens.len() as u64,
+            &req_media_spans,
+            crate::kvmem_ctl::KV_BLOCK_TOKENS as u64,
+        )
+        .map_err(|e| format!("kvmem reuse: media anchor: {e}"))?;
+        if aligned != frontier as u64 {
+            return Err(format!(
+                "kvmem reuse: media anchor moves frontier {frontier} -> {aligned}"
+            ));
+        }
+        Ok(frontier)
+    };
     #[cfg(feature = "kvmem")]
     if rig.kvmem_prefix_pin {
         // 期3 G3 P1.1: a cold pack hit publishes a catalog entry and may
@@ -9478,6 +9540,15 @@ fn admit(
                     .ok_or_else(|| "kvmem reuse: no controller".to_string())?;
                 // 1. Host fork: validates the FULL provenance (geometry +
                 // fingerprint + token proof) before any mutation.
+                // Stage C: the candidate frontier must pass the media anchor
+                // BEFORE the fork mutates the slot; a violation closes the
+                // reuse to a cold prefill (the slot is still the earlier
+                // reset state here).
+                let candidate = ctl
+                    .prefix_checkpoint(ckpt_id)
+                    .map(|c| c.frontier)
+                    .ok_or_else(|| format!("kvmem reuse: checkpoint {ckpt_id} missing"))?;
+                anchor_reuse(candidate)?;
                 let mut frontier = ctl.fork_prefix_into(slot.0, ckpt_id, &req.prompt_tokens)?;
                 let mut reuse_id = ckpt_id;
                 // G3 cold-reuse fix: a page-less import (restart pack load or an
@@ -9533,6 +9604,11 @@ fn admit(
                                     frontier, start.restore_tokens
                                 ));
                             };
+                            let candidate = ctl
+                                .prefix_checkpoint(sid)
+                                .map(|c| c.frontier)
+                                .ok_or_else(|| format!("kvmem reuse: checkpoint {sid} missing"))?;
+                            anchor_reuse(candidate)?;
                             frontier = ctl.fork_prefix_into(slot.0, sid, &req.prompt_tokens)?;
                             reuse_id = sid;
                             let prev = ctl.prefix_original_query(reuse_id);
@@ -9618,8 +9694,17 @@ fn admit(
                     .checkpoint_pool
                     .as_mut()
                     .ok_or_else(|| "kvmem reuse: no checkpoint pool".to_string())?;
-                let fp = crate::checkpoint::prefix_fingerprint(
+                // G7 Stage C: the recurrent state is keyed by the checkpoint's
+                // media identity. The catalog gate proved it equals the
+                // request's digest when the prefix covers an image span; a
+                // pre-image/plain prefix carries no media and keeps the
+                // historical key.
+                let ckpt_media = ctl
+                    .prefix_checkpoint(reuse_id)
+                    .and_then(|c| c.media_digest);
+                let fp = crate::checkpoint::checkpoint_fingerprint(
                     &req.prompt_tokens[..frontier as usize],
+                    ckpt_media,
                 );
                 // 期3 G3 P1.1 dn-persist: rebuild the recurrent checkpoint from
                 // the pack sidecar when this process has no pool entry (restart).

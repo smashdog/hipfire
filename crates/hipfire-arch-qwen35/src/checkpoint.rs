@@ -15,6 +15,30 @@ pub use hipfire_runtime::checkpoint_pool::{
 use hipfire_runtime::serve_contract::CacheDomain;
 use rdna_compute::Gpu;
 
+/// G7: recurrent-state checkpoint key.
+///
+/// A media (vision) prefix cannot be identified by its token stream alone:
+/// every image renders the same `image_pad` ids, so two different images in
+/// the same text produce an identical `prefix_fingerprint`. Their recurrent
+/// states differ (different visual embeddings feed the hybrid layers), so the
+/// pool key must carry the media digest. `media_digest == None` is the
+/// historical text-only key (byte-neutral for every non-VL path).
+pub fn checkpoint_fingerprint(tokens: &[u32], media_digest: Option<u64>) -> u64 {
+    let fp = prefix_fingerprint(tokens);
+    match media_digest {
+        None => fp,
+        Some(digest) => {
+            // splitmix64-style avalanche over (fp, digest).
+            let mut x = fp ^ digest.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x ^= x >> 27;
+            x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+            x ^ (x >> 31)
+        }
+    }
+}
+
 impl CheckpointBlob for DeltaNetSnapshot {
     fn bytes_len(&self) -> u64 {
         DeltaNetSnapshot::bytes_len(self)
@@ -42,6 +66,7 @@ pub fn capture_checkpoint(
     domain: &CacheDomain,
     p: u64,
     boundary_tokens: &[u32],
+    media_digest: Option<u64>,
     state: &DeltaNetState,
 ) -> HipResult<CheckpointId> {
     if !CheckpointPool::<DeltaNetSnapshot>::is_aligned(p) {
@@ -56,17 +81,15 @@ pub fn capture_checkpoint(
     // soft refusal, indistinguishable from a hard failure only after the
     // work is already spent.
     let bytes = DeltaNetSnapshot::bytes_for(state);
-    if !pool.can_afford(
-        &(domain.clone(), p, prefix_fingerprint(boundary_tokens)),
-        bytes,
-    ) {
+    let fp = checkpoint_fingerprint(boundary_tokens, media_digest);
+    if !pool.can_afford(&(domain.clone(), p, fp), bytes) {
         return Ok(CheckpointId::NONE);
     }
 
     let mut snap = DeltaNetSnapshot::new_for(gpu, state)?;
     snap.save_from(state, gpu)?;
 
-    let (id, displaced) = pool.insert(domain.clone(), p, prefix_fingerprint(boundary_tokens), snap);
+    let (id, displaced) = pool.insert(domain.clone(), p, fp, snap);
     // Displaced blobs (LRU evictions / same-key replacement / a ceiling
     // refusal of this very capture) own device memory with no freeing
     // `Drop` — free them here or they leak for the process lifetime.
@@ -104,3 +127,41 @@ pub fn restore_private(
 // ───────────────────────────────────────────────────────────────────────────
 // Tests (host-only — no GPU/HIP required)
 // ───────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_checkpoint_key_is_the_historical_fingerprint() {
+        let toks: Vec<u32> = (0..256).map(|i| i * 7 + 3).collect();
+        assert_eq!(
+            checkpoint_fingerprint(&toks, None),
+            prefix_fingerprint(&toks)
+        );
+    }
+
+    #[test]
+    fn media_checkpoint_key_is_content_scoped() {
+        // One token stream, two images: identical proof, distinct states.
+        let toks: Vec<u32> = (0..300).map(|i| i % 5).collect();
+        let a = checkpoint_fingerprint(&toks, Some(0xA11CE));
+        let b = checkpoint_fingerprint(&toks, Some(0xB0B));
+        let a2 = checkpoint_fingerprint(&toks, Some(0xA11CE));
+        assert_ne!(a, b);
+        assert_eq!(a, a2);
+        assert_ne!(a, prefix_fingerprint(&toks));
+        assert_ne!(b, prefix_fingerprint(&toks));
+    }
+
+    #[test]
+    fn media_key_depends_on_both_halves() {
+        let t1: Vec<u32> = (0..256).collect();
+        let t2: Vec<u32> = (0..256).map(|i| i ^ 1).collect();
+        let d = Some(42);
+        assert_ne!(
+            checkpoint_fingerprint(&t1, d),
+            checkpoint_fingerprint(&t2, d)
+        );
+    }
+}

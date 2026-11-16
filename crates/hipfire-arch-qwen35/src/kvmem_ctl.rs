@@ -1625,6 +1625,8 @@ impl KvMemCtl {
         let original_query = st.request_query;
         // Dedup BEFORE forking/sealing: an identical frontier+proof already
         // pins the same pages; a second archive would double the cache refs.
+        // The catalog stays token-keyed; the media digest gates serving and
+        // scopes the pack path and the recurrent-state key.
         if let Some(existing) = self.prefix_catalog.find_exact(frontier, fingerprint) {
             return Ok((existing, Vec::new(), true));
         }
@@ -1709,8 +1711,15 @@ impl KvMemCtl {
                 media_digest: entry.media_digest,
                 media_spans: entry.media_spans.clone(),
             };
+            // G7: the file name carries the media identity. Two images with
+            // the same token stream share the token fingerprint; without the
+            // digest suffix their packs would overwrite each other.
+            let media_tag = match media_digest {
+                None => String::new(),
+                Some(d) => format!("-m{d:016x}"),
+            };
             let path = dir.join(format!(
-                "p{layout_id:016x}-{frontier:08}-{fingerprint:016x}.hkpack"
+                "p{layout_id:016x}-{frontier:08}-{fingerprint:016x}{media_tag}.hkpack"
             ));
             let written = meta
                 .encode()
@@ -1803,6 +1812,23 @@ impl KvMemCtl {
             let pack = self.cold_packs.packs()[index].clone();
             match self.load_cold_pack(&pack) {
                 Ok(id) => {
+                    // G7 Stage C: the hot catalog is token-keyed. A pack load
+                    // can dedup into a live entry that belongs to a DIFFERENT
+                    // image (identical `image_pad` token stream). Serving it
+                    // would hand over the other image's KV — stay a miss.
+                    let identity_ok = self
+                        .prefix_catalog
+                        .get(id)
+                        .map(|e| e.media_digest == pack.meta.media_digest)
+                        .unwrap_or(false);
+                    if !identity_ok {
+                        self.cold_pack_misses_total += 1;
+                        eprintln!(
+                            "[kvmem-pack] cold load identity mismatch \
+                             (media digest) — miss"
+                        );
+                        return None;
+                    }
                     self.cold_pack_hits_total += 1;
                     self.prefix_hits_total += 1;
                     if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
