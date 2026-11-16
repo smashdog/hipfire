@@ -1692,7 +1692,7 @@ impl KvMemCtl {
         // 期3 G3 P1.1: persist the canonical prefix as a pack file. Failure
         // never blocks the freeze (persistence is an optional tier); the byte
         // cap prunes the oldest packs.
-        if let Some(dir) = self.cold_dir.clone().filter(|_| st.fed == frontier) {
+        if let Some(dir) = self.cold_dir.clone() {
             let meta = ContentPackMeta {
                 version: ContentPackMeta::VERSION,
                 layout_id,

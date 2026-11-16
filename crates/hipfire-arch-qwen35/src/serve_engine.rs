@@ -7959,16 +7959,38 @@ fn kvmem_catalog_and_pin(
         }
     }
     // 期3 G3 P1.1 dn-persist: co-locate the recurrent state with the pack.
-    // Only at the LIVE frontier (prefill-boundary freeze); the endpoint freeze
-    // labels an earlier covered frontier whose state the live one no longer
-    // holds, so it carries no sidecar (restart reuse falls back to cold).
-    if !deduped && ctl.fed_tokens(s) == Some(boundary) {
+    // Live-frontier freezes export the live DN state; endpoint/coverage
+    // freezes label an earlier frontier whose state lives in the checkpoint
+    // pool (the coverage capture), so export THAT snapshot's bytes. Without a
+    // source the pack carries no sidecar (restart reuse falls back to cold).
+    if !deduped {
         if let Some(pack) = ctl.prefix_pack_path(id) {
             let dn_path = std::path::PathBuf::from(format!("{}.dn", pack.display()));
-            match crate::speculative::DeltaNetSnapshot::export_host_from_state(
-                &rig.gpu,
-                &rig.model.dn_states[s],
-            ) {
+            let live = ctl.fed_tokens(s) == Some(boundary);
+            let exported: Result<Vec<u8>, String> = if live {
+                crate::speculative::DeltaNetSnapshot::export_host_from_state(
+                    &rig.gpu,
+                    &rig.model.dn_states[s],
+                )
+            } else {
+                let domain = rig
+                    .cache_domain
+                    .as_ref()
+                    .ok_or_else(|| "no cache domain".to_string())?;
+                let fp = crate::checkpoint::prefix_fingerprint(
+                    &tokens[..boundary as usize],
+                );
+                match rig
+                    .model
+                    .checkpoint_pool
+                    .as_ref()
+                    .and_then(|pool| pool.peek(domain, boundary as u64, fp))
+                {
+                    Some(snapshot) => snapshot.export_host(&rig.gpu),
+                    None => Err("no recurrent checkpoint at the frozen frontier".to_string()),
+                }
+            };
+            match exported {
                 Ok(bytes) => {
                     let tmp = std::path::PathBuf::from(format!("{}.tmp", dn_path.display()));
                     match std::fs::write(&tmp, &bytes)
@@ -7980,7 +8002,7 @@ fn kvmem_catalog_and_pin(
                                 .is_some_and(|v| v == "1" || v == "on" || v == "true")
                             {
                                 eprintln!(
-                                    "[kvmem-pack] DN sidecar {} bytes at frontier {boundary}",
+                                    "[kvmem-pack] DN sidecar {} bytes at frontier {boundary} (live={live})",
                                     bytes.len()
                                 );
                             }
@@ -7988,7 +8010,7 @@ fn kvmem_catalog_and_pin(
                         Err(e) => eprintln!("[kvmem-pack] DN sidecar skipped: {e}"),
                     }
                 }
-                Err(e) => eprintln!("[kvmem-pack] DN export skipped: {e}"),
+                Err(e) => eprintln!("[kvmem-pack] DN sidecar skipped: {e}"),
             }
         }
     }
