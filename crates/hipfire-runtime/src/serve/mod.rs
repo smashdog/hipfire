@@ -252,6 +252,9 @@ pub struct KvMemStats {
     pub content_groups: u64,
     /// Entries retired by the group-aware publication plan.
     pub content_retirements: u64,
+    /// 期3 G3-SSD: content-cache account bytes (charged) and its disk tier.
+    pub content_cache_bytes: u64,
+    pub content_cache_disk_bytes: u64,
 }
 
 /// Speculative-decoding telemetry (期4, KVMem/nInfer `speculative.hpp`

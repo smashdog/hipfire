@@ -204,3 +204,49 @@ fn snapshot_capture_refuses_a_store_without_packed_records() {
     assert!(!raw.has_packed(1));
     assert!(raw.capture_snapshot(1, None).is_err());
 }
+
+#[test]
+fn copy_prefix_to_reproduces_packed_bytes_and_mean_and_separates_accounts() {
+    let a = Storage::new_ram(1 << 30).expect("a");
+    let b = Storage::new_ram(1 << 30).expect("b");
+    let src = RawStore::new(raw_config(), Some(&a)).expect("src");
+    fill(&src, 3);
+    let canonical = src.fork_prefix(2 * BLOCK).expect("fork");
+    let dst = RawStore::new(raw_config(), Some(&b)).expect("dst");
+    assert!(!dst.has_packed(1));
+    canonical.copy_prefix_to(&dst, 2).expect("copy");
+    assert!(dst.has_packed(2));
+    assert!(!dst.has_k_gpu(2, 0, BLOCK), "only the prefix blocks copy");
+    for blk in 0..2 {
+        for il in 0..LAYERS {
+            let mut k0 = vec![0u8; BLOCK as usize * ROW_BYTES];
+            let mut k1 = vec![0u8; BLOCK as usize * ROW_BYTES];
+            assert!(canonical.copy_k_gpu(blk, il, &mut k0, BLOCK));
+            assert!(dst.copy_k_gpu(blk, il, &mut k1, BLOCK));
+            assert_eq!(k0, k1, "packed K block {blk} layer {il}");
+            let mut v0 = vec![0u8; BLOCK as usize * ROW_BYTES];
+            let mut v1 = vec![0u8; BLOCK as usize * ROW_BYTES];
+            assert!(canonical.copy_v_gpu(blk, il, &mut v0, BLOCK));
+            assert!(dst.copy_v_gpu(blk, il, &mut v1, BLOCK));
+            assert_eq!(v0, v1, "packed V block {blk} layer {il}");
+            let mut m0 = vec![0f32; K_WIDTH];
+            let mut m1 = vec![0f32; K_WIDTH];
+            canonical.mean_k(blk, il, &mut m0);
+            dst.mean_k(blk, il, &mut m1);
+            assert_eq!(m0, m1, "Mean-K block {blk} layer {il}");
+            assert_eq!(
+                canonical.mean_k_tokens(blk, il),
+                dst.mean_k_tokens(blk, il),
+                "Mean-K token count block {blk} layer {il}"
+            );
+        }
+    }
+    // Separate accounts: both carry their own bytes, and later destination
+    // writes never charge the source account.
+    assert!(a.charged_bytes() > 0, "source account charged");
+    assert!(b.charged_bytes() > 0, "content account charged");
+    let before = a.charged_bytes();
+    dst.write_layer_k_gpu(2 * BLOCK, BLOCK, 0, &vec![7u8; BLOCK as usize * ROW_BYTES])
+        .expect("dst write");
+    assert_eq!(a.charged_bytes(), before, "writes stay in the destination account");
+}
