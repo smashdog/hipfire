@@ -121,6 +121,11 @@ pub mod kvmem_ctl;
 /// nothing and mutates nothing, keeping the Legacy serve byte-neutral.
 #[cfg(feature = "kvmem")]
 pub mod kvmem_prefix;
+/// G7 multimodal × KVMem Stage A: vision spans as indivisible prefix groups
+/// (nInfer `layerwise_media_replay_begin` + core `prefix_anchor`). Pure host
+/// logic; no engine call site yet (additive, byte-neutral).
+#[cfg(feature = "kvmem")]
+pub mod kvmem_media;
 /// Layerwise Q8 packed-page layout adapter (Phase 3.2 ①地基): bridges hipfire Q8
 /// geometry to the core generic `PayloadLayout` manifest + the crate-agnostic
 /// packed arena. Clean sibling to `kvmem_ctl`; not wired into live serve in ①.
