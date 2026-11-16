@@ -7669,11 +7669,13 @@ fn run_loop(
             // the branch's composite export fails closed). Freeze
             // the newly completed page-aligned prefix into the canonical
             // catalog: DeltaNet checkpoint + immutable host fork + sealed GPU
-            // page PIN (cache refs). Prefill chunks of text-only sessions only;
-            // the chunk must END page-aligned (the live recurrent state sits at
-            // next_pos and cannot be relabelled to an earlier boundary, spec
-            // §4.5). Generated rows are never frozen — the shared prefix is
-            // prompt content; generation stays session-private. Opportunistic:
+            // page PIN (cache refs). The chunk must END page-aligned (the live
+            // recurrent state sits at next_pos and cannot be relabelled to an
+            // earlier boundary, spec §4.5). G7: vision sessions freeze too; a
+            // boundary that would split an image span is skipped below, and the
+            // checkpoint carries the image identity. Generated rows are never
+            // frozen — the shared prefix is prompt content; generation stays
+            // session-private. Opportunistic:
             // a failed freeze skips the boundary (the request continues cold-
             // reusable at earlier anchors), it never poisons the serve loop.
             #[cfg(feature = "kvmem")]
@@ -7682,9 +7684,11 @@ fn run_loop(
                     if batch.m_per_slot[s] == 0 || !freeze_snapshot[s].0 {
                         continue;
                     }
-                    if work[s].vl_prefill.is_some() {
-                        continue;
-                    }
+                    // G7 Stage B2 pending: vision rows are not yet fed into the
+                    // KVMem packed store, so a VL freeze would fork an
+                    // incomplete canonical (the pack write already fails closed
+                    // with "incomplete packed source"). Keep VL freezes off
+                    // until the feed lands.
                     if slots[s]
                         .as_ref()
                         .and_then(|f| rig.sessions.get(f.session))
@@ -7714,6 +7718,26 @@ fn run_loop(
                         }
                         _ => continue,
                     };
+                    // G7: never freeze a boundary that splits an image span;
+                    // carry the session's media identity into the checkpoint.
+                    let (media_digest, all_spans) = kvmem_session_media(&rig, session);
+                    if all_spans
+                        .iter()
+                        .any(|&(b, e)| (b as usize) < boundary && boundary < e as usize)
+                    {
+                        if rig.gpu.slot_trace() {
+                            eprintln!(
+                                "[kvmem-prefix] slot {s} boundary {boundary} not frozen: \
+                                 splits a media span"
+                            );
+                        }
+                        continue;
+                    }
+                    let media_spans: Vec<(u32, u32)> = all_spans
+                        .iter()
+                        .copied()
+                        .filter(|&(_, e)| (e as usize) <= boundary)
+                        .collect();
                     // PIN requires residency: every prefix page must still be
                     // bound (a spilled page has no physical handle to pin).
                     let n_pages = boundary / PAGE_TOKENS;
@@ -7777,7 +7801,15 @@ fn run_loop(
                             );
                         }
                         // 2-4. Host freeze + displaced release + page PIN.
-                        kvmem_catalog_and_pin(&mut rig, s, boundary as u32, &tokens, &page_indices)
+                        kvmem_catalog_and_pin(
+                            &mut rig,
+                            s,
+                            boundary as u32,
+                            &tokens,
+                            &page_indices,
+                            media_digest,
+                            media_spans.clone(),
+                        )
                     })();
                     match freeze_result {
                         Ok(()) => {
@@ -7866,6 +7898,29 @@ fn run_loop(
     }
 }
 
+/// G7: the session's media identity + image spans over `tokens` (the frozen
+/// prefix). Text-only sessions and pre-image prefixes yield `(None, vec![])`.
+#[cfg(feature = "kvmem")]
+fn kvmem_session_media(rig: &Rig, session: SessionId) -> (Option<u64>, Vec<(u32, u32)>) {
+    let Some(sess) = rig.sessions.get(session) else {
+        return (None, Vec::new());
+    };
+    if !sess.has_image || sess.media_n_visual == 0 {
+        return (sess.media_digest.filter(|_| sess.has_image), Vec::new());
+    }
+    let Some(pad) = rig.tokenizer.special_token_id("<|image_pad|>") else {
+        return (sess.media_digest, Vec::new());
+    };
+    // Spans over the FULL session token stream: a mid-image boundary must be
+    // recognized as a split even though the prefix truncates the run.
+    let spans: Vec<(u32, u32)> =
+        crate::kvmem_media::spans_from_pad_runs(&sess.tokens, pad, sess.media_n_visual)
+            .into_iter()
+            .map(|s| (s.begin as u32, s.end as u32))
+            .collect();
+    (sess.media_digest, spans)
+}
+
 /// P2.2b2: freeze the canonical host prefix, release displaced GPU refs and PIN
 /// this prefix's pages. Shared by the prefill-boundary freeze (after its
 /// DeltaNet capture) and the terminal endpoint freeze (which reuses a coverage
@@ -7878,13 +7933,16 @@ fn kvmem_catalog_and_pin(
     boundary: u32,
     tokens: &[u32],
     page_indices: &[u32],
+    media_digest: Option<u64>,
+    media_spans: Vec<(u32, u32)>,
 ) -> Result<(), String> {
     let ctl = rig
         .model
         .kvmem
         .as_mut()
         .ok_or_else(|| "kvmem freeze: no controller".to_string())?;
-    let (id, displaced, deduped) = ctl.freeze_prefix(s, boundary, tokens)?;
+    let (id, displaced, deduped) =
+        ctl.freeze_prefix_with_media(s, boundary, tokens, media_digest, media_spans)?;
     for d in displaced {
         if let Some(pp) = rig.pool.page_pool_mut() {
             for &phys in &d.gpu_pages {
@@ -8107,6 +8165,7 @@ fn kvmem_freeze_endpoint(rig: &mut Rig, slots: &mut [Option<InFlight>], s: usize
     let Some(sess) = rig.sessions.get(session) else {
         return;
     };
+    // G7 Stage B2 pending (see the prefill freeze note): no VL freezes yet.
     if sess.has_image {
         return;
     }
@@ -8147,6 +8206,17 @@ fn kvmem_freeze_endpoint(rig: &mut Rig, slots: &mut [Option<InFlight>], s: usize
         return;
     }
     let tokens: Vec<u32> = sess.tokens[..boundary as usize].to_vec();
+    // G7: the endpoint frontier must not split an image span; carry the
+    // session's media identity into the checkpoint.
+    let (media_digest, all_spans) = kvmem_session_media(rig, session);
+    if all_spans.iter().any(|&(b, e)| b < boundary && boundary < e) {
+        return;
+    }
+    let media_spans: Vec<(u32, u32)> = all_spans
+        .iter()
+        .copied()
+        .filter(|&(_, e)| e <= boundary)
+        .collect();
     let Some(domain) = rig.cache_domain.as_ref() else {
         return;
     };
@@ -8159,7 +8229,15 @@ fn kvmem_freeze_endpoint(rig: &mut Rig, slots: &mut [Option<InFlight>], s: usize
     {
         return;
     }
-    match kvmem_catalog_and_pin(rig, s, boundary, &tokens, &page_indices) {
+    match kvmem_catalog_and_pin(
+        rig,
+        s,
+        boundary,
+        &tokens,
+        &page_indices,
+        media_digest,
+        media_spans,
+    ) {
         Ok(()) => {
             if let Some(f) = slots[s].as_mut() {
                 f.last_frozen_boundary = boundary as usize;
@@ -9376,17 +9454,28 @@ fn admit(
     // Cross-session reuse from the canonical catalog (the radix stays OFF
     // under KVMem). Order: provenance-validated host fork → DeltaNet restore
     // → GPU page share. Any failure unwinds to the cold state (host reset +
-    // DN reset; a refused share is non-mutating by contract). Vision requests
-    // skip reuse (their KV carries M-RoPE phases the shared prefix lacks).
+    // DN reset; a refused share is non-mutating by contract).
+    //
+    // G7: vision requests participate too, gated by the media identity. A
+    // checkpoint covering an image span is eligible only when the incoming
+    // request's digest (this turn's image, or the session's sticky digest for
+    // a text continuation) equals it — token proofs cannot distinguish two
+    // images (identical `image_pad` ids).
     let mut prefix_reused: usize = 0;
     let mut prefix_hit = false;
+    #[cfg(feature = "kvmem")]
+    let req_media: Option<u64> = req
+        .visual_data
+        .as_ref()
+        .map(|vd| vd.media_digest())
+        .or_else(|| rig.sessions.get(id).and_then(|s| s.media_digest));
     #[cfg(feature = "kvmem")]
     if rig.kvmem_prefix_pin && req.visual_data.is_none() {
         // 期3 G3 P1.1: a cold pack hit publishes a catalog entry and may
         // displace others; release their GPU cache refs outside the borrow.
         let mut cold_displaced = Vec::new();
         let hit = rig.model.kvmem.as_mut().and_then(|ctl| {
-            let hit = ctl.prefix_lookup(&req.prompt_tokens);
+            let hit = ctl.prefix_lookup_media(&req.prompt_tokens, req_media);
             cold_displaced = ctl.take_cold_displaced();
             hit
         });
@@ -9452,7 +9541,8 @@ fn admit(
                         }
                         if start.restore_tokens < frontier as u64 {
                             let cap = start.restore_tokens as u32;
-                            let shorter = ctl.prefix_lookup_capped(&req.prompt_tokens, cap);
+                            let shorter =
+                                ctl.prefix_lookup_capped_media(&req.prompt_tokens, cap, req_media);
                             let Some(sid) = shorter.filter(|&sid| sid != reuse_id) else {
                                 return Err(format!(
                                     "kvmem reuse: import pressure narrows {} -> {} tokens \
@@ -10099,6 +10189,13 @@ fn admit(
         // image turn". `has_image` is the publish/lookup gate for the prefix
         // cache (spec §6 X2).
         sess.has_image = sess.has_image || req.visual_data.is_some();
+        // G7: sticky media identity of the newest image turn. A text
+        // continuation inherits it so a checkpoint covering the image span
+        // stays eligible only for the same image.
+        if let Some(vd) = req.visual_data.as_ref() {
+            sess.media_digest = Some(vd.media_digest());
+            sess.media_n_visual = vd.n_visual_tokens;
+        }
     }
 
     if send_event(
@@ -10179,8 +10276,22 @@ fn admit(
     }
     let grammar_constrained = grammar_constraint.is_some();
     if let Some(vd) = req.visual_data {
-        work[slot.0].remaining_prompt = req.prompt_tokens.clone();
-        work[slot.0].next_pos = 0;
+        // G7: a converted prefix hit prefills only the suffix. The M-RoPE
+        // table stays absolute (`base = 0`, indexed by the absolute `pos`),
+        // and visual_idx skips the image pads that already live in the
+        // imported prefix (freeze never splits an image span, so the prefix
+        // holds the whole image or none of it).
+        let pad = rig
+            .tokenizer
+            .special_token_id("<|image_pad|>")
+            .unwrap_or(u32::MAX);
+        let prefix_pads = req.prompt_tokens[..reused]
+            .iter()
+            .filter(|&&t| t == pad)
+            .count()
+            .min(vd.n_visual_tokens);
+        work[slot.0].remaining_prompt = req.prompt_tokens[reused..].to_vec();
+        work[slot.0].next_pos = reused;
         work[slot.0].pos3_delta = 0; // phases come from the VL table below
                                      // Drop any previous request's vision state: the new request's
                                      // embeddings are not produced until its first batched chunk, and the
@@ -10195,11 +10306,8 @@ fn admit(
             n_visual_tokens: vd.n_visual_tokens,
             embeddings: Vec::new(),
             dim: rig.model.config.dim,
-            visual_idx: 0,
-            image_pad_id: rig
-                .tokenizer
-                .special_token_id("<|image_pad|>")
-                .unwrap_or(u32::MAX),
+            visual_idx: prefix_pads,
+            image_pad_id: pad,
             mrope_positions: vd.mrope_positions,
             rope_delta: vd.rope_delta,
             base: 0,

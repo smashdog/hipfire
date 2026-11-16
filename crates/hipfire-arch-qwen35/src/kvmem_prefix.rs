@@ -109,6 +109,13 @@ pub struct ContentPackMeta {
     pub group: u64,
     pub original_query: Option<(u64, u64)>,
     pub n_record_layers: u32,
+    /// G7: media identity of the image turn inside this prefix (`None` for
+    /// text-only checkpoints) and its image token spans (absolute prompt
+    /// coordinates). Older packs decode as text-only (serde defaults).
+    #[serde(default)]
+    pub media_digest: Option<u64>,
+    #[serde(default)]
+    pub media_spans: Vec<(u32, u32)>,
 }
 
 impl ContentPackMeta {
@@ -228,9 +235,28 @@ impl ColdPackIndex {
     /// Longest pack whose FULL token proof matches `prompt` (same rule as the
     /// hot catalog; a fingerprint alone is never the admission proof).
     pub fn lookup(&self, prompt: &[u32], layout_id: u64) -> Option<usize> {
+        self.lookup_media(prompt, layout_id, None)
+    }
+
+    /// Media-aware cold-pack lookup (G7): same full token proof, plus the
+    /// pack's media digest must match when it covers a media span.
+    pub fn lookup_media(
+        &self,
+        prompt: &[u32],
+        layout_id: u64,
+        media: Option<u64>,
+    ) -> Option<usize> {
         let mut best: Option<usize> = None;
         for (i, p) in self.packs.iter().enumerate() {
             if p.meta.layout_id != layout_id || p.meta.frontier as usize > prompt.len() {
+                continue;
+            }
+            if !meta_media_eligible(
+                p.meta.frontier,
+                &p.meta.media_spans,
+                p.meta.media_digest,
+                media,
+            ) {
                 continue;
             }
             let f = p.meta.frontier as usize;
@@ -324,6 +350,13 @@ pub struct PrefixCheckpoint {
     /// FAIRNESS hint only — it never authorizes reuse or overwrites a proof.
     /// 0 = unknown origin (independent group, as in the core policy).
     pub group: u64,
+    /// G7: media identity of the image turn inside this prefix (`None` for
+    /// text-only checkpoints). A token proof cannot distinguish two images, so
+    /// a checkpoint covering a media span is eligible only when the incoming
+    /// request's digest equals this one.
+    pub media_digest: Option<u64>,
+    /// G7: image token spans (absolute prompt coordinates) inside the prefix.
+    pub media_spans: Vec<(u32, u32)>,
     /// 期3 G3 P1.1: persistent pack file backing this checkpoint (set at
     /// freeze when the live frontier matches, and on a cold load). The DN
     /// sidecar sits beside it (`<pack>.dn`).
@@ -346,7 +379,24 @@ pub struct PrefixCheckpoint {
     last_used: u64,
 }
 
+/// G7 media eligibility: a prefix without a fully-inside media span is
+/// reusable by any request; a prefix covering an image span requires an
+/// identical, present media digest (token proofs cannot distinguish images).
+pub fn meta_media_eligible(
+    frontier: u32,
+    spans: &[(u32, u32)],
+    digest: Option<u64>,
+    media: Option<u64>,
+) -> bool {
+    let covers = spans.iter().any(|&(_, end)| end <= frontier);
+    !covers || (digest.is_some() && digest == media)
+}
+
 impl PrefixCheckpoint {
+    /// G7: see [`meta_media_eligible`].
+    pub fn media_eligible(&self, media: Option<u64>) -> bool {
+        meta_media_eligible(self.frontier, &self.media_spans, self.media_digest, media)
+    }
     /// Build a frozen checkpoint around an immutable canonical archive
     /// (`source.fork_prefix(frontier)`). The fingerprint is derived from the
     /// full token proof; `gpu_pages` starts empty (the engine attaches the
@@ -372,6 +422,8 @@ impl PrefixCheckpoint {
             gpu_pages: Vec::new(),
             original_query: None,
             group: 0,
+            media_digest: None,
+            media_spans: Vec::new(),
             pack_path: None,
             canonical,
             kv_snapshot: None,
@@ -633,11 +685,26 @@ impl PrefixCatalog {
 
     /// Look up the LONGEST frozen prefix fully proven by `prompt`
     /// (fingerprint fast reject + full token equality). Touches the winner
-    /// (LRU). Returns the checkpoint id.
+    /// (LRU). Returns the checkpoint id. Text-only lookup (`media` None):
+    /// checkpoints covering an image span are never eligible.
     pub fn lookup(&mut self, prompt: &[u32], dst_layout: u64) -> Option<u64> {
+        self.lookup_media(prompt, dst_layout, None)
+    }
+
+    /// Media-aware lookup (G7): identical proof, additionally requiring the
+    /// checkpoint's media digest to match when the prefix covers a media span.
+    pub fn lookup_media(
+        &mut self,
+        prompt: &[u32],
+        dst_layout: u64,
+        media: Option<u64>,
+    ) -> Option<u64> {
         let mut best: Option<(u64, u32)> = None;
         for e in &self.entries {
             if e.layout_id != dst_layout || e.frontier as usize > prompt.len() {
+                continue;
+            }
+            if !e.media_eligible(media) {
                 continue;
             }
             let f = e.frontier as usize;
@@ -664,9 +731,23 @@ impl PrefixCatalog {
     /// fall back to an earlier coverage checkpoint when the longest one cannot
     /// start inside the layerwise window. Touches the winner (LRU).
     pub fn lookup_at_most(&mut self, prompt: &[u32], dst_layout: u64, max_frontier: u32) -> Option<u64> {
+        self.lookup_at_most_media(prompt, dst_layout, max_frontier, None)
+    }
+
+    /// Media-aware [`Self::lookup_at_most`] (G7).
+    pub fn lookup_at_most_media(
+        &mut self,
+        prompt: &[u32],
+        dst_layout: u64,
+        max_frontier: u32,
+        media: Option<u64>,
+    ) -> Option<u64> {
         let mut best: Option<(u64, u32)> = None;
         for e in &self.entries {
             if e.layout_id != dst_layout || e.frontier > max_frontier || e.frontier as usize > prompt.len() {
+                continue;
+            }
+            if !e.media_eligible(media) {
                 continue;
             }
             let f = e.frontier as usize;
@@ -898,6 +979,8 @@ mod tests {
             gpu_pages: Vec::new(),
             original_query: None,
             group: 0,
+            media_digest: None,
+            media_spans: Vec::new(),
             pack_path: None,
             canonical,
             kv_snapshot: None,
@@ -1032,6 +1115,40 @@ mod tests {
         assert!(remaining.is_some(), "the newest (longest) prefix survives");
         // The same selection is idempotent.
         assert!(cat.prune_policy(1, 1 << 30, 4096, 0).is_empty());
+    }
+
+    /// G7: a checkpoint covering an image span is eligible only for the same
+    /// media digest; text-only checkpoints stay eligible for everyone.
+    #[test]
+    fn catalog_media_gate_requires_the_same_digest() {
+        let st = storage();
+        let toks = tokens(256);
+        let mut cat = PrefixCatalog::new(4);
+        let layout = layout_fingerprint(&raw_config());
+        let mut imaged = checkpoint(&st, cat.mint_id(), 128, &toks[..128]);
+        imaged.media_digest = Some(0x11);
+        imaged.media_spans = vec![(0, 64)];
+        let plain = checkpoint(&st, cat.mint_id(), 256, &toks);
+        cat.insert(imaged).expect("insert imaged");
+        cat.insert(plain).expect("insert plain");
+        assert_eq!(
+            cat.lookup_media(&toks[..128], layout, None),
+            None,
+            "text-only requests must not reuse an image checkpoint"
+        );
+        assert_eq!(cat.lookup_media(&toks[..128], layout, Some(0x11)), Some(1));
+        assert_eq!(cat.lookup_media(&toks[..128], layout, Some(0x22)), None);
+        assert_eq!(
+            cat.lookup(&toks, layout),
+            Some(2),
+            "text-only checkpoints remain eligible"
+        );
+        // The capped variant applies the same gate.
+        assert_eq!(cat.lookup_at_most_media(&toks, layout, 128, None), None);
+        assert_eq!(
+            cat.lookup_at_most_media(&toks, layout, 128, Some(0x11)),
+            Some(1)
+        );
     }
 
     /// 期3 G3 follow-up: catalog accounting charges a `SealedKvBlock` origin
@@ -1244,6 +1361,8 @@ mod tests {
                 group: 7,
                 original_query: Some((0, 10)),
                 n_record_layers: LAYERS,
+                media_digest: None,
+                media_spans: Vec::new(),
             };
             let path = dir.join(name);
             canonical

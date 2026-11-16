@@ -79,6 +79,14 @@ pub struct Session {
     /// KV to the radix and a later text request could restore it — silent
     /// wrong output (spec §6 X2). `has_image` is the positive marker.
     pub has_image: bool,
+    /// G7: sticky media identity of the newest image turn in this
+    /// conversation (FNV digest of the vision patches + M-RoPE). A text
+    /// continuation inherits it; prefix reuse requires it to match any
+    /// checkpoint that covers the image span.
+    pub media_digest: Option<u64>,
+    /// G7: visual-token count of the newest image turn (bounds the
+    /// `image_pad` runs that form the media spans).
+    pub media_n_visual: usize,
     /// Highest page-aligned token boundary of this session's KV that has
     /// been published to the cross-session prefix cache (spec §4.6 C6).
     ///
@@ -149,6 +157,8 @@ impl SessionTable {
                 convo: Vec::new(),
                 rope_delta: 0,
                 has_image: false,
+                media_digest: None,
+                media_n_visual: 0,
                 published_boundary: 0,
                 admitted: true,
                 last_used: {
