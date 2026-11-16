@@ -60,8 +60,8 @@ use saddle_core::kv::KvMode;
 
 use crate::kvmem_taps::KvMemTaps;
 use crate::kvmem_prefix::{
-    layout_fingerprint, ColdPack, ColdPackIndex, ContentPackMeta, PrefixCatalog, PrefixCheckpoint,
-    PREFIX_PAGE_TOKENS,
+    layout_fingerprint, sidecar_path, ColdPack, ColdPackIndex, ContentPackMeta, PrefixCatalog,
+    PrefixCheckpoint, PREFIX_PAGE_TOKENS, SIDECAR_MIN_BYTES,
 };
 use crate::layerwise_driver::{layerwise_backend, layerwise_capabilities, OutputAcceptanceSnapshot};
 use crate::layerwise_layout::LayerwiseMtpQ8Layout;
@@ -1728,14 +1728,39 @@ impl KvMemCtl {
             let path = dir.join(format!(
                 "p{layout_id:016x}-{frontier:08}-{fingerprint:016x}{media_tag}.hkpack"
             ));
-            let written = meta
-                .encode()
-                .and_then(|bytes| {
+            // Idempotent publish: a previous freeze of this exact token proof
+            // already left a complete pack + recurrent sidecar pair. Reusing
+            // it avoids rewriting ~pack + DN bytes and guarantees the pair
+            // stays coherent (the sidecar is only skipped with its pack).
+            let side = sidecar_path(&path);
+            let complete_pair = self.cold_packs.contains_path(&path)
+                && std::fs::metadata(&path)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
+                && std::fs::metadata(&side)
+                    .map(|m| m.len() >= SIDECAR_MIN_BYTES)
+                    .unwrap_or(false);
+            let written = if complete_pair {
+                if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+                    .ok()
+                    .is_some_and(|v| v == "1" || v == "on" || v == "true")
+                {
+                    eprintln!(
+                        "[kvmem-pack] reuse complete pack+sidecar frontier={frontier}"
+                    );
+                }
+                Ok(())
+            } else {
+                // A rewrite must never pair a fresh pack with a stale sidecar.
+                let _ = std::fs::remove_file(&side);
+                self.cold_packs.set_sidecar_bytes(&path, 0);
+                meta.encode().and_then(|bytes| {
                     entry
                         .canonical()
                         .write_prefix_pack(blocks, &path, &bytes)
                         .map_err(|e| e.to_string())
-                });
+                })
+            };
             match written {
                 Ok(()) => {
                     entry.pack_path = Some(path.clone());
@@ -1746,6 +1771,7 @@ impl KvMemCtl {
                             meta,
                             fingerprint,
                             bytes,
+                            sidecar_bytes: 0,
                             stamp: 0,
                         });
                     }
@@ -2301,9 +2327,48 @@ impl KvMemCtl {
     }
 
     /// 期3 G3 P1.1: the pack file backing a cataloged checkpoint (the DN
-    /// sidecar lives beside it as `<pack>.dn`).
+    /// sidecar lives beside it as `<pack>.dn`). Returns `None` once the pack
+    /// was pruned from the disk index, so callers never create an orphan
+    /// sidecar for a vanished pack.
     pub fn prefix_pack_path(&self, id: u64) -> Option<std::path::PathBuf> {
-        self.prefix_catalog.get(id).and_then(|c| c.pack_path.clone())
+        let path = self
+            .prefix_catalog
+            .get(id)
+            .and_then(|c| c.pack_path.clone())?;
+        self.cold_packs.contains_path(&path).then_some(path)
+    }
+
+    /// A complete reusable pack + recurrent sidecar pair already exists for
+    /// `id` (post-freeze). The engine skips the DN export when true.
+    pub fn prefix_sidecar_ready(&self, id: u64) -> bool {
+        let Some(pack) = self.prefix_pack_path(id) else {
+            return false;
+        };
+        std::fs::metadata(sidecar_path(&pack))
+            .map(|m| m.len() >= SIDECAR_MIN_BYTES)
+            .unwrap_or(false)
+    }
+
+    /// Record the recurrent sidecar written beside a pack. The whole cache
+    /// directory (packs + sidecars) is re-pruned under `HIPFIRE_KVMEM_CACHE_BYTES`.
+    /// When the pack disappeared meanwhile, drop the orphan sidecar instead.
+    pub fn note_pack_sidecar(&mut self, path: &std::path::Path, bytes: u64) {
+        if !self.cold_packs.set_sidecar_bytes(path, bytes) {
+            let _ = std::fs::remove_file(sidecar_path(path));
+            return;
+        }
+        let removed = self.cold_packs.prune_to(self.cold_bytes);
+        if !removed.is_empty()
+            && hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+                .ok()
+                .is_some_and(|v| v == "1" || v == "on" || v == "true")
+        {
+            eprintln!(
+                "[kvmem-pack] pruned {} pack(s), {} disk bytes retained",
+                removed.len(),
+                self.cold_packs.disk_bytes()
+            );
+        }
     }
 
     /// Host-store length of `slot` (tokens whose statistics are recorded).
@@ -6270,6 +6335,64 @@ mod tests {
         // A foreign prompt is neither a hot nor a cold proof.
         ctl2.reset_slot(0).expect("reset");
         assert!(ctl2.prefix_lookup(&prefix_tokens(128, 77)).is_none());
+        std::env::remove_var("HIPFIRE_KVMEM_CACHE_BYTES");
+        std::env::remove_var("HIPFIRE_KVMEM_CACHE_DIR");
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 期3 G3 optional micro-opt: a complete pack + recurrent sidecar pair is
+    /// idempotent across restarts — a re-freeze of the same token proof reuses
+    /// the bytes instead of rewriting the artifact. A missing sidecar forces a
+    /// coherent pack rewrite (the engine then exports a fresh DN image).
+    #[test]
+    fn content_pack_idempotent_publish_reuses_complete_pair() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let dir = std::env::temp_dir().join(format!("kvmem-idempotent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("HIPFIRE_KVMEM_CACHE_DIR", dir.to_str().unwrap());
+        std::env::set_var("HIPFIRE_KVMEM_CACHE_BYTES", "16777216");
+        let toks = prefix_tokens(128, 8);
+        let (pack, side) = {
+            let mut ctl =
+                KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
+                    .expect("ctl");
+            prefix_fill(&mut ctl, 0, 1, 8);
+            let (id, _, _) = ctl.freeze_prefix(0, 128, &toks).expect("freeze");
+            let pack = ctl.prefix_pack_path(id).expect("pack path");
+            let side = sidecar_path(&pack);
+            std::fs::write(&side, vec![7u8; 32]).expect("fake sidecar");
+            ctl.note_pack_sidecar(&pack, 32);
+            assert!(ctl.prefix_sidecar_ready(id), "pair is complete");
+            (pack, side)
+        };
+        let before = std::fs::metadata(&pack).expect("pack metadata");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Restart: the scan sees pack + sidecar; the same freeze reuses both.
+        let mut ctl2 =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
+                .expect("ctl2");
+        prefix_fill(&mut ctl2, 0, 1, 8);
+        let (id2, _, _) = ctl2.freeze_prefix(0, 128, &toks).expect("freeze 2");
+        assert!(ctl2.prefix_sidecar_ready(id2), "reused pair stays ready");
+        let after = std::fs::metadata(&pack).expect("pack metadata 2");
+        assert_eq!(before.len(), after.len());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(before.ino(), after.ino(), "complete pair is not rewritten");
+        }
+        assert_eq!(std::fs::read(&side).expect("sidecar read"), vec![7u8; 32]);
+        // Dropping the sidecar breaks the pair: the next freeze rewrites the
+        // pack and readiness stays false until the engine exports a new image.
+        std::fs::remove_file(&side).expect("drop sidecar");
+        let mut ctl3 =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
+                .expect("ctl3");
+        prefix_fill(&mut ctl3, 0, 1, 8);
+        let (id3, _, _) = ctl3.freeze_prefix(0, 128, &toks).expect("freeze 3");
+        assert!(!ctl3.prefix_sidecar_ready(id3), "no sidecar, no ready pair");
+        assert!(pack.exists(), "pack rewritten for the next DN export");
         std::env::remove_var("HIPFIRE_KVMEM_CACHE_BYTES");
         std::env::remove_var("HIPFIRE_KVMEM_CACHE_DIR");
         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
