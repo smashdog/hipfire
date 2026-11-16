@@ -667,6 +667,18 @@ impl Metrics {
                 );
                 counter(
                     &mut out,
+                    "hipfire_kvmem_prefix_catalog_hits_total",
+                    "Prefix hits served from the hot catalog without reading a pack.",
+                    s.kvmem.prefix_catalog_hits,
+                );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_prefix_restore_hits_total",
+                    "Reuse conversions that restored a page-less (demoted or restart) entry from the sealed archive.",
+                    s.kvmem.prefix_restore_hits,
+                );
+                counter(
+                    &mut out,
                     "hipfire_kvmem_draft_images_total",
                     "DFlash2 draft conditioning images captured with prefix checkpoints.",
                     s.kvmem.draft_images,
@@ -724,6 +736,12 @@ impl Metrics {
                     "hipfire_kvmem_cold_pack_hits_total",
                     "Prefix lookups served by an on-disk content pack.",
                     s.kvmem.cold_pack_hits,
+                );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_cold_pack_misses_total",
+                    "Cold pack matches that were rejected or failed to load.",
+                    s.kvmem.cold_pack_misses,
                 );
             }
         }
@@ -1145,10 +1163,12 @@ mod tests {
                 "prefix_host_bytes": 3000, "prefix_host_bytes_gross": 5000,
                 "prefix_freezes": 5, "prefix_hits": 4,
                 "prefix_misses": 6, "prefix_evictions": 1, "prefix_demotions": 2,
+                "prefix_catalog_hits": 3, "prefix_restore_hits": 2,
                 "draft_images": 2, "draft_image_hits": 1, "draft_image_misses": 1,
                 "content_groups": 2, "content_retirements": 1,
                 "content_cache_bytes": 4096, "content_cache_disk_bytes": 2048,
                 "content_packs": 3, "content_pack_bytes": 8192, "cold_pack_hits": 1,
+                "cold_pack_misses": 1,
             },
         });
         let kvmeta = ServeMeta {
@@ -1177,6 +1197,8 @@ mod tests {
             "hipfire_kvmem_prefix_misses_total 6\n",
             "hipfire_kvmem_prefix_evictions_total 1\n",
             "hipfire_kvmem_prefix_demotions_total 2\n",
+            "hipfire_kvmem_prefix_catalog_hits_total 3\n",
+            "hipfire_kvmem_prefix_restore_hits_total 2\n",
             "hipfire_kvmem_draft_images_total 2\n",
             "hipfire_kvmem_draft_image_hits_total 1\n",
             "hipfire_kvmem_draft_image_misses_total 1\n",
@@ -1187,6 +1209,7 @@ mod tests {
             "hipfire_kvmem_content_packs 3\n",
             "hipfire_kvmem_content_pack_bytes 8192\n",
             "hipfire_kvmem_cold_pack_hits_total 1\n",
+            "hipfire_kvmem_cold_pack_misses_total 1\n",
         ] {
             assert!(out.contains(sample), "{sample}: {out}");
         }

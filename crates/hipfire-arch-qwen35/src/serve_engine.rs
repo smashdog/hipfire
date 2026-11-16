@@ -9606,6 +9606,10 @@ fn admit(
                                 .to_string(),
                         );
                     }
+                    // G3 follow-up: page-less Layerwise reuse restores pages
+                    // from the sealed archive on demand; count it apart from a
+                    // hot catalog hit (demotion / restart metrics).
+                    ctl.note_prefix_restore_hit();
                 } else if rig.pool.share_published_pages(slot, &gpu_pages).is_err() {
                     let _ = ctl.reset_slot(slot.0);
                     let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);

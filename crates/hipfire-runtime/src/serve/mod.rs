@@ -251,6 +251,10 @@ pub struct KvMemStats {
     /// Admission-pressure residency demotions: the entry stays cataloged and
     /// only its pinned pages are dropped (Layerwise restores them later).
     pub prefix_demotions: u64,
+    /// Hot catalog hits (no pack read) and reuse conversions that restored a
+    /// page-less (demoted/restart) entry from the sealed archive.
+    pub prefix_catalog_hits: u64,
+    pub prefix_restore_hits: u64,
     /// 期4: DFlash2 draft conditioning images captured with prefix
     /// checkpoints, restored on reuse, and missing/unrestorable (reseed).
     pub draft_images: u64,
@@ -267,6 +271,8 @@ pub struct KvMemStats {
     pub content_packs: u64,
     pub content_pack_bytes: u64,
     pub cold_pack_hits: u64,
+    /// Cold pack matches that were rejected / failed to load.
+    pub cold_pack_misses: u64,
 }
 
 /// Speculative-decoding telemetry (期4, KVMem/nInfer `speculative.hpp`
