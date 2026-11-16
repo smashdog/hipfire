@@ -647,6 +647,24 @@ impl Metrics {
                     "Frozen prefix checkpoints displaced by the LRU bound or admission reclaim.",
                     s.kvmem.prefix_evictions,
                 );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_draft_images_total",
+                    "DFlash2 draft conditioning images captured with prefix checkpoints.",
+                    s.kvmem.draft_images,
+                );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_draft_image_hits_total",
+                    "Prefix reuses that restored the DFlash2 draft conditioning image.",
+                    s.kvmem.draft_image_hits,
+                );
+                counter(
+                    &mut out,
+                    "hipfire_kvmem_draft_image_misses_total",
+                    "Prefix reuses with no restorable DFlash2 draft image (draft reseeds).",
+                    s.kvmem.draft_image_misses,
+                );
             }
         }
 
@@ -1066,6 +1084,7 @@ mod tests {
                 "prefix_entries": 2, "prefix_pinned_pages": 16,
                 "prefix_freezes": 5, "prefix_hits": 4,
                 "prefix_misses": 6, "prefix_evictions": 1,
+                "draft_images": 2, "draft_image_hits": 1, "draft_image_misses": 1,
             },
         });
         let kvmeta = ServeMeta {
@@ -1091,6 +1110,9 @@ mod tests {
             "hipfire_kvmem_prefix_hits_total 4\n",
             "hipfire_kvmem_prefix_misses_total 6\n",
             "hipfire_kvmem_prefix_evictions_total 1\n",
+            "hipfire_kvmem_draft_images_total 2\n",
+            "hipfire_kvmem_draft_image_hits_total 1\n",
+            "hipfire_kvmem_draft_image_misses_total 1\n",
         ] {
             assert!(out.contains(sample), "{sample}: {out}");
         }

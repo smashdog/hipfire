@@ -436,6 +436,143 @@ pub fn reset_dflash_slot(st: &mut DflashSlotState, session: u64) {
     st.draft = None;
 }
 
+/// 期4 (KVMem/nInfer DFlash2 integration): stable identity of the draft
+/// geometry a state image was captured from. A restore refuses a mismatch
+/// instead of seeding garbage into the rings.
+pub fn dflash_geometry_id(shared: &DflashShared) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let d = &shared.draft_config;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    d.n_layers.hash(&mut h);
+    d.hidden.hash(&mut h);
+    d.feature_width().hash(&mut h);
+    d.kv_dim().hash(&mut h);
+    d.head_dim.hash(&mut h);
+    d.target_layer_ids.hash(&mut h);
+    d.all_layers_sliding.hash(&mut h);
+    shared.block_size.hash(&mut h);
+    shared.window.hash(&mut h);
+    h.finish()
+}
+
+/// 期4: capture the DFlash2 draft's conditioning state at a checkpoint whose
+/// frontier equals the draft's LIVE seeded frontier (nInfer native full-state
+/// serialization). Earlier frontiers cannot be reconstructed from the cached
+/// ring — those checkpoints simply carry no image and reseed on reuse.
+pub fn dflash_capture_image(
+    gpu: &Gpu,
+    shared: &DflashShared,
+    st: &DflashSlotState,
+    frontier: usize,
+    floor: usize,
+) -> Result<crate::kvmem_prefix::DraftImage, String> {
+    let d = &shared.draft_config;
+    let w = shared
+        .window
+        .ok_or_else(|| "draft image: not a windowed draft".to_string())?;
+    if !d.all_layers_sliding {
+        return Err("draft image: split/legacy draft shape".to_string());
+    }
+    if st.seeded_through != frontier {
+        return Err(format!(
+            "draft image: draft frontier {} != checkpoint frontier {frontier}",
+            st.seeded_through
+        ));
+    }
+    if frontier > st.scratch.max_ctx_len {
+        return Err(format!(
+            "draft image: frontier {frontier} exceeds draft ctx {}",
+            st.scratch.max_ctx_len
+        ));
+    }
+    let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(1 + 2 * d.n_layers);
+    let mut grab = |t: &GpuTensor| -> Result<(), String> {
+        let mut bytes = vec![0u8; t.buf.size()];
+        gpu.hip
+            .memcpy_dtoh(&mut bytes, &t.buf)
+            .map_err(|e| format!("draft image dtoh: {e:?}"))?;
+        blobs.push(bytes);
+        Ok(())
+    };
+    grab(&st.scratch.target_hidden)?;
+    for l in 0..d.n_layers {
+        grab(&st.scratch.k_ctx_cached[l])?;
+        grab(&st.scratch.v_ctx_cached[l])?;
+    }
+    Ok(crate::kvmem_prefix::DraftImage {
+        geometry: dflash_geometry_id(shared),
+        frontier: frontier as u32,
+        floor: floor as u32,
+        window: w,
+        feature_width: d.feature_width(),
+        kv_dim: d.kv_dim(),
+        n_layers: d.n_layers,
+        proj_cached_rows: st.scratch.thlog.proj_cached_rows(),
+        full_cached_rows: st.scratch.thlog.full_cached_rows(),
+        blobs,
+    })
+}
+
+/// 期4: install a captured draft image into the slot (fresh or reused state)
+/// and publish the restored conditioning frontier + suffix bound. The next
+/// draft cycle conditions on exactly the rows the target verify sees; the
+/// suffix floor is recomputed per draft step from the live Layerwise policy.
+pub fn dflash_restore_image(
+    gpu: &mut Gpu,
+    shared: &DflashShared,
+    st: &mut DflashSlotState,
+    img: &crate::kvmem_prefix::DraftImage,
+    session: u64,
+    frontier: usize,
+) -> Result<(), String> {
+    let d = &shared.draft_config;
+    let w = shared
+        .window
+        .ok_or_else(|| "draft image: not a windowed draft".to_string())?;
+    if img.geometry != dflash_geometry_id(shared) {
+        return Err("draft image: geometry mismatch".to_string());
+    }
+    if img.frontier as usize != frontier || img.window != w || img.n_layers != d.n_layers {
+        return Err(format!(
+            "draft image: frontier/window/layers mismatch ({} vs {frontier}, {} vs {w}, {} vs {})",
+            img.frontier, img.window, img.n_layers, d.n_layers
+        ));
+    }
+    if img.blobs.len() != 1 + 2 * d.n_layers {
+        return Err(format!(
+            "draft image: {} blobs, expected {}",
+            img.blobs.len(),
+            1 + 2 * d.n_layers
+        ));
+    }
+    let mut put = |t: &GpuTensor, b: &[u8]| -> Result<(), String> {
+        if b.len() != t.buf.size() {
+            return Err(format!(
+                "draft image h2d: blob {} bytes != tensor {} bytes",
+                b.len(),
+                t.buf.size()
+            ));
+        }
+        gpu.hip
+            .memcpy_htod(&t.buf, b)
+            .map_err(|e| format!("draft image h2d: {e:?}"))
+    };
+    put(&st.scratch.target_hidden, &img.blobs[0])?;
+    for l in 0..d.n_layers {
+        put(&st.scratch.k_ctx_cached[l], &img.blobs[1 + 2 * l])?;
+        put(&st.scratch.v_ctx_cached[l], &img.blobs[2 + 2 * l])?;
+    }
+    st.scratch.reset_upload_tracking();
+    let abs: Vec<i32> = (0..frontier as i32).collect();
+    st.scratch
+        .thlog
+        .restore_state(abs, img.proj_cached_rows, img.full_cached_rows);
+    st.session = Some(session);
+    st.seeded_through = frontier;
+    st.draft = None;
+    Ok(())
+}
+
 /// `target_hidden` is interleaved `[pos % modulus][layer][h]` — one
 /// `scatter_hidden_block_to_interleaved`-style copy per extract layer.
 pub fn scatter_staging_rows_to_interleaved(
@@ -523,6 +660,7 @@ pub fn dflash_slot_draft_step(
     st: &mut DflashSlotState,
     seed: u32,
     position: usize,
+    ctx_floor: usize,
 ) -> Result<DflashSlotDraft, String> {
     let b = shared.block_size;
     let h = shared.draft_config.hidden;
@@ -590,11 +728,16 @@ pub fn dflash_slot_draft_step(
         .len()
         .min(position)
         .min(st.scratch.max_ctx_len);
+    let ctx_rows_len = st.scratch.thlog.abs_positions().len();
+    let start_idx = ctx_rows_len.saturating_sub(effective_ctx_len);
+    // 期4: absolute retained-suffix floor → row index of the context buffer
+    // (slot positions are contiguous, `abs_positions()[i] == i`). This is the
+    // draft's local-attention lower bound; 0 keeps the historical span.
+    st.scratch.ctx_floor = ctx_floor.saturating_sub(start_idx).min(effective_ctx_len);
     let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
     let mut positions_k: Vec<i32> = Vec::with_capacity(effective_ctx_len + b);
     {
         let th_abs = st.scratch.thlog.abs_positions();
-        let start_idx = th_abs.len().saturating_sub(effective_ctx_len);
         positions_k.extend_from_slice(&th_abs[start_idx..]);
         for p in 0..b {
             positions_k.push(position as i32 + p as i32);

@@ -1561,6 +1561,22 @@ mod target_hidden_log {
         pub fn mark_full_cached(&mut self, l: usize) {
             self.full_cached_rows = l;
         }
+
+        /// 期4 checkpoint restore (KVMem/nInfer DFlash2 integration): install
+        /// the captured row layout and watermarks in one shot. The caller has
+        /// already uploaded the ring bytes; `abs_positions` is the prefix's
+        /// contiguous `0..frontier` list.
+        pub fn restore_state(
+            &mut self,
+            abs_positions: Vec<i32>,
+            proj_cached_rows: usize,
+            full_cached_rows: usize,
+        ) {
+            self.uploaded_rows = abs_positions.len();
+            self.abs_positions = abs_positions;
+            self.proj_cached_rows = proj_cached_rows.min(self.uploaded_rows);
+            self.full_cached_rows = full_cached_rows.min(self.uploaded_rows);
+        }
     }
 }
 pub use target_hidden_log::{TargetHiddenLog, TargetHiddenLogMark};
@@ -1692,6 +1708,12 @@ impl DraftLaneWorkspace {
 pub struct DflashScratch {
     pub max_block_size: usize,
     pub max_ctx_len: usize,
+    /// Draft local-attention lower bound (KVMem/nInfer DFlash2 integration):
+    /// the retained continuous recent suffix of the target's reselection,
+    /// expressed as a row index in the context buffer ([0, ctx_len]). Rows
+    /// below it are masked. 0 = no bound (Legacy / no reselection ⇒ the span
+    /// is the historical `[l−w, l)` and every offset stays byte-identical).
+    pub ctx_floor: usize,
 
     // Block-sized activations (B rows).
     pub x: GpuTensor,        // [B, hidden] — hidden state rolled across layers
@@ -2197,6 +2219,7 @@ impl DflashScratch {
         let scratch = DflashScratch {
             max_block_size: b,
             max_ctx_len: l,
+            ctx_floor: 0,
 
             x: take!(i_x),
             x_norm: take!(i_x_norm),
@@ -4238,7 +4261,15 @@ fn draft_forward_based_inner(
         } else {
             (&scratch.k_cat, &scratch.v_cat)
         };
-        let span_start = l.saturating_sub(layer_w);
+        // 期4 (KVMem/nInfer DFlash2 integration): the target's reselection
+        // retains a continuous recent suffix; every draft row carries that
+        // suffix's lower bound into its LOCAL attention and older ring entries
+        // are masked. Applied to the attention span only — the projection fill
+        // keeps the historical span so every reachable ring row stays
+        // projected (a lower floor restored from a checkpoint image must never
+        // read unprojected rows). `ctx_floor == 0` ⇒ byte-identical offsets.
+        let span_start_ring = l.saturating_sub(layer_w);
+        let span_start = span_start_ring.max(scratch.ctx_floor.min(l));
         let span = l - span_start;
         let wm = if is_full_layer {
             scratch.thlog.full_cached_rows()
@@ -4247,7 +4278,7 @@ fn draft_forward_based_inner(
         };
         // Rows older than the proj ring's live window cannot be (re)filled
         // here — the post-seed backfill owns that band for the last layer.
-        let fill_start = wm.max(span_start).max(l.saturating_sub(swa_w));
+        let fill_start = wm.max(span_start_ring).max(l.saturating_sub(swa_w));
         // For all-sliding, there is no out-of-window full backfill band to skip;
         // the fill_start already equals span_start.
         if fill_start < l {

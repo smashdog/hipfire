@@ -235,6 +235,11 @@ pub struct KvMemStats {
     pub prefix_hits: u64,
     pub prefix_misses: u64,
     pub prefix_evictions: u64,
+    /// 期4: DFlash2 draft conditioning images captured with prefix
+    /// checkpoints, restored on reuse, and missing/unrestorable (reseed).
+    pub draft_images: u64,
+    pub draft_image_hits: u64,
+    pub draft_image_misses: u64,
 }
 
 /// Serialized as the `engine_stats` object of every multi-slot `done` event;

@@ -57,6 +57,43 @@ pub fn layout_fingerprint(cfg: &RawStoreConfig) -> u64 {
     h
 }
 
+/// 期4 (KVMem/nInfer DFlash2 integration): the DFlash2 draft's conditioning
+/// state at a prefix checkpoint — the backend-owned "native full sequence
+/// state serialization" that rides with the target checkpoint. Captured only
+/// when the draft's live seeded frontier equals the checkpoint frontier (the
+/// cached ring cannot reconstruct an earlier frontier); restored with the
+/// target prefix so the next draft cycle conditions on the same rows the
+/// target verify sees. Native F32 layout in ring-slot order (`row % window`):
+/// `[target_hidden w×feature_width][k_l w×kv_dim][v_l w×kv_dim]...`.
+#[derive(Debug, Clone, Default)]
+pub struct DraftImage {
+    /// Draft geometry identity (layers, hidden, feature width, kv dim, window,
+    /// block) — a mismatch refuses the restore instead of seeding garbage.
+    pub geometry: u64,
+    /// Logical frontier (committed rows) at capture.
+    pub frontier: u32,
+    /// Retained-suffix floor (logical tokens) at capture
+    /// (nInfer `dflash_context_floor`).
+    pub floor: u32,
+    /// Ring window `w` (row modulus) at capture.
+    pub window: usize,
+    pub feature_width: usize,
+    pub kv_dim: usize,
+    pub n_layers: usize,
+    /// Captured thlog watermarks (rows whose projection was cached).
+    pub proj_cached_rows: usize,
+    pub full_cached_rows: usize,
+    /// Raw blobs in the order above, each the full ring (`window × dim × 4`).
+    pub blobs: Vec<Vec<u8>>,
+}
+
+impl DraftImage {
+    /// Host bytes charged to the prefix catalog (blob payload).
+    pub fn nbytes(&self) -> u64 {
+        self.blobs.iter().map(|b| b.len() as u64).sum()
+    }
+}
+
 /// One frozen reusable prefix: the immutable canonical archive plus the
 /// provenance a reuse must satisfy. Created by [`crate::kvmem_ctl::KvMemCtl::freeze_prefix`];
 /// the engine attaches the pinned GPU pages (`gpu_pages`) after sealing them.
@@ -86,6 +123,10 @@ pub struct PrefixCheckpoint {
     /// records are sealed shared sources; mean-K is private to this archive
     /// and re-forked private into every branch. Never fed after freeze.
     canonical: RawStore,
+    /// 期4: DFlash2 draft conditioning image captured with this checkpoint
+    /// (`None` for AR/MTP sessions, non-windowed drafts, or a frontier that
+    /// did not equal the draft's live seeded frontier — those reseed).
+    pub draft_image: Option<DraftImage>,
     /// LRU clock stamp (catalog-internal).
     last_used: u64,
 }
@@ -115,8 +156,16 @@ impl PrefixCheckpoint {
             layout_id,
             gpu_pages: Vec::new(),
             canonical,
+            draft_image: None,
             last_used: 0,
         }
+    }
+
+    /// Host bytes charged for retention (canonical packed archive + the
+    /// optional draft image).
+    pub fn host_bytes(&self) -> u64 {
+        self.canonical.payload_bytes()
+            + self.draft_image.as_ref().map_or(0, |img| img.nbytes())
     }
 
     /// The canonical archive (read-only use: fork / inspect).
@@ -345,7 +394,7 @@ impl PrefixCatalog {
             .iter()
             .map(|e| CoverageInfo {
                 frontier: e.frontier as u64,
-                bytes: e.canonical.payload_bytes(),
+                bytes: e.host_bytes(),
                 used: e.last_used,
                 identity: e.id,
                 purpose: CoveragePurpose::Periodic as u32,
@@ -481,6 +530,7 @@ mod tests {
             layout_id: layout_fingerprint(&raw_config()),
             gpu_pages: Vec::new(),
             canonical,
+            draft_image: None,
             last_used: 0,
         }
     }

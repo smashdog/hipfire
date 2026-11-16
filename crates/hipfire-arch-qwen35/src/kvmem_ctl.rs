@@ -904,6 +904,11 @@ pub struct KvMemCtl {
     prefix_hits_total: u64,
     prefix_misses_total: u64,
     prefix_evictions_total: u64,
+    /// 期4: DFlash2 draft conditioning images captured with prefix
+    /// checkpoints, restored on reuse, and missing/unrestorable (reseed).
+    draft_images_total: u64,
+    draft_image_hits_total: u64,
+    draft_image_misses_total: u64,
 }
 
 impl KvMemCtl {
@@ -1231,6 +1236,9 @@ impl KvMemCtl {
             prefix_hits_total: 0,
             prefix_misses_total: 0,
             prefix_evictions_total: 0,
+            draft_images_total: 0,
+            draft_image_hits_total: 0,
+            draft_image_misses_total: 0,
         })
     }
 
@@ -1286,6 +1294,26 @@ impl KvMemCtl {
             .register_append(full_pages * KV_BLOCK_TOKENS as u32)
             .map_err(|e| format!("kvmem layerwise policy append: {e}"))?;
         Ok(policy)
+    }
+
+    /// 期4 (KVMem/nInfer DFlash2 integration): the draft's local-attention
+    /// lower bound in logical token positions — the start of the continuous
+    /// recent suffix the Layerwise selection retains
+    /// (nInfer `dflash_context_floor = main_frontier − recent_blocks·page_tokens`).
+    /// The draft ring, proposal positions and cyclic slot addressing stay
+    /// logical; only the target verify uses compact positions. 0 under Legacy,
+    /// where the whole context stays resident and the draft span is unchanged.
+    pub fn draft_conditioning_floor(&self, slot: usize, position: usize) -> usize {
+        if !self.strategy.is_layerwise() {
+            return 0;
+        }
+        let fed = self
+            .fed_tokens(slot)
+            .map(|f| f as usize)
+            .unwrap_or(position)
+            .min(position);
+        let recent = self.kv_cfg.recent_blocks as usize * KV_BLOCK_TOKENS;
+        fed.saturating_sub(recent)
     }
 
     /// Per-slot resident page budget (full pages + partial tail).
@@ -1544,6 +1572,18 @@ impl KvMemCtl {
         self.prefix_catalog.get(id)
     }
 
+    /// 期4: DFlash2 draft image instrumentation (captures / restore hits /
+    /// misses). Pure bookkeeping — never read back into selection/residency.
+    pub fn note_draft_image_capture(&mut self) {
+        self.draft_images_total += 1;
+    }
+    pub fn note_draft_image_hit(&mut self) {
+        self.draft_image_hits_total += 1;
+    }
+    pub fn note_draft_image_miss(&mut self) {
+        self.draft_image_misses_total += 1;
+    }
+
     /// Mutable access (engine attaches `gpu_pages` after sealing + cache refs).
     pub fn prefix_checkpoint_mut(&mut self, id: u64) -> Option<&mut PrefixCheckpoint> {
         self.prefix_catalog.get_mut(id)
@@ -1597,6 +1637,9 @@ impl KvMemCtl {
             prefix_hits: self.prefix_hits_total,
             prefix_misses: self.prefix_misses_total,
             prefix_evictions: self.prefix_evictions_total,
+            draft_images: self.draft_images_total,
+            draft_image_hits: self.draft_image_hits_total,
+            draft_image_misses: self.draft_image_misses_total,
         }
     }
 
