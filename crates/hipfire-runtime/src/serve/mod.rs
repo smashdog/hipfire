@@ -49,6 +49,34 @@ pub struct VisualData {
     pub rope_delta: i32,
 }
 
+impl VisualData {
+    /// G7: stable content digest of this media turn (FNV-1a over the vision
+    /// patch tensor, grid, visual-token count and rope delta). Content-only:
+    /// the per-prompt M-RoPE phase table is deliberately excluded — it depends
+    /// on the surrounding text length, while two requests carrying the SAME
+    /// image must share an identity. A token proof cannot distinguish two
+    /// images (identical `image_pad` ids), so prefix reuse requires this digest
+    /// to match whenever a checkpoint covers a media span.
+    pub fn media_digest(&self) -> u64 {
+        const OFFSET: u64 = 0xcbf29ce484222325;
+        const PRIME: u64 = 0x100000001b3;
+        let mut h = OFFSET;
+        let mut mix = |bytes: &[u8]| {
+            for &b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(PRIME);
+            }
+        };
+        mix(&(self.grid_h as u64).to_le_bytes());
+        mix(&(self.grid_w as u64).to_le_bytes());
+        mix(&(self.n_visual_tokens as u64).to_le_bytes());
+        mix(&self.rope_delta.to_le_bytes());
+        let patch_bytes: Vec<u8> = self.patches.iter().flat_map(|f| f.to_le_bytes()).collect();
+        mix(&patch_bytes);
+        h
+    }
+}
+
 /// One request handed to the engine.
 ///
 /// `reply` is the client's own channel: the engine streams this request's

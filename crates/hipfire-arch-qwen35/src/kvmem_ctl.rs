@@ -1582,6 +1582,21 @@ impl KvMemCtl {
         frontier: u32,
         prefix_tokens: &[u32],
     ) -> Result<(u64, Vec<PrefixCheckpoint>, bool), String> {
+        self.freeze_prefix_with_media(slot, frontier, prefix_tokens, None, Vec::new())
+    }
+
+    /// G7: freeze with the image-turn media identity (digest + image token
+    /// spans) recorded in the checkpoint and the persistent pack meta. The
+    /// engine passes the session's sticky digest on image turns; text-only
+    /// freezes pass `(None, vec![])`.
+    pub fn freeze_prefix_with_media(
+        &mut self,
+        slot: usize,
+        frontier: u32,
+        prefix_tokens: &[u32],
+        media_digest: Option<u64>,
+        media_spans: Vec<(u32, u32)>,
+    ) -> Result<(u64, Vec<PrefixCheckpoint>, bool), String> {
         let st = self
             .slots
             .get(slot)
@@ -1664,6 +1679,8 @@ impl KvMemCtl {
         );
         entry.original_query = original_query;
         entry.group = st.convo_group;
+        entry.media_digest = media_digest;
+        entry.media_spans = media_spans.clone();
         if self.content_groups > 0
             && hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
                 .ok()
@@ -1689,6 +1706,8 @@ impl KvMemCtl {
                 group: entry.group,
                 original_query: entry.original_query,
                 n_record_layers: self.n_record_layers as u32,
+                media_digest: entry.media_digest,
+                media_spans: entry.media_spans.clone(),
             };
             let path = dir.join(format!(
                 "p{layout_id:016x}-{frontier:08}-{fingerprint:016x}.hkpack"
@@ -1765,8 +1784,14 @@ impl KvMemCtl {
     /// Look up the longest cataloged prefix fully proven by `prompt`.
     /// Returns the checkpoint id (engine then validates + forks).
     pub fn prefix_lookup(&mut self, prompt: &[u32]) -> Option<u64> {
+        self.prefix_lookup_media(prompt, None)
+    }
+
+    /// G7: media-aware prefix lookup. A checkpoint covering an image span is
+    /// eligible only when the incoming request's media digest matches it.
+    pub fn prefix_lookup_media(&mut self, prompt: &[u32], media: Option<u64>) -> Option<u64> {
         let layout = layout_fingerprint(&self.raw_cfg);
-        if let Some(hit) = self.prefix_catalog.lookup(prompt, layout) {
+        if let Some(hit) = self.prefix_catalog.lookup_media(prompt, layout, media) {
             self.prefix_catalog_hits_total += 1;
             self.prefix_hits_total += 1;
             return Some(hit);
@@ -1774,7 +1799,7 @@ impl KvMemCtl {
         // 期3 G3 P1.1: a cold pack hit loads the payload and publishes a
         // normal catalog entry; the caller then reuses it through the usual
         // proof path (restart reuse still needs the DN checkpoint, patch 35).
-        if let Some(index) = self.cold_packs.lookup(prompt, layout) {
+        if let Some(index) = self.cold_packs.lookup_media(prompt, layout, media) {
             let pack = self.cold_packs.packs()[index].clone();
             match self.load_cold_pack(&pack) {
                 Ok(id) => {
@@ -1854,6 +1879,8 @@ impl KvMemCtl {
         );
         entry.original_query = meta.original_query;
         entry.group = meta.group;
+        entry.media_digest = meta.media_digest;
+        entry.media_spans = meta.media_spans.clone();
         entry.kv_snapshot = kv_snapshot;
         entry.pack_path = Some(pack.path.clone());
         let (inserted, displaced) = if self.content_groups > 0 && entry.group != 0 {
@@ -1875,9 +1902,22 @@ impl KvMemCtl {
     /// Look up the longest cataloged prefix fully proven by `prompt` whose
     /// frontier is at most `max_frontier` (import narrowing fallback).
     pub fn prefix_lookup_capped(&mut self, prompt: &[u32], max_frontier: u32) -> Option<u64> {
-        let hit = self
-            .prefix_catalog
-            .lookup_at_most(prompt, layout_fingerprint(&self.raw_cfg), max_frontier);
+        self.prefix_lookup_capped_media(prompt, max_frontier, None)
+    }
+
+    /// G7: media-aware capped lookup for import narrowing.
+    pub fn prefix_lookup_capped_media(
+        &mut self,
+        prompt: &[u32],
+        max_frontier: u32,
+        media: Option<u64>,
+    ) -> Option<u64> {
+        let hit = self.prefix_catalog.lookup_at_most_media(
+            prompt,
+            layout_fingerprint(&self.raw_cfg),
+            max_frontier,
+            media,
+        );
         if hit.is_some() {
             self.prefix_catalog_hits_total += 1;
             self.prefix_hits_total += 1;
@@ -6153,6 +6193,46 @@ mod tests {
         // A foreign prompt is neither a hot nor a cold proof.
         ctl2.reset_slot(0).expect("reset");
         assert!(ctl2.prefix_lookup(&prefix_tokens(128, 77)).is_none());
+        std::env::remove_var("HIPFIRE_KVMEM_CACHE_BYTES");
+        std::env::remove_var("HIPFIRE_KVMEM_CACHE_DIR");
+        std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G7: media identity rides the pack round trip and gates both hot and
+    /// cold lookup (text-only requests never reuse an image prefix; a
+    /// different image digest never does).
+    #[test]
+    fn vl_media_pack_roundtrip_and_gated_reuse() {
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let dir = std::env::temp_dir().join(format!("kvmem-vl-media-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("HIPFIRE_KVMEM_CACHE_DIR", dir.to_str().unwrap());
+        std::env::set_var("HIPFIRE_KVMEM_CACHE_BYTES", "268435456");
+        let toks = prefix_tokens(128, 11);
+        {
+            let mut ctl =
+                KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
+                    .expect("ctl");
+            prefix_fill(&mut ctl, 0, 1, 11);
+            let (id, _, _) = ctl
+                .freeze_prefix_with_media(0, 128, &toks, Some(0xabc), vec![(4, 36)])
+                .expect("freeze with media");
+            let ckpt = ctl.prefix_checkpoint(id).expect("ckpt");
+            assert_eq!(ckpt.media_digest, Some(0xabc));
+            assert_eq!(ckpt.media_spans, vec![(4, 36)]);
+        }
+        let mut ctl2 =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy)
+                .expect("ctl2");
+        assert_eq!(ctl2.prefix_lookup_media(&toks, None), None);
+        assert_eq!(ctl2.prefix_lookup_media(&toks, Some(0xdef)), None);
+        let hit = ctl2
+            .prefix_lookup_media(&toks, Some(0xabc))
+            .expect("same media cold hit");
+        let ckpt = ctl2.prefix_checkpoint(hit).expect("entry");
+        assert_eq!(ckpt.media_digest, Some(0xabc));
+        assert_eq!(ckpt.media_spans, vec![(4, 36)]);
         std::env::remove_var("HIPFIRE_KVMEM_CACHE_BYTES");
         std::env::remove_var("HIPFIRE_KVMEM_CACHE_DIR");
         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");

@@ -30,6 +30,42 @@ pub fn spans_from_runs(runs: &[(usize, usize)]) -> Vec<MediaSpan> {
     spans
 }
 
+/// True when `boundary` would cut a media span (strictly inside it).
+pub fn media_split(spans: &[MediaSpan], boundary: u64) -> bool {
+    spans.iter().any(|s| s.begin < boundary && boundary < s.end)
+}
+
+/// True when any media span is fully inside the prefix (`end <= frontier`).
+pub fn media_inside(spans: &[MediaSpan], frontier: u64) -> bool {
+    spans.iter().any(|s| s.end <= frontier)
+}
+
+/// `image_pad` runs of `tokens` (absolute prompt coordinates), capped at
+/// `n_visual` rows — the engine-side mirror of `vl_prefill::image_spans`
+/// without its embedding-row bookkeeping.
+pub fn spans_from_pad_runs(tokens: &[u32], pad: u32, n_visual: usize) -> Vec<MediaSpan> {
+    let mut spans: Vec<MediaSpan> = Vec::new();
+    let mut used = 0usize;
+    let mut i = 0usize;
+    while i < tokens.len() && used < n_visual {
+        if tokens[i] != pad {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < tokens.len() && tokens[i] == pad && used + (i - start) < n_visual {
+            i += 1;
+        }
+        let len = i - start;
+        spans.push(MediaSpan {
+            begin: start as u64,
+            end: (start + len) as u64,
+        });
+        used += len;
+    }
+    spans
+}
+
 /// nInfer `validate_layerwise_media` for one flat, ordered span list.
 pub fn validate_spans(prompt_len: u64, spans: &[MediaSpan], block: u64) -> Result<(), String> {
     if block == 0 {
@@ -129,6 +165,41 @@ mod tests {
     use super::*;
 
     const BLOCK: u64 = 128;
+
+    #[test]
+    fn split_and_inside_predicates() {
+        let spans = [MediaSpan { begin: 200, end: 300 }];
+        assert!(!media_split(&spans, 200));
+        assert!(media_split(&spans, 256));
+        assert!(!media_split(&spans, 300));
+        assert!(!media_inside(&spans, 299));
+        assert!(media_inside(&spans, 300));
+        assert!(!media_inside(&[], 1000));
+    }
+
+    #[test]
+    fn pad_runs_respect_n_visual() {
+        let toks = [1u32, 9, 9, 9, 2, 9, 9];
+        let spans = spans_from_pad_runs(&toks, 9, 5);
+        // 3 + 2 rows used; both runs kept.
+        assert_eq!(
+            spans,
+            vec![
+                MediaSpan { begin: 1, end: 4 },
+                MediaSpan { begin: 5, end: 7 },
+            ]
+        );
+        // Cap inside the second run.
+        let spans = spans_from_pad_runs(&toks, 9, 4);
+        assert_eq!(
+            spans,
+            vec![
+                MediaSpan { begin: 1, end: 4 },
+                MediaSpan { begin: 5, end: 6 },
+            ]
+        );
+        assert!(spans_from_pad_runs(&toks, 9, 0).is_empty());
+    }
 
     #[test]
     fn spans_from_runs_drops_empty_and_sorts() {
