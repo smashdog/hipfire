@@ -242,6 +242,50 @@ pub struct KvMemStats {
     pub draft_image_misses: u64,
 }
 
+/// Speculative-decoding telemetry (期4, KVMem/nInfer `speculative.hpp`
+/// parity): the schema version + configuration the engine resolved, plus the
+/// completed-request statistics the contract defines. Statistics accumulate
+/// when a generation finishes (cancellation paths included) and exclude
+/// admission failures; `drafted_tokens` excludes internal replay proposals,
+/// `accepted_tokens` excludes correction/bonus rows, `rounds` counts target
+/// verifications that carried proposals and `fallback_steps` counts ordinary
+/// decode steps with no proposal available.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SpeculativeStats {
+    pub schema_version: u32,
+    pub enabled: bool,
+    /// `kvmem::SpeculativeAlgorithm` ordinal (1 mtp, 2 dflash, 3 dflash2).
+    pub algorithm: u32,
+    pub draft_tokens: u64,
+    pub adaptive: bool,
+    pub ngram_draft_tokens: u64,
+    pub requests: u64,
+    pub rounds: u64,
+    pub drafted_tokens: u64,
+    pub accepted_tokens: u64,
+    pub generated_tokens: u64,
+    pub fallback_steps: u64,
+}
+
+impl SpeculativeStats {
+    /// accepted / drafted, or `None` before any draft.
+    pub fn acceptance_rate(&self) -> Option<f64> {
+        (self.drafted_tokens != 0)
+            .then(|| self.accepted_tokens as f64 / self.drafted_tokens as f64)
+    }
+}
+
+/// Canonical `speculative.hpp` algorithm name for an ordinal.
+pub fn speculative_algorithm_name(algorithm: u32) -> &'static str {
+    match algorithm {
+        1 => "mtp",
+        2 => "dflash",
+        3 => "dflash2",
+        _ => "none",
+    }
+}
+
 /// Serialized as the `engine_stats` object of every multi-slot `done` event;
 /// the serve gateway exports it on `/metrics`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -282,6 +326,8 @@ pub struct EngineStats {
     pub swap_disk_budget: u64,
     /// KVMem host-offload snapshot (zeroed when the engine runs without it).
     pub kvmem: KvMemStats,
+    /// Speculative-decoding contract snapshot (期4; zeroed when off).
+    pub speculative: SpeculativeStats,
 }
 
 impl EngineStats {

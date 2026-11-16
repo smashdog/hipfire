@@ -355,6 +355,7 @@ impl SlotEngine {
                         // daemon reports the effective budgets and usage.
                         if let Ok(mut st) = stats_thread.lock() {
                             st.note_swap(&rig.swap);
+                            st.speculative = rig.speculative_config();
                         }
                         let _ = ready_tx.send(Ok(()));
                         run_loop(rig, rx, stats_thread)
@@ -796,6 +797,21 @@ fn layerwise_mtp_verify_admissible(
     Some((slot, frame.session.0, width))
 }
 
+/// 期4: per-slot speculative counters, folded into
+/// [`hipfire_runtime::serve::EngineStats::speculative`] when the request
+/// terminates (nInfer completed-request statistics: cancellations count,
+/// admission failures do not). `drafted` excludes the seed row and `accepted`
+/// excludes the bonus row, following the `speculative.hpp` definitions.
+#[derive(Clone, Copy, Debug, Default)]
+struct SpecCounters {
+    requested: bool,
+    rounds: u64,
+    drafted: u64,
+    accepted: u64,
+    generated: u64,
+    fallback: u64,
+}
+
 struct Rig {
     gpu: Gpu,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -865,6 +881,10 @@ struct Rig {
     /// `(interval, min_gap)` gating the prefill freeze cadence with the core
     /// `CheckpointCapturePlan`. `None` = legacy (freeze every boundary).
     kvmem_checkpoint_policy: Option<(u64, u64)>,
+    /// 期4: per-slot speculative counters (completed-request statistics,
+    /// nInfer `speculative.hpp` scope). Reset at admit, folded into
+    /// `EngineStats.speculative` at the terminal event.
+    spec_counters: Vec<SpecCounters>,
     /// The configured `serve.prefix_cache_max_bytes` ceiling. Retained on
     /// the Rig so the Reset path can re-apply it to the replacement index
     /// (`PrefixIndex::new` starts with no ceiling; losing it on reset
@@ -999,6 +1019,31 @@ fn slot_snapshot_kv_tag(kv_mode: hipfire_runtime::kv_mode::KvMode) -> u32 {
 }
 
 impl Rig {
+    /// 期4: the speculative contract snapshot (schema + resolved config).
+    /// Statistics start zero and accumulate at request completion; the schema
+    /// version comes from the KVMem core contract on `kvmem` builds.
+    fn speculative_config(&self) -> hipfire_runtime::serve::SpeculativeStats {
+        let mut out = hipfire_runtime::serve::SpeculativeStats::default();
+        out.schema_version = 1;
+        #[cfg(feature = "kvmem")]
+        {
+            out.schema_version = hipfire_kvmem::speculative_schema_version();
+        }
+        if let Some(d) = self.model.dflash.as_ref() {
+            out.enabled = true;
+            out.algorithm = 3; // kvmem::SpeculativeAlgorithm::DFlash2
+            // B verify rows = seed + (B−1) proposals.
+            out.draft_tokens = d.block_size.saturating_sub(1) as u64;
+        } else if self.model.mtp_head.is_some() && self.model.mtp_k > 0 {
+            out.enabled = true;
+            out.algorithm = 1; // kvmem::SpeculativeAlgorithm::Mtp
+            out.draft_tokens = self.model.mtp_k as u64;
+            out.adaptive = false;
+        }
+        out.ngram_draft_tokens = 0;
+        out
+    }
+
     /// Resolve the placement the slots path loads with.
     ///
     /// `Full`/`Full` returns the all-device placement with no capacity check — the
@@ -2546,6 +2591,7 @@ impl Rig {
             kvmem_prefix_coverage,
             kvmem_prefix_coverage_interval,
             kvmem_checkpoint_policy,
+            spec_counters: vec![SpecCounters::default(); cfg.n_slots],
             prefix_cache_max_bytes: if prefix_cache {
                 Some(cfg.prefix_cache_max_bytes as usize)
             } else {
@@ -4526,6 +4572,20 @@ fn commit_sampled_token(
         // instead of a successful done (spec §7.1 G1, A17). ClientGone is
         // never overridden: the receiver is already dropped.
         lock_stats(stats).note_slot_released();
+        // 期4: fold this request's speculative counters (completed-request
+        // statistics; cancellation paths included, admission failures excluded).
+        {
+            let spec = std::mem::take(&mut rig.spec_counters[s]);
+            if spec.requested {
+                let mut st = lock_stats(stats);
+                st.speculative.requests += 1;
+                st.speculative.rounds += spec.rounds;
+                st.speculative.drafted_tokens += spec.drafted;
+                st.speculative.accepted_tokens += spec.accepted;
+                st.speculative.generated_tokens += spec.generated;
+                st.speculative.fallback_steps += spec.fallback;
+            }
+        }
         if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
             let _ = send_event(
                 &f.reply,
@@ -5402,6 +5462,12 @@ fn run_loop(
                         };
                         match outcome {
                             Ok(draft) => {
+                                // 期4 speculative statistics: one target round,
+                                // `rows−1` proposal candidates (the seed row is
+                                // not a proposal).
+                                let rows = draft.verify_tokens().len() as u64;
+                                rig.spec_counters[s].rounds += 1;
+                                rig.spec_counters[s].drafted += rows.saturating_sub(1);
                                 spec_seeds[s] = seed;
                                 spec_drafts[s] = Some(draft);
                             }
@@ -6059,6 +6125,19 @@ fn run_loop(
                 work[s].spec == SpecKind::Dflash
                     && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
             });
+            // 期4 speculative statistics: a decode row served as plain AR while
+            // the request asked for a drafter (retired, cap guard, or a reuse
+            // without a draft image) counts as a fallback step
+            // (speculative.hpp `fallback_steps`).
+            for s in 0..n {
+                if rig.spec_counters[s].requested
+                    && work[s].decoding
+                    && !work[s].spec.active()
+                    && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
+                {
+                    rig.spec_counters[s].fallback += 1;
+                }
+            }
             // Step span (opt-in `HIPFIRE_CPU_EXEC_TRACE` only): forward vs
             // sample vs sync/readback vs emit. Host wall around work this step
             // already runs; no new sync, no order change.
@@ -7236,6 +7315,12 @@ fn run_loop(
                     };
                     match accept_outcome {
                         Ok(tokens) => {
+                            // 期4 speculative statistics: committed outputs
+                            // include the bonus row; accepted candidates
+                            // exclude it (speculative.hpp semantics).
+                            rig.spec_counters[s].generated += tokens.len() as u64;
+                            rig.spec_counters[s].accepted +=
+                                tokens.len().saturating_sub(1) as u64;
                             for tok in &tokens {
                                 commit_sampled_token(
                                     &mut rig, &mut slots, &mut work, &stats, s, *tok,
@@ -7472,6 +7557,20 @@ fn run_loop(
                     // G1, A17). ClientGone is never overridden: the receiver is
                     // already dropped.
                     lock_stats(&stats).note_slot_released();
+                    // 期4: fold this request's speculative counters
+                    // (completed-request statistics; cancellation included).
+                    {
+                        let spec = std::mem::take(&mut rig.spec_counters[s]);
+                        if spec.requested {
+                            let mut st = lock_stats(&stats);
+                            st.speculative.requests += 1;
+                            st.speculative.rounds += spec.rounds;
+                            st.speculative.drafted_tokens += spec.drafted;
+                            st.speculative.accepted_tokens += spec.accepted;
+                            st.speculative.generated_tokens += spec.generated;
+                            st.speculative.fallback_steps += spec.fallback;
+                        }
+                    }
                     if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
                         let _ = send_event(
                             &f.reply,
@@ -8846,6 +8945,10 @@ fn admit(
                         } else {
                             SpecKind::None
                         };
+                        rig.spec_counters[slot.0] = SpecCounters {
+                            requested: work[slot.0].spec.active(),
+                            ..Default::default()
+                        };
                         rig.model.spec_req_sampling[slot.0] = if work[slot.0].spec.active() {
                             Some(MtpReqSampling::new(&req, &extended))
                         } else {
@@ -9896,6 +9999,10 @@ fn admit(
             SpecKind::Dflash
         } else {
             SpecKind::None
+        };
+        rig.spec_counters[slot.0] = SpecCounters {
+            requested: work[slot.0].spec.active(),
+            ..Default::default()
         };
         rig.model.spec_req_sampling[slot.0] = if work[slot.0].spec.active() {
             Some(MtpReqSampling::new(&req, &req.prompt_tokens))
@@ -11034,5 +11141,38 @@ mod kvmem_dflash_validation_tests {
     fn rejects_multi_slot_kvmem_dflash() {
         let e = kvmem_dflash_validation_error(true, true, 0, 2).expect("must reject");
         assert!(e.contains("single-slot"), "{e}");
+    }
+}
+
+#[cfg(all(test, feature = "kvmem"))]
+mod speculative_contract_tests {
+    /// 期4: the core `speculative.hpp` is the single source of algorithm
+    /// names; the engine ordinal mapping must equal the shim's.
+    #[test]
+    fn algorithm_names_match_core() {
+        for a in 0..=3u32 {
+            assert_eq!(
+                hipfire_runtime::serve::speculative_algorithm_name(a),
+                hipfire_kvmem::speculative_algorithm_name(a),
+                "ordinal {a}"
+            );
+        }
+    }
+
+    /// The engine folds per-request counters; pin that the shim's C mirror
+    /// round-trips the core `SpeculativeStatistics::add`.
+    #[test]
+    fn statistics_add_round_trips_through_core() {
+        let mut dst = hipfire_kvmem::speculative_statistics_reset();
+        dst.requests = 2;
+        dst.drafted_tokens = 10;
+        let mut src = hipfire_kvmem::speculative_statistics_reset();
+        src.requests = 1;
+        src.drafted_tokens = 5;
+        src.accepted_tokens = 2;
+        hipfire_kvmem::speculative_statistics_add(&mut dst, &src);
+        assert_eq!(dst.requests, 3);
+        assert_eq!(dst.drafted_tokens, 15);
+        assert_eq!(dst.accepted_tokens, 2);
     }
 }
