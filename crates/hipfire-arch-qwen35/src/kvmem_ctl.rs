@@ -918,9 +918,6 @@ pub struct KvMemCtl {
     content_groups: usize,
     /// Entries retired by the group-aware publication plan.
     content_retirements_total: u64,
-    /// 期3 G3-SSD: separate tiered account for canonical content copies
-    /// (`HIPFIRE_KVMEM_CACHE_DIR/_BYTES`, independent of the spill account).
-    content_storage: Option<Storage>,
     /// 期3 G3 P1.1: persistent pack directory (same cache dir) and byte cap.
     cold_dir: Option<PathBuf>,
     cold_bytes: u64,
@@ -1131,10 +1128,9 @@ impl KvMemCtl {
             ));
         }
         // 期3 G3 single-tier: `HIPFIRE_KVMEM_CACHE_DIR` owns the PERSISTENT
-        // pack tier. The second (account) storage was consolidated away —
-        // packs are the one persistent copy, still billed under
-        // `HIPFIRE_KVMEM_CACHE_BYTES` and separate from the spill account.
-        // `content_storage` stays None; the cache account metrics report 0.
+        // pack tier. Packs are the one persistent copy, billed under
+        // `HIPFIRE_KVMEM_CACHE_BYTES` and separate from the spill account;
+        // there is no second storage account (the cache metrics stay 0).
         let content_cache_dir = env_raw("HIPFIRE_KVMEM_CACHE_DIR").filter(|d| !d.is_empty());
         if let Some(dir) = content_cache_dir.as_ref() {
             let dir = PathBuf::from(dir);
@@ -1148,7 +1144,6 @@ impl KvMemCtl {
                 }
             }
         }
-        let content_storage: Option<Storage> = None;
         let content_cache_dir = content_cache_dir.map(PathBuf::from);
 
         // 期3 G3 P1.1: pack files live beside the content account; scanning
@@ -1328,7 +1323,6 @@ impl KvMemCtl {
             }),
             content_groups,
             content_retirements_total: 0,
-            content_storage,
             cold_dir,
             cold_bytes,
             cold_packs,
@@ -1627,21 +1621,6 @@ impl KvMemCtl {
             .fork_prefix(frontier)
             .map_err(|e| format!("kvmem freeze_prefix fork: {e}"))?;
         let blocks = frontier / KV_BLOCK_TOKENS as u32;
-        // 期3 G3-SSD: move the canonical archive into the separate content
-        // account (exact packed bytes + Mean-K sums copied; the session fork
-        // drops). Reuse materializes a session-account copy instead of sharing
-        // records across accounts (the core refuses cross-account imports and a
-        // shared list would mix the ledgers).
-        let mut canonical_on_content = false;
-        if let Some(content) = self.content_storage.as_ref() {
-            let copied = RawStore::new(self.raw_cfg, Some(content))
-                .map_err(|e| format!("kvmem content store: {e}"))?;
-            canonical
-                .copy_prefix_to(&copied, blocks)
-                .map_err(|e| format!("kvmem content copy: {e}"))?;
-            canonical = copied;
-            canonical_on_content = true;
-        }
         let mean_tail = st
             .raw
             .mean_checkpoint(frontier)
@@ -1684,7 +1663,6 @@ impl KvMemCtl {
         );
         entry.original_query = original_query;
         entry.group = st.convo_group;
-        entry.canonical_on_content = canonical_on_content;
         if self.content_groups > 0
             && hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
                 .ok()
@@ -1780,11 +1758,6 @@ impl KvMemCtl {
             displaced.extend(pruned);
         }
         self.prefix_evictions_total += 0;
-        // Idle sealed content payloads move to the content disk tier; the
-        // canonical records stay readable through leases on reuse.
-        if let Some(content) = self.content_storage.as_mut() {
-            let _ = content.trim(0);
-        }
         Ok((inserted.unwrap_or(id), displaced, false))
     }
 
@@ -1846,12 +1819,7 @@ impl KvMemCtl {
         {
             return Err("pack geometry/layout mismatch".to_string());
         }
-        let on_content = self.content_storage.is_some();
-        let storage = match self.content_storage.as_ref() {
-            Some(content) => content,
-            None => &self.storage,
-        };
-        let store = RawStore::new(self.raw_cfg, Some(storage))
+        let store = RawStore::new(self.raw_cfg, Some(&self.storage))
             .map_err(|e| format!("pack store: {e}"))?;
         let meta_bytes = store
             .read_prefix_pack(&pack.path)
@@ -1886,7 +1854,6 @@ impl KvMemCtl {
         entry.original_query = meta.original_query;
         entry.group = meta.group;
         entry.kv_snapshot = kv_snapshot;
-        entry.canonical_on_content = on_content;
         entry.pack_path = Some(pack.path.clone());
         let (inserted, displaced) = if self.content_groups > 0 && entry.group != 0 {
             let (id, displaced, _deduped) = self
@@ -2018,11 +1985,9 @@ impl KvMemCtl {
             prefix_restore_hits: self.prefix_restore_hits_total,
             content_groups: self.prefix_catalog.group_count() as u64,
             content_retirements: self.content_retirements_total,
-            content_cache_bytes: self
-                .content_storage
-                .as_ref()
-                .map_or(0, |s| s.charged_bytes()),
-            content_cache_disk_bytes: self.content_storage.as_ref().map_or(0, |s| s.disk_bytes()),
+            // Single tier: packs are files, so there is no second account.
+            content_cache_bytes: 0,
+            content_cache_disk_bytes: 0,
             content_packs: self.cold_packs.len() as u64,
             content_pack_bytes: self.cold_packs.total_bytes(),
             cold_pack_hits: self.cold_pack_hits_total,
@@ -2111,23 +2076,12 @@ impl KvMemCtl {
         ckpt.validate_reuse(prompt, layout_fingerprint(&self.raw_cfg))
             .map_err(|e| format!("kvmem fork_prefix_into: {e}"))?;
         let frontier = ckpt.frontier;
-        // 期3 G3-SSD: a content-account canonical cannot be forked into the
-        // session account (import/fork share allocations, mixing ledgers), so
-        // reuse copies the exact packed prefix + Mean-K sums back into a fresh
-        // session-account store. The plain fast path stays for session-account
-        // canonicals.
-        let branch = if ckpt.canonical_on_content {
-            let branch = RawStore::new(self.raw_cfg, Some(&self.storage))
-                .map_err(|e| format!("kvmem fork_prefix_into store: {e}"))?;
-            ckpt.canonical()
-                .copy_prefix_to(&branch, frontier / KV_BLOCK_TOKENS as u32)
-                .map_err(|e| format!("kvmem fork_prefix_into content copy: {e}"))?;
-            branch
-        } else {
-            ckpt.canonical()
-                .fork_prefix(frontier)
-                .map_err(|e| format!("kvmem fork_prefix_into fork: {e}"))?
-        };
+        // Single tier: every canonical lives in the session account, so reuse
+        // is always the zero-copy sealed-record fork.
+        let branch = ckpt
+            .canonical()
+            .fork_prefix(frontier)
+            .map_err(|e| format!("kvmem fork_prefix_into fork: {e}"))?;
         if let Some(tail) = ckpt.mean_tail.as_ref() {
             branch
                 .restore_mean_checkpoint(frontier, tail)
@@ -6059,7 +6013,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kvmem-cache-test-{}", std::process::id()));
         std::env::set_var("HIPFIRE_KVMEM_CACHE_DIR", dir.to_str().unwrap());
         std::env::set_var("HIPFIRE_KVMEM_CACHE_BYTES", "16777216");
-        std::env::set_var("HIPFIRE_KVMEM_CACHE_RAM_BYTES", "1048576");
         let mut ctl =
             KvMemCtl::new_with_strategy(2, &plan(), &geom(), RecallStrategy::Legacy)
                 .expect("ctl");
@@ -6068,12 +6021,6 @@ mod tests {
         let toks = prefix_tokens(128, 5);
         let (id, displaced, dup) = ctl.freeze_prefix(0, 128, &toks).expect("freeze");
         assert!(!dup && displaced.is_empty());
-        assert!(
-            !ctl.prefix_checkpoint(id)
-                .expect("ckpt")
-                .canonical_on_content,
-            "single tier: the canonical stays in the session account"
-        );
         let cache_stats = ctl.stats();
         assert!(
             cache_stats.content_packs >= 1 && cache_stats.content_pack_bytes > 0,
@@ -6094,7 +6041,6 @@ mod tests {
         ctl.slots[0].raw.mean_k(0, 0, &mut m0);
         ctl.slots[1].raw.mean_k(0, 0, &mut m1);
         assert_eq!(m0, m1, "reused Mean-K copied exactly");
-        std::env::remove_var("HIPFIRE_KVMEM_CACHE_RAM_BYTES");
         std::env::remove_var("HIPFIRE_KVMEM_CACHE_BYTES");
         std::env::remove_var("HIPFIRE_KVMEM_CACHE_DIR");
         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
@@ -6110,7 +6056,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("HIPFIRE_KVMEM_CACHE_DIR", dir.to_str().unwrap());
         std::env::set_var("HIPFIRE_KVMEM_CACHE_BYTES", "268435456");
-        std::env::set_var("HIPFIRE_KVMEM_CACHE_RAM_BYTES", "4194304");
         let toks = prefix_tokens(128, 6);
         {
             let mut ctl =
@@ -6144,7 +6089,6 @@ mod tests {
         // A foreign prompt is neither a hot nor a cold proof.
         ctl2.reset_slot(0).expect("reset");
         assert!(ctl2.prefix_lookup(&prefix_tokens(128, 77)).is_none());
-        std::env::remove_var("HIPFIRE_KVMEM_CACHE_RAM_BYTES");
         std::env::remove_var("HIPFIRE_KVMEM_CACHE_BYTES");
         std::env::remove_var("HIPFIRE_KVMEM_CACHE_DIR");
         std::env::remove_var("HIPFIRE_KVMEM_HOST_BYTES");
