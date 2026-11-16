@@ -1361,6 +1361,8 @@ impl SlotBackend {
         }
 
         let mut visual_data = None;
+        // 期2.3: frontend-derived query identity (last user question span).
+        let mut request_query: Option<(u64, u64)> = None;
         let (prompt_tokens, prefix) = if let Some(image) = slot_image {
             // The projected message view carries the system text; fall back to
             // the top-level `system` field for prompt-only requests.
@@ -1421,7 +1423,18 @@ impl SlotBackend {
             // Qwen3-family behaviour — the model opens `<think>` itself)
             // frames `Plain`, not `ClosedThink`.
             let framing = hipfire_engine::emit::render_assistant_prefix(&rendered);
-            (self.tokenizer.encode(&rendered), framing)
+            let tokens = self.tokenizer.encode(&rendered);
+            // A tool-result turn carries no new Query (nInfer query_policy);
+            // only a final user message contributes query identity.
+            if messages.last().map(|m| m.role) == Some(Role::User) {
+                request_query = rendered_query_span(
+                    &self.tokenizer,
+                    &rendered,
+                    &last_user.content,
+                    &tokens,
+                );
+            }
+            (tokens, framing)
         } else {
             if tools.is_some()
                 || messages
@@ -1460,6 +1473,17 @@ impl SlotBackend {
         // ends in. There is nothing left to reconcile: the Jinja render owns
         // the generation suffix, and the two builders frame it themselves.
         let started_in_think = matches!(prefix, AssistantPrefix::OpenThink);
+        if request_query.is_some()
+            && hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+                .ok()
+                .is_some_and(|v| v == "1" || v == "on" || v == "true")
+        {
+            eprintln!(
+                "[kvmem-query] frontend span {:?} in {} prompt tokens",
+                request_query,
+                prompt_tokens.len()
+            );
+        }
         let prompt_len = prompt_tokens.len();
         // A client that omitted max_tokens gets the default clamped to the
         // room left after the prompt, exactly like the sequential route.
@@ -1574,6 +1598,7 @@ impl SlotBackend {
             h.finish()
         };
         let req = SubmitRequest {
+            query: request_query,
             prompt_tokens,
             convo: convo.clone(),
             continuation,
@@ -2949,6 +2974,38 @@ fn trailing_tool_results(
 /// Prepends tagged system hash; each user hash includes name.
 pub fn build_convo(turns: &[(Role, String)], last_user: &str) -> Vec<u64> {
     build_convo_with_system(None, turns, last_user, None)
+}
+
+/// 期2.3 (KVMem/nInfer `layerwise_query_at_source`): provenance-checked span
+/// of the current user question inside the rendered prompt. Encoding the text
+/// before / through the content must reproduce prefixes of the full encoding;
+/// otherwise the span is unproven and the request carries `None` (fail-closed:
+/// no query identity, historical Layerwise behaviour).
+fn rendered_query_span(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    rendered: &str,
+    content: &str,
+    prompt_tokens: &[u32],
+) -> Option<(u64, u64)> {
+    if content.is_empty() {
+        return None;
+    }
+    let begin = rendered.rfind(content)?;
+    let end = begin + content.len();
+    let before = tokenizer.encode(&rendered[..begin]);
+    let through = tokenizer.encode(&rendered[..end]);
+    if before.len() >= through.len()
+        || !prompt_tokens.starts_with(&before)
+        || !prompt_tokens.starts_with(&through)
+    {
+        return None;
+    }
+    // nInfer `bounded_query`: the Query is the recent question window, not a
+    // whole pasted document — clamp the proven span to the last
+    // `default_query_tokens` (512) tokens.
+    const QUERY_LIMIT: u64 = 512;
+    let begin = (before.len() as u64).max((through.len() as u64).saturating_sub(QUERY_LIMIT));
+    Some((begin, through.len() as u64))
 }
 
 pub fn build_convo_with_system(

@@ -8803,6 +8803,16 @@ fn admit(
                                     }
                                 }
                             }
+                            // 期2.3: move the previous turn's proven span to
+                            // `last_query` and install this turn's before
+                            // `begin_request` decides whether the first
+                            // Layerwise step must re-score (Query) or may keep
+                            // the already-effective selection.
+                            let _ = rig
+                                .model
+                                .kvmem
+                                .as_mut()
+                                .map(|ctl| ctl.set_request_query(slot.0, req.query));
                             let fed = rig
                                 .model
                                 .kvmem
@@ -9272,6 +9282,21 @@ fn admit(
             lock_stats(stats).note_rejected();
             return;
         }
+        // 期2.3: the fresh session's question identity (the reuse import and
+        // any later checkpoint freeze both read it). reset_slot cleared the
+        // previous session's spans — this is the first request of a new one.
+        if let Err(e) = ctl.set_request_query(slot.0, req.query) {
+            let _ = send_event(
+                &req.reply,
+                Event::Rejected {
+                    class: RejectClass::Internal,
+                    reason: format!("kvmem query span: {e}"),
+                },
+            );
+            rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+            lock_stats(stats).note_rejected();
+            return;
+        }
     }
 
     // ── P4.3 KVMem-native prefix reuse (HIPFIRE_KVMEM_PREFIX_PIN) ─────────
@@ -9309,14 +9334,25 @@ fn admit(
                 // (its DeltaNet state exists at its own page-aligned frontier);
                 // no such checkpoint closes the reuse to cold.
                 if ctl.strategy().is_layerwise() {
+                    // 期2.3: the import decision carries the frontend query
+                    // identity — KeepSelected (already effective at the
+                    // source) suppresses the per-request Query; a NEW proven
+                    // question arms it. Unproven spans keep the historical
+                    // behaviour (no forced Query on the cold-reuse path).
+                    let mut keep_selected = false;
                     let admission = (|| -> Result<Option<u32>, String> {
-                        let start = ctl
+                        let prev = ctl.prefix_original_query(reuse_id);
+                        let decision = ctl
                             .import_window(
                                 req.prompt_tokens.len() as u64,
                                 req.max_tokens as u64,
                                 frontier,
+                                req.query,
+                                prev,
                             )
                             .map_err(|e| format!("kvmem reuse: import admission: {e}"))?;
+                        keep_selected = decision.keep_selected;
+                        let start = decision.start;
                         if !start.pressure() {
                             return Ok(None);
                         }
@@ -9332,13 +9368,18 @@ fn admit(
                             };
                             frontier = ctl.fork_prefix_into(slot.0, sid, &req.prompt_tokens)?;
                             reuse_id = sid;
-                            let retry = ctl
+                            let prev = ctl.prefix_original_query(reuse_id);
+                            let decision = ctl
                                 .import_window(
                                     req.prompt_tokens.len() as u64,
                                     req.max_tokens as u64,
                                     frontier,
+                                    req.query,
+                                    prev,
                                 )
                                 .map_err(|e| format!("kvmem reuse: import retry: {e}"))?;
+                            keep_selected = decision.keep_selected;
+                            let retry = decision.start;
                             if retry.pressure() {
                                 if retry.restore_tokens < frontier as u64 {
                                     return Err(format!(
@@ -9370,6 +9411,25 @@ fn admit(
                             let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
                             return Err(e);
                         }
+                    }
+                    // 期2.3: arm the first-step Query only for a NEW proven
+                    // question. KeepSelected leaves it clear so the source's
+                    // selected views stand; an unproven span keeps the
+                    // historical (no forced Query on the cold-reuse path).
+                    if req.query.is_some() {
+                        ctl.set_layerwise_query_due(slot.0, !keep_selected);
+                    }
+                    if hipfire_config::developer_var("HIPFIRE_KVMEM_TRACE")
+                        .ok()
+                        .is_some_and(|v| v == "1" || v == "on" || v == "true")
+                    {
+                        eprintln!(
+                            "[kvmem-query] reuse slot {} query={:?} keep_selected={} -> due={}",
+                            slot.0,
+                            req.query,
+                            keep_selected,
+                            req.query.is_some() && !keep_selected
+                        );
                     }
                 }
                 let gpu_pages = ctl

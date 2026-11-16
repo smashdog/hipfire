@@ -57,6 +57,14 @@ pub struct VisualData {
 pub struct SubmitRequest {
     /// Full cold render of the conversation. Used when nothing is reusable.
     pub prompt_tokens: Vec<u32>,
+    /// 期2.3: frontend-proven span of the current user question inside
+    /// `prompt_tokens` (original coordinates `[begin, end)`). The frontend
+    /// derives it from the rendered prompt; `None` when it cannot prove the
+    /// span (tool continuations, VL, template transforms). Layerwise import
+    /// uses it to tell a NEW query from one whose KV/score is already
+    /// effective at the source checkpoint (KVMem/nInfer
+    /// `layerwise_query_at_source`); `None` keeps the historical behaviour.
+    pub query: Option<(u64, u64)>,
     /// Hashes of the conversation's user turns, in order. Identity for
     /// continuation matching — see `Session::convo`.
     pub convo: Vec<u64>,

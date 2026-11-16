@@ -64,6 +64,7 @@ fn main() {
             let prompt: Vec<u32> = (0..64).map(|t| (1000 + i * 100 + t) as u32).collect();
             engine
                 .submit(SubmitRequest {
+                    query: None,
                     prompt_tokens: prompt,
                     convo: vec![0xA13_000 + i as u64],
                     continuation: Continuation::Cold,

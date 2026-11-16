@@ -119,6 +119,12 @@ pub struct PrefixCheckpoint {
     /// catalog entry). Attached by the engine at freeze; released by the
     /// engine when the entry is evicted/removed. Empty until attached.
     pub gpu_pages: Vec<u32>,
+    /// 期2.3: span of the user question that created this checkpoint, in the
+    /// freeze request's original coordinates. Import compares it with the new
+    /// request's proven span (KVMem/nInfer `layerwise_query_at_source`):
+    /// equal and inside the frontier ⇒ the source's KV/score already covers
+    /// the question ⇒ KeepSelected. `None` = frozen without a proven span.
+    pub original_query: Option<(u64, u64)>,
     /// Immutable canonical archive: `source.fork_prefix(frontier)`. Packed
     /// records are sealed shared sources; mean-K is private to this archive
     /// and re-forked private into every branch. Never fed after freeze.
@@ -155,6 +161,7 @@ impl PrefixCheckpoint {
             source_incarnation,
             layout_id,
             gpu_pages: Vec::new(),
+            original_query: None,
             canonical,
             draft_image: None,
             last_used: 0,
@@ -529,6 +536,7 @@ mod tests {
             source_incarnation: 1,
             layout_id: layout_fingerprint(&raw_config()),
             gpu_pages: Vec::new(),
+            original_query: None,
             canonical,
             draft_image: None,
             last_used: 0,
