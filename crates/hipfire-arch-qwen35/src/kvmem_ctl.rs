@@ -951,6 +951,7 @@ pub struct KvMemCtl {
     draft_image_misses_total: u64,
 }
 
+
 impl KvMemCtl {
     pub fn new(
         n_slots: usize,
@@ -3286,6 +3287,69 @@ impl KvMemCtl {
     /// Their state (statistics, spilled payloads, selection watermark) is the
     /// reused prefix and must survive idle steps; only a slot with neither an
     /// in-flight request nor a resident session is dropped.
+    /// G3 cold-reuse fix: materialize a page-less imported prefix (restart
+    /// pack load or a demoted/restart entry) into fresh pool pages BEFORE the
+    /// suffix prefill. Without this the block table holds no prefix pages and
+    /// the suffix prefill's attention reads unbound/stale rows — the model
+    /// loses the whole imported context. Returns the physical pages (the
+    /// caller pins them as cache refs so the entry becomes hot).
+    pub fn stage_page_less_import(
+        &mut self,
+        gpu: &Gpu,
+        pool: &mut SlotPool,
+        k_arenas: &[GpuTensor],
+        v_arenas: &[GpuTensor],
+        slot: usize,
+        frontier: u32,
+    ) -> Result<Vec<u32>, String> {
+        if frontier == 0 || frontier % KV_BLOCK_TOKENS as u32 != 0 {
+            return Err(format!("kvmem stage: frontier {frontier} is not page aligned"));
+        }
+        let (k_page_bytes, v_page_bytes) = (self.k_page_bytes, self.v_page_bytes);
+        let st = self
+            .slots
+            .get_mut(slot)
+            .ok_or_else(|| format!("kvmem stage: slot {slot} out of range"))?;
+        let pages = (frontier / KV_BLOCK_TOKENS as u32) as usize;
+        pool.set_seq_len(SlotId(slot), frontier as usize)
+            .map_err(|e| format!("kvmem stage provision: {e}"))?;
+        let phys_pages: Vec<u32> = {
+            let bt = pool
+                .block_table(SlotId(slot))
+                .ok_or_else(|| "kvmem stage: slot has no block table".to_string())?;
+            if bt.num_pages() < pages {
+                return Err(format!(
+                    "kvmem stage: block table holds {} pages, need {pages}",
+                    bt.num_pages()
+                ));
+            }
+            (0..pages)
+                .map(|lp| {
+                    bt.physical(lp)
+                        .ok_or_else(|| format!("kvmem stage: logical page {lp} unbound"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut page_k = vec![0u8; k_page_bytes];
+        let mut page_v = vec![0u8; v_page_bytes];
+        for (lp, &phys) in phys_pages.iter().enumerate() {
+            restore_page(
+                gpu,
+                &st.raw,
+                &mut page_k,
+                &mut page_v,
+                k_arenas,
+                v_arenas,
+                k_page_bytes,
+                v_page_bytes,
+                phys,
+                lp,
+            )
+            .map_err(|e| format!("kvmem stage restore: {e}"))?;
+        }
+        Ok(phys_pages)
+    }
+
     pub fn prepare_step(
         &mut self,
         gpu: &Gpu,
