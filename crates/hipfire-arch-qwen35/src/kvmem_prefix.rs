@@ -26,7 +26,9 @@
 //! default, `HIPFIRE_KVMEM_PREFIX_PIN` off) no path allocates or mutates
 //! anything, keeping the Legacy serve byte-neutral.
 
-use hipfire_kvmem::{RawStore, RawStoreConfig};
+use hipfire_kvmem::{
+    plan_content_group_publication, ContentSlot, PublicationReason, RawStore, RawStoreConfig,
+};
 use hipfire_runtime::checkpoint_pool::prefix_fingerprint;
 
 /// Page-aligned reuse granularity: GPU prefix sharing is page-granular
@@ -125,6 +127,10 @@ pub struct PrefixCheckpoint {
     /// equal and inside the frontier ⇒ the source's KV/score already covers
     /// the question ⇒ KeepSelected. `None` = frozen without a proven span.
     pub original_query: Option<(u64, u64)>,
+    /// 期3 G3: internal content group (conversation-lineage hash). A capacity
+    /// FAIRNESS hint only — it never authorizes reuse or overwrites a proof.
+    /// 0 = unknown origin (independent group, as in the core policy).
+    pub group: u64,
     /// Immutable canonical archive: `source.fork_prefix(frontier)`. Packed
     /// records are sealed shared sources; mean-K is private to this archive
     /// and re-forked private into every branch. Never fed after freeze.
@@ -168,6 +174,7 @@ impl PrefixCheckpoint {
             layout_id,
             gpu_pages: Vec::new(),
             original_query: None,
+            group: 0,
             canonical,
             kv_snapshot: None,
             draft_image: None,
@@ -324,6 +331,79 @@ impl PrefixCatalog {
     ) -> Result<(Option<u64>, Vec<PrefixCheckpoint>), String> {
         let id = self.insert(entry)?;
         Ok((id, std::mem::take(&mut self.pending_displaced)))
+    }
+
+    /// 期3 G3: group-aware publication through the core content-directory
+    /// policy (`plan_content_group_publication`): internal content groups are a
+    /// capacity fairness hint; the whole least-recently-used group retires
+    /// before entry trimming, and a redundant version is trimmed before
+    /// another group's sole version. Reuse-proof semantics are unchanged (the
+    /// caller still validates tokens/layout). Returns the inserted id (None
+    /// when deduped), the retired entries (the engine releases their GPU
+    /// refs), and the dedup flag.
+    pub fn insert_group_aware(
+        &mut self,
+        mut entry: PrefixCheckpoint,
+        max_groups: usize,
+    ) -> Result<(Option<u64>, Vec<PrefixCheckpoint>, bool), String> {
+        if self.max_entries == 0 {
+            return Err("kvmem prefix catalog: disabled (max_entries 0)".to_string());
+        }
+        if let Some(existing) = self
+            .entries
+            .iter()
+            .find(|e| e.frontier == entry.frontier && e.fingerprint == entry.fingerprint)
+        {
+            let id = existing.id;
+            self.touch(id);
+            return Ok((None, Vec::new(), true));
+        }
+        let slots: Vec<ContentSlot> = self
+            .entries
+            .iter()
+            .map(|e| ContentSlot {
+                occupied: 1,
+                pinned: 0,
+                last_used: e.last_used,
+                identity: 0,
+                group: e.group,
+            })
+            .collect();
+        let (slot, reason, retired) =
+            plan_content_group_publication(&slots, self.max_entries, max_groups, entry.group)
+                .map_err(|e| format!("kvmem content directory: {e}"))?;
+        if slot.is_none() {
+            return Err(format!(
+                "kvmem content directory refused publication ({reason:?})"
+            ));
+        }
+        let mut displaced = Vec::with_capacity(retired.len());
+        for &index in retired.iter().rev() {
+            if index < self.entries.len() {
+                displaced.push(self.entries.remove(index));
+            }
+        }
+        if reason == PublicationReason::Deduplicated {
+            // The plan matched an identity this catalog does not mint (the
+            // dedup probe above is the authoritative one); never append twice.
+            return Ok((None, displaced, true));
+        }
+        self.clock += 1;
+        entry.last_used = self.clock;
+        let id = entry.id;
+        self.entries.push(entry);
+        Ok((Some(id), displaced, false))
+    }
+
+    /// Distinct non-zero content groups currently retained.
+    pub fn group_count(&self) -> usize {
+        let mut seen = std::collections::BTreeSet::new();
+        for e in &self.entries {
+            if e.group != 0 {
+                seen.insert(e.group);
+            }
+        }
+        seen.len()
     }
 
     /// Drain any displaced entries left by [`Self::insert`] (test-facing).
@@ -545,6 +625,7 @@ mod tests {
             layout_id: layout_fingerprint(&raw_config()),
             gpu_pages: Vec::new(),
             original_query: None,
+            group: 0,
             canonical,
             kv_snapshot: None,
             draft_image: None,
@@ -734,5 +815,38 @@ mod tests {
         assert_eq!(removed.frontier, 128);
         assert!(cat.is_empty());
         assert!(cat.remove(1).is_none());
+    }
+
+    /// 期3 G3: group-aware publication retires the whole least-recently-used
+    /// group before entry trimming; reuse proofs are unchanged.
+    #[test]
+    fn content_groups_retire_the_lru_whole_group() {
+        let st = storage();
+        let mut cat = PrefixCatalog::new(4);
+        let mut publish = |cat: &mut PrefixCatalog, frontier: u32, seed: u32, group: u64| {
+            let mut ck = checkpoint(&st, cat.mint_id(), frontier, &tokens(frontier as usize + seed as usize));
+            ck.group = group;
+            cat.insert_group_aware(ck, 2).expect("group publish")
+        };
+        // Group A owns two versions, group B is the newer sole version.
+        let (a1, d1, dup1) = publish(&mut cat, 128, 0, 11);
+        assert!(a1.is_some() && d1.is_empty() && !dup1);
+        let (a2, d2, _) = publish(&mut cat, 256, 1, 11);
+        assert!(a2.is_some() && d2.is_empty());
+        let (b1, d3, _) = publish(&mut cat, 384, 2, 22);
+        assert!(b1.is_some() && d3.is_empty());
+        assert_eq!(cat.group_count(), 2);
+        // Publishing a third group retires the LRU whole group (A: used 2 < B: 3).
+        let (c1, retired, _) = publish(&mut cat, 512, 3, 33);
+        assert!(c1.is_some());
+        assert_eq!(retired.len(), 2, "both A versions retire with their group");
+        assert!(retired.iter().all(|e| e.group == 11));
+        assert_eq!(cat.group_count(), 2, "B and C remain");
+        assert_eq!(cat.len(), 2, "B + C");
+        // Dedup by exact frontier+proof still wins before the group plan.
+        let mut dup = checkpoint(&st, cat.mint_id(), 512, &tokens(512 + 3));
+        dup.group = 33;
+        let (id, none, deduped) = cat.insert_group_aware(dup, 2).expect("dedup");
+        assert!(id.is_none() && none.is_empty() && deduped);
     }
 }
