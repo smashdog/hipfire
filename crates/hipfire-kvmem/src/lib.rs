@@ -138,6 +138,21 @@ struct HkKvSnapshot {
     _private: [u8; 0],
 }
 
+/// Header of one persistent prefix pack (期3 G3 P1.1).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrefixPackInfo {
+    pub n_layer: u32,
+    pub block_tokens: u32,
+    pub n_embd_k: u32,
+    pub n_embd_v: u32,
+    pub blocks: u32,
+    pub k_row_bytes: u64,
+    pub v_row_bytes: u64,
+    pub meta_bytes: u64,
+    pub file_bytes: u64,
+}
+
 #[repr(C)]
 struct HkKvStore {
     _private: [u8; 0],
@@ -1113,6 +1128,32 @@ mod ffi {
             dst: *mut HkRawStore,
             src: *const HkRawStore,
             blocks: u32,
+        ) -> c_int;
+
+        // 期3 G3 P1.1: persistent prefix packs.
+        pub fn hk_raw_store_write_prefix_pack(
+            st: *const HkRawStore,
+            blocks: u32,
+            path: *const c_char,
+            meta: *const u8,
+            meta_len: usize,
+        ) -> c_int;
+        pub fn hk_prefix_pack_info_read(
+            path: *const c_char,
+            out: *mut PrefixPackInfo,
+        ) -> c_int;
+        pub fn hk_prefix_pack_meta_read(
+            path: *const c_char,
+            meta_out: *mut u8,
+            meta_cap: usize,
+            meta_len: *mut usize,
+        ) -> c_int;
+        pub fn hk_raw_store_read_prefix_pack(
+            st: *mut HkRawStore,
+            path: *const c_char,
+            meta_out: *mut u8,
+            meta_cap: usize,
+            meta_len: *mut usize,
         ) -> c_int;
         pub fn hk_raw_store_capture_snapshot(
             st: *const HkRawStore,
@@ -2281,6 +2322,95 @@ impl RawStore {
         checked(|| unsafe {
             let _ = ffi::hk_raw_store_copy_prefix_to(out, src, blocks);
         })
+    }
+
+    /// 期3 G3 P1.1: write this store's `blocks`-block packed prefix (K/V +
+    /// Mean-K sums) and the opaque adapter metadata into an atomic pack file.
+    pub fn write_prefix_pack(&self, blocks: u32, path: &Path, meta: &[u8]) -> Result<()> {
+        let c = CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|e| KvMemError(format!("pack path: {e}")))?;
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe {
+            let _ = ffi::hk_raw_store_write_prefix_pack(
+                p,
+                blocks,
+                c.as_ptr(),
+                if meta.is_empty() { ptr::null() } else { meta.as_ptr() },
+                meta.len(),
+            );
+        })
+    }
+
+    /// 期3 G3 P1.1: read a pack's header only (cold-index scans).
+    pub fn prefix_pack_info(path: &Path) -> Result<PrefixPackInfo> {
+        let c = CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|e| KvMemError(format!("pack path: {e}")))?;
+        let mut out = PrefixPackInfo::default();
+        clear_error();
+        let rc = unsafe { ffi::hk_prefix_pack_info_read(c.as_ptr(), &mut out) };
+        if rc != 0 {
+            return Err(last_error().map_or_else(
+                || KvMemError("pack info failed".to_string()),
+                KvMemError,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// 期3 G3 P1.1: read only a pack's adapter metadata (cold-index scans;
+    /// never loads the payload).
+    pub fn prefix_pack_meta(path: &Path) -> Result<Vec<u8>> {
+        let c = CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|e| KvMemError(format!("pack path: {e}")))?;
+        let info = Self::prefix_pack_info(path)?;
+        let mut meta = vec![0u8; info.meta_bytes as usize];
+        let mut meta_len = 0usize;
+        clear_error();
+        let rc = unsafe {
+            ffi::hk_prefix_pack_meta_read(
+                c.as_ptr(),
+                if meta.is_empty() { ptr::null_mut() } else { meta.as_mut_ptr() },
+                meta.len(),
+                &mut meta_len,
+            )
+        };
+        if rc != 0 {
+            return Err(last_error().map_or_else(
+                || KvMemError("pack meta read failed".to_string()),
+                KvMemError,
+            ));
+        }
+        meta.truncate(meta_len.min(meta.len()));
+        Ok(meta)
+    }
+
+    /// 期3 G3 P1.1: load a pack's payload into this (empty) store; geometry
+    /// must match. The adapter metadata is returned to the caller.
+    pub fn read_prefix_pack(&self, path: &Path) -> Result<Vec<u8>> {
+        let c = CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|e| KvMemError(format!("pack path: {e}")))?;
+        let info = Self::prefix_pack_info(path)?;
+        let mut meta = vec![0u8; info.meta_bytes as usize];
+        let mut meta_len = 0usize;
+        let p = self.ptr.as_ptr();
+        clear_error();
+        let rc = unsafe {
+            ffi::hk_raw_store_read_prefix_pack(
+                p,
+                c.as_ptr(),
+                if meta.is_empty() { ptr::null_mut() } else { meta.as_mut_ptr() },
+                meta.len(),
+                &mut meta_len,
+            )
+        };
+        if rc != 0 {
+            return Err(last_error().map_or_else(
+                || KvMemError("pack read failed".to_string()),
+                KvMemError,
+            ));
+        }
+        meta.truncate(meta_len.min(meta.len()));
+        Ok(meta)
     }
 
     /// 期3 G4: capture one immutable core `KvSnapshot` over the sealed packed

@@ -96,6 +96,188 @@ impl DraftImage {
     }
 }
 
+/// 期3 G3 P1.1: adapter metadata of one persistent prefix pack. The pack
+/// header (geometry + per-block tokens) lives in the shim; this JSON blob is
+/// opaque to it and carries the reuse proof and identity.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ContentPackMeta {
+    pub version: u32,
+    pub layout_id: u64,
+    pub frontier: u32,
+    pub tokens: Vec<u32>,
+    pub mean_tail: Option<Vec<f32>>,
+    pub group: u64,
+    pub original_query: Option<(u64, u64)>,
+    pub n_record_layers: u32,
+}
+
+impl ContentPackMeta {
+    pub const VERSION: u32 = 1;
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(self).map_err(|e| format!("content pack meta: {e}"))
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        serde_json::from_slice(bytes).map_err(|e| format!("content pack meta: {e}"))
+    }
+}
+
+/// One pack file discovered in the content directory (metadata only; the
+/// payload is loaded on demand).
+#[derive(Debug, Clone)]
+pub struct ColdPack {
+    pub path: std::path::PathBuf,
+    pub meta: ContentPackMeta,
+    pub fingerprint: u64,
+    pub bytes: u64,
+    /// Monotonic LRU stamp assigned at scan (file mtime order).
+    pub stamp: u64,
+}
+
+/// Cold content index: persistent pack files in `HIPFIRE_KVMEM_CACHE_DIR`.
+/// A hit loads the payload into a fresh store and publishes a normal catalog
+/// entry (the engine then reuses it through the usual proof path).
+#[derive(Debug, Default)]
+pub struct ColdPackIndex {
+    packs: Vec<ColdPack>,
+    clock: u64,
+}
+
+impl ColdPackIndex {
+    pub fn len(&self) -> usize {
+        self.packs.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.packs.is_empty()
+    }
+    pub fn total_bytes(&self) -> u64 {
+        self.packs.iter().map(|p| p.bytes).sum()
+    }
+    pub fn packs(&self) -> &[ColdPack] {
+        &self.packs
+    }
+
+    /// Scan `dir` for `*.hkpack` files, keeping only packs whose geometry and
+    /// layout match this engine and whose metadata is well-formed. Files are
+    /// ordered by mtime (oldest first) for byte-cap pruning.
+    pub fn scan(
+        dir: &std::path::Path,
+        layout_id: u64,
+        n_record_layers: u32,
+        block_tokens: u32,
+        max_meta_bytes: u64,
+    ) -> Self {
+        let mut index = Self::default();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return index;
+        };
+        let mut raw: Vec<(std::time::SystemTime, ColdPack)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("hkpack") {
+                continue;
+            }
+            let Ok(info) = RawStore::prefix_pack_info(&path) else {
+                continue;
+            };
+            if info.meta_bytes == 0 || info.meta_bytes > max_meta_bytes {
+                continue;
+            }
+            let Ok(meta_bytes) = RawStore::prefix_pack_meta(&path) else {
+                continue;
+            };
+            let Ok(meta) = ContentPackMeta::decode(&meta_bytes) else {
+                continue;
+            };
+            if meta.version != ContentPackMeta::VERSION
+                || meta.layout_id != layout_id
+                || meta.n_record_layers != n_record_layers
+                || meta.frontier == 0
+                || meta.frontier % block_tokens != 0
+                || meta.tokens.len() != meta.frontier as usize
+            {
+                continue;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            raw.push((
+                modified,
+                ColdPack {
+                    fingerprint: prefix_fingerprint(&meta.tokens),
+                    path,
+                    meta,
+                    bytes: info.file_bytes,
+                    stamp: 0,
+                },
+            ));
+        }
+        raw.sort_by_key(|(m, _)| *m);
+        index.clock = raw.len() as u64;
+        index.packs = raw
+            .into_iter()
+            .enumerate()
+            .map(|(i, (_, mut p))| {
+                p.stamp = i as u64;
+                p
+            })
+            .collect();
+        index
+    }
+
+    /// Longest pack whose FULL token proof matches `prompt` (same rule as the
+    /// hot catalog; a fingerprint alone is never the admission proof).
+    pub fn lookup(&self, prompt: &[u32], layout_id: u64) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for (i, p) in self.packs.iter().enumerate() {
+            if p.meta.layout_id != layout_id || p.meta.frontier as usize > prompt.len() {
+                continue;
+            }
+            let f = p.meta.frontier as usize;
+            if prefix_fingerprint(&prompt[..f]) != p.fingerprint {
+                continue;
+            }
+            if prompt[..f] != p.meta.tokens[..] {
+                continue;
+            }
+            if best
+                .map(|b| p.meta.frontier > self.packs[b].meta.frontier)
+                .unwrap_or(true)
+            {
+                best = Some(i);
+            }
+        }
+        best
+    }
+
+    /// Delete the oldest packs until the index fits `max_bytes`. Returns the
+    /// removed files so callers can log/metrics them.
+    pub fn prune_to(&mut self, max_bytes: u64) -> Vec<std::path::PathBuf> {
+        let mut removed = Vec::new();
+        while self.total_bytes() > max_bytes && !self.packs.is_empty() {
+            let victim = self
+                .packs
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, p)| p.stamp)
+                .map(|(i, _)| i)
+                .expect("nonempty");
+            let p = self.packs.remove(victim);
+            let _ = std::fs::remove_file(&p.path);
+            removed.push(p.path);
+        }
+        removed
+    }
+
+    pub fn remove(&mut self, index: usize) -> Option<ColdPack> {
+        if index < self.packs.len() {
+            Some(self.packs.remove(index))
+        } else {
+            None
+        }
+    }
+}
+
 /// One frozen reusable prefix: the immutable canonical archive plus the
 /// provenance a reuse must satisfy. Created by [`crate::kvmem_ctl::KvMemCtl::freeze_prefix`];
 /// the engine attaches the pinned GPU pages (`gpu_pages`) after sealing them.
@@ -856,4 +1038,52 @@ mod tests {
         let (id, none, deduped) = cat.insert_group_aware(dup, 2).expect("dedup");
         assert!(id.is_none() && none.is_empty() && deduped);
     }
+
+    /// 期3 G3 P1.1: the cold index scans pack files, proves by full token
+    /// equality (never fingerprint alone), and prunes by byte cap.
+    #[test]
+    fn cold_pack_index_scans_proves_and_prunes() {
+        let st = storage();
+        let src = RawStore::new(raw_config(), Some(&st)).expect("src");
+        fill(&src, 4);
+        let dir = std::env::temp_dir().join(format!("kvmem-packidx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let layout = layout_fingerprint(&raw_config());
+        let mut write = |frontier: u32, seed: u32, name: &str| {
+            let canonical = src.fork_prefix(frontier).expect("fork");
+            let toks: Vec<u32> = (0..frontier)
+                .map(|i| i.wrapping_mul(31).wrapping_add(seed))
+                .collect();
+            let meta = ContentPackMeta {
+                version: ContentPackMeta::VERSION,
+                layout_id: layout,
+                frontier,
+                tokens: toks.clone(),
+                mean_tail: None,
+                group: 7,
+                original_query: Some((0, 10)),
+                n_record_layers: LAYERS,
+            };
+            let path = dir.join(name);
+            canonical
+                .write_prefix_pack(frontier / BLOCK, &path, &meta.encode().expect("meta"))
+                .expect("write pack");
+            (path, toks)
+        };
+        let (p1, t1) = write(128, 0, "a.hkpack");
+        let (p2, t2) = write(256, 1, "b.hkpack");
+        let mut idx = ColdPackIndex::scan(&dir, layout, LAYERS, BLOCK, 1 << 20);
+        assert_eq!(idx.len(), 2, "two well-formed packs");
+        assert_eq!(idx.lookup(&t1, layout).map(|i| idx.packs()[i].path.clone()), Some(p1.clone()));
+        assert_eq!(idx.lookup(&t2, layout).map(|i| idx.packs()[i].path.clone()), Some(p2.clone()));
+        let mut foreign = t1.clone();
+        foreign[0] ^= 0xffff;
+        assert!(idx.lookup(&foreign, layout).is_none(), "fingerprint alone is no proof");
+        assert!(idx.lookup(&t1, layout ^ 1).is_none(), "layout must match");
+        let removed = idx.prune_to(0);
+        assert_eq!(removed.len(), 2);
+        assert!(!p1.exists() && !p2.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
+
