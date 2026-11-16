@@ -677,6 +677,18 @@ impl Metrics {
                     "Prefix entries retired by the group-aware publication plan.",
                     s.kvmem.content_retirements,
                 );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_content_cache_bytes",
+                    "Content-cache account bytes (separate from the spill account).",
+                    s.kvmem.content_cache_bytes as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_content_cache_disk_bytes",
+                    "Content-cache disk-tier bytes.",
+                    s.kvmem.content_cache_disk_bytes as f64,
+                );
             }
         }
 
@@ -1098,6 +1110,7 @@ mod tests {
                 "prefix_misses": 6, "prefix_evictions": 1,
                 "draft_images": 2, "draft_image_hits": 1, "draft_image_misses": 1,
                 "content_groups": 2, "content_retirements": 1,
+                "content_cache_bytes": 4096, "content_cache_disk_bytes": 2048,
             },
         });
         let kvmeta = ServeMeta {
@@ -1128,6 +1141,8 @@ mod tests {
             "hipfire_kvmem_draft_image_misses_total 1\n",
             "hipfire_kvmem_content_groups 2\n",
             "hipfire_kvmem_content_retirements_total 1\n",
+            "hipfire_kvmem_content_cache_bytes 4096\n",
+            "hipfire_kvmem_content_cache_disk_bytes 2048\n",
         ] {
             assert!(out.contains(sample), "{sample}: {out}");
         }

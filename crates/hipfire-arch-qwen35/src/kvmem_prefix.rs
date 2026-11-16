@@ -131,6 +131,11 @@ pub struct PrefixCheckpoint {
     /// FAIRNESS hint only — it never authorizes reuse or overwrites a proof.
     /// 0 = unknown origin (independent group, as in the core policy).
     pub group: u64,
+    /// 期3 G3-SSD: the canonical archive lives in the separate content-cache
+    /// storage account, so reuse materializes a session-account copy instead
+    /// of sharing records across accounts (core `import_packed` refuses a
+    /// foreign account and `fork_prefix` would mix the ledgers).
+    pub canonical_on_content: bool,
     /// Immutable canonical archive: `source.fork_prefix(frontier)`. Packed
     /// records are sealed shared sources; mean-K is private to this archive
     /// and re-forked private into every branch. Never fed after freeze.
@@ -175,6 +180,7 @@ impl PrefixCheckpoint {
             gpu_pages: Vec::new(),
             original_query: None,
             group: 0,
+            canonical_on_content: false,
             canonical,
             kv_snapshot: None,
             draft_image: None,
@@ -626,6 +632,7 @@ mod tests {
             gpu_pages: Vec::new(),
             original_query: None,
             group: 0,
+            canonical_on_content: false,
             canonical,
             kv_snapshot: None,
             draft_image: None,
