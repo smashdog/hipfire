@@ -146,6 +146,12 @@ pub mod layerwise_driver;
 /// default Legacy serve never constructs it and stays byte-neutral.
 #[cfg(all(feature = "deltanet", feature = "kvmem"))]
 pub mod layerwise_mtp;
+/// P4.1③ UpstreamGlobal MTP head-history private-probe selection: the global
+/// Mean-K reduction over the trunk carrier's captured activation Q tapes
+/// (core `LayerwiseProbeSelection`). Additive sibling to `layerwise_mtp`; only
+/// the UpstreamGlobal policy reaches it, so Legacy/FirstLayer stay byte-neutral.
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+pub mod layerwise_probe;
 /// Threaded Layerwise forward handle (Phase 3.2 ②-D4b). With `kvmem` it carries
 /// the per-query driver+staging bundle through the shared forward spine exactly
 /// like `SpecVerifyCapture`; without it, a zero-sized placeholder so the

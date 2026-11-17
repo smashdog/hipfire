@@ -5899,7 +5899,7 @@ fn run_loop(
                         .as_ref()
                         .expect("kvmem controller without statistics taps");
                     ctl.prepare_step(
-                        &rig.gpu,
+                        &mut rig.gpu,
                         &mut rig.pool,
                         taps,
                         &active,
@@ -6349,6 +6349,48 @@ fn run_loop(
                                 // restored view re-admits cold-recalled needle pages, and a
                                 // growing union would diverge per-layer extents (bug #8).
                                 let head_plane = ctl.head_plane_enabled();
+                                // P4.1③ H2a/H4: UpstreamGlobal head-history probe
+                                // over the carrier's CAPTURED activation Q tapes,
+                                // run BEFORE `free` ends the carrier borrow (the
+                                // tapes live in the per-step carrier). Pure host
+                                // selection — no KV mutation, no rollback. FirstLayer
+                                // (the auto-default) skips this and binds from the
+                                // first restored ordinal after free (② G5). Legacy /
+                                // AR-only never reach it (byte-neutral).
+                                let mtp_history = ctl.layerwise_mtp_history();
+                                let probe_aux: Option<Result<crate::layerwise_mtp::AuxiliarySelection, String>> =
+                                    if head_plane
+                                        && mtp_history
+                                            == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
+                                    {
+                                        Some(match carrier.activation() {
+                                            Some(act) => match ctl.layerwise_stores(slot) {
+                                                Some((keys, _)) => {
+                                                    crate::layerwise_probe::probe_head_history(
+                                                        &mut rig.gpu,
+                                                        act,
+                                                        &lw_policy,
+                                                        keys,
+                                                        rig.model.config.n_heads as u32,
+                                                        rig.model.config.n_kv_heads as u32,
+                                                        rig.model.config.head_dim as u32,
+                                                        0.0,
+                                                        crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u32,
+                                                        begin,
+                                                    )
+                                                }
+                                                None => Err(
+                                                    "layerwise probe: slot has no keys store".to_string(),
+                                                ),
+                                            },
+                                            None => Err(
+                                                "layerwise probe: UpstreamGlobal carrier has no activation"
+                                                    .to_string(),
+                                            ),
+                                        })
+                                    } else {
+                                        None
+                                    };
                                 let prev_keep: Vec<Vec<u64>> = ctl
                                     .layerwise_keep_set(slot)
                                     .map(|s| s.to_vec())
@@ -6399,16 +6441,22 @@ fn run_loop(
                                 // FirstLayer under ②. `Ok(None)` when the head plane is
                                 // inactive (AR-only) or the restore errored (handled below).
                                 let aux_res = if head_plane {
-                                    aux_first
-                                        .as_deref()
-                                        .map(|first| {
-                                            crate::layerwise_mtp::bind_first_layer_auxiliary(
-                                                first,
-                                                begin,
-                                                crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u64,
-                                            )
-                                        })
-                                        .transpose()
+                                    if mtp_history
+                                        == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
+                                    {
+                                        probe_aux.transpose()
+                                    } else {
+                                        aux_first
+                                            .as_deref()
+                                            .map(|first| {
+                                                crate::layerwise_mtp::bind_first_layer_auxiliary(
+                                                    first,
+                                                    begin,
+                                                    crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u64,
+                                                )
+                                            })
+                                            .transpose()
+                                    }
                                 } else {
                                     Ok(None)
                                 };
@@ -6588,6 +6636,47 @@ fn run_loop(
                                         Some(&mut carrier),
                                     );
                                     let head_plane = ctl.head_plane_enabled();
+                                    // P4.1③ H2a/H4: UpstreamGlobal head-history probe
+                                    // over the carrier's CAPTURED activation Q tapes,
+                                    // run BEFORE `free` (the tapes live in the per-step
+                                    // carrier). Pure host selection — no KV mutation, no
+                                    // rollback. FirstLayer binds from the first restored
+                                    // ordinal after free (② G5). Legacy / AR-only never
+                                    // reach it (byte-neutral).
+                                    let mtp_history = ctl.layerwise_mtp_history();
+                                    let probe_aux: Option<Result<crate::layerwise_mtp::AuxiliarySelection, String>> =
+                                        if head_plane
+                                            && mtp_history
+                                                == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
+                                        {
+                                            Some(match carrier.activation() {
+                                                Some(act) => match ctl.layerwise_stores(slot) {
+                                                    Some((keys, _)) => {
+                                                        crate::layerwise_probe::probe_head_history(
+                                                            &mut rig.gpu,
+                                                            act,
+                                                            &lw_policy,
+                                                            keys,
+                                                            rig.model.config.n_heads as u32,
+                                                            rig.model.config.n_kv_heads as u32,
+                                                            rig.model.config.head_dim as u32,
+                                                            0.0,
+                                                            crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as u32,
+                                                            begin,
+                                                        )
+                                                    }
+                                                    None => Err(
+                                                        "layerwise probe: slot has no keys store".to_string(),
+                                                    ),
+                                                },
+                                                None => Err(
+                                                    "layerwise probe: UpstreamGlobal carrier has no activation"
+                                                        .to_string(),
+                                                ),
+                                            })
+                                        } else {
+                                            None
+                                        };
                                     let restored_res = carrier.restored_keep_set();
                                     // G5: the first FA ordinal's restored canonical ids
                                     // for the FirstLayer head aux binding, captured before
@@ -6622,17 +6711,23 @@ fn run_loop(
                                     // the next span's draft take this binding. `Ok(None)` when
                                     // the head plane is inactive or the restore errored.
                                     let aux_res = if head_plane {
-                                        aux_first
-                                            .as_deref()
-                                            .map(|first| {
-                                                crate::layerwise_mtp::bind_first_layer_auxiliary(
-                                                    first,
-                                                    begin,
-                                                    crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS
-                                                        as u64,
-                                                )
-                                            })
-                                            .transpose()
+                                        if mtp_history
+                                            == crate::layerwise_mtp::LayerwiseMtpHistory::UpstreamGlobal
+                                        {
+                                            probe_aux.transpose()
+                                        } else {
+                                            aux_first
+                                                .as_deref()
+                                                .map(|first| {
+                                                    crate::layerwise_mtp::bind_first_layer_auxiliary(
+                                                        first,
+                                                        begin,
+                                                        crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS
+                                                            as u64,
+                                                    )
+                                                })
+                                                .transpose()
+                                        }
                                     } else {
                                         Ok(None)
                                     };
@@ -6966,7 +7061,7 @@ fn run_loop(
             if rig.model.kvmem.is_some() {
                 let mut row = 0usize;
                 let mut feed_err: Option<String> = None;
-                // fix(a) (② head-plane gap): take the controller OUT so the AR-decode
+                // P4.1③ root-cause fix: take the controller OUT so the AR-decode
                 // head aux co-archive below can borrow head/weights/hidden
                 // disjointly alongside `&mut ctl` (mirrors the MTP verify accept
                 // path's `self.kvmem.take()`).
@@ -6994,7 +7089,7 @@ fn run_loop(
                             &rig.gpu, taps, s, pos0, m, row_start,
                             &rig.pool, &rig.model.k_arenas, &rig.model.v_arenas,
                         )?;
-                        // fix(a) (AR-decode head aux co-archive, ② head-plane gap):
+                        // P4.1③ root-cause fix (AR-decode head aux co-archive):
                         // the head aux plane was co-archived ONLY in MTP prefill
                         // (mtp_prefill) + MTP verify accept; plain AR-decode rows
                         // fed here advanced the trunk Main plane but NOT the aux
