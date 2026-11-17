@@ -246,6 +246,234 @@ __device__ __forceinline__ half16_t decode_tile(const unsigned char* __restrict_
         }                                                                                      \
     }
 
+// ---------------------------------------------------------------------------
+// QKVZA overwrite MW — four projection regions (QKV / Z / beta / alpha)
+// Grid: [ceil((qkv_m+z_m+beta_m+alpha_m)/16), ceil(N/(16*NW))]. Block: [32*NW].
+// Instantiated for BITS=3 (exact gfx1100 MQ3 lane) only.
+// ---------------------------------------------------------------------------
+#define GEN_QKVZA_MW_LDS(BITS, NW)                                                             \
+    extern "C" __launch_bounds__(32 * (NW), 1) __global__ void                                 \
+        gemm_qkvza_mq##BITS##g256v2_wmma_gfx11_mw##NW##_lds(                                   \
+            const char* __restrict__ A_qkv,                                                    \
+            const char* __restrict__ A_z,                                                      \
+            const char* __restrict__ A_beta,                                                   \
+            const char* __restrict__ A_alpha,                                                  \
+            const _Float16* __restrict__ X,                                                    \
+            float* __restrict__ Y_qkv,                                                         \
+            float* __restrict__ Y_z,                                                           \
+            float* __restrict__ Y_beta,                                                        \
+            float* __restrict__ Y_alpha,                                                       \
+            int qkv_m,                                                                         \
+            int z_m,                                                                           \
+            int beta_m,                                                                        \
+            int alpha_m,                                                                       \
+            int K,                                                                             \
+            int N) {                                                                           \
+        constexpr int GROUP_BYTES = 8 + 32 * (BITS);                                           \
+        const int tid = threadIdx.x;                                                           \
+        const int lane = tid & 31;                                                             \
+        const int wave_id = tid >> 5;                                                          \
+        const int ml = lane & 15;                                                              \
+        const int total_m = qkv_m + z_m + beta_m + alpha_m;                                    \
+        const int row_start = blockIdx.x * 16;                                                 \
+        const int n_block_start = blockIdx.y * (16 * (NW));                                    \
+        const int out_col = n_block_start + wave_id * 16 + ml;                                 \
+        const int safe_batch = (out_col < N) ? out_col : 0;                                    \
+        const int groups_per_row = K / 256;                                                    \
+                                                                                               \
+        /* Tile-major [kt][row][ki]: 16*16*16 half = 8192 B / 4096 fp16. */                    \
+        __shared__ __align__(32) _Float16 w_lds[16][16][16];                                   \
+                                                                                               \
+        float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};                       \
+                                                                                               \
+        for (int g = 0; g < groups_per_row; g++) {                                             \
+            /* 128 logical staging jobs: 16 rows × 8 segments. */                              \
+            for (int job = tid; job < 128; job += 32 * (NW)) {                                 \
+                const int row = job / 8;                                                       \
+                const int segment = job % 8;                                                   \
+                const int safe_row =                                                           \
+                    (row_start + row < total_m) ? (row_start + row) : (total_m - 1);            \
+                const char* A;                                                                 \
+                int local_row;                                                                 \
+                if (safe_row < qkv_m) {                                                        \
+                    A = A_qkv;                                                                 \
+                    local_row = safe_row;                                                      \
+                } else if (safe_row < qkv_m + z_m) {                                           \
+                    A = A_z;                                                                   \
+                    local_row = safe_row - qkv_m;                                              \
+                } else if (safe_row < qkv_m + z_m + beta_m) {                                  \
+                    A = A_beta;                                                                \
+                    local_row = safe_row - (qkv_m + z_m);                                      \
+                } else {                                                                       \
+                    A = A_alpha;                                                               \
+                    local_row = safe_row - (qkv_m + z_m + beta_m);                             \
+                }                                                                              \
+                const char* gp = A + (long long)local_row * groups_per_row * GROUP_BYTES +      \
+                                 (long long)g * GROUP_BYTES;                                   \
+                /* One relevant dual-half V2 header for this segment's K half. */              \
+                const unsigned int h =                                                         \
+                    *(const unsigned int*)(gp + ((segment < 4) ? 0 : 4));                      \
+                const _Float16 sc_h =                                                          \
+                    (_Float16)__half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu)));    \
+                const _Float16 zp_h =                                                          \
+                    (_Float16)__half2float(__ushort_as_half((unsigned short)(h >> 16)));        \
+                const unsigned char* payload = (const unsigned char*)(gp + 8);                 \
+                const int kt0 = 2 * segment;                                                   \
+                const int kt1 = kt0 + 1;                                                       \
+                half16_t frag = decode_tile<BITS>(payload, kt0, sc_h, zp_h);                   \
+                *(half16_t*)(&w_lds[kt0][row][0]) = frag;                                      \
+                frag = decode_tile<BITS>(payload, kt1, sc_h, zp_h);                            \
+                *(half16_t*)(&w_lds[kt1][row][0]) = frag;                                      \
+            }                                                                                  \
+            /* All threads reach both barriers every group — no early returns. */              \
+            __syncthreads();                                                                   \
+                                                                                               \
+            /* K2 ascending: kt pairs 0,1; 2,3; ... 14,15. One float8 acc / wave. */           \
+            const _Float16* xg = X + (long long)safe_batch * K + (long long)g * 256;           \
+            _Pragma("unroll")                                                                  \
+            for (int kt = 0; kt < 16; kt += 2) {                                               \
+                half16_t a_reg = *(const half16_t*)(&w_lds[kt][ml][0]);                        \
+                half16_t b_reg = *(const half16_t*)(xg + kt * 16);                             \
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);           \
+                a_reg = *(const half16_t*)(&w_lds[kt + 1][ml][0]);                             \
+                b_reg = *(const half16_t*)(xg + (kt + 1) * 16);                                \
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);           \
+            }                                                                                  \
+                                                                                               \
+            __syncthreads();                                                                   \
+        }                                                                                      \
+                                                                                               \
+        /* RDNA3 wave32 WMMA: acc[j] = C[2*j + (lane>>4)][lane & 15]. Overwrite (=). */        \
+        if (out_col < N) {                                                                     \
+            _Pragma("unroll")                                                                  \
+            for (int j = 0; j < 8; j++) {                                                      \
+                const int out_row = row_start + 2 * j + (lane >> 4);                            \
+                if (out_row < total_m) {                                                       \
+                    if (out_row < qkv_m) {                                                     \
+                        Y_qkv[(long long)out_col * qkv_m + out_row] = acc[j];                  \
+                    } else if (out_row < qkv_m + z_m) {                                        \
+                        Y_z[(long long)out_col * z_m + (out_row - qkv_m)] = acc[j];            \
+                    } else if (out_row < qkv_m + z_m + beta_m) {                               \
+                        Y_beta[(long long)out_col * beta_m + (out_row - (qkv_m + z_m))] =      \
+                            acc[j];                                                            \
+                    } else {                                                                   \
+                        Y_alpha[(long long)out_col * alpha_m +                                 \
+                                (out_row - (qkv_m + z_m + beta_m))] = acc[j];                  \
+                    }                                                                          \
+                }                                                                              \
+            }                                                                                  \
+        }                                                                                      \
+    }
+
+// ---------------------------------------------------------------------------
+// QKV overwrite MW — three projection regions (Q / K / V)
+// Grid: [ceil((q_m+k_m+v_m)/16), ceil(N/(16*NW))]. Block: [32*NW].
+// Instantiated for BITS=3 (exact gfx1100 MQ3 lane) only.
+// ---------------------------------------------------------------------------
+#define GEN_QKV_MW_LDS(BITS, NW)                                                               \
+    extern "C" __launch_bounds__(32 * (NW), 1) __global__ void                                 \
+        gemm_qkv_mq##BITS##g256v2_wmma_gfx11_mw##NW##_lds(                                     \
+            const char* __restrict__ A_q,                                                      \
+            const char* __restrict__ A_k,                                                      \
+            const char* __restrict__ A_v,                                                      \
+            const _Float16* __restrict__ X,                                                    \
+            float* __restrict__ Y_q,                                                           \
+            float* __restrict__ Y_k,                                                           \
+            float* __restrict__ Y_v,                                                           \
+            int q_m,                                                                           \
+            int k_m,                                                                           \
+            int v_m,                                                                           \
+            int K,                                                                             \
+            int N) {                                                                           \
+        constexpr int GROUP_BYTES = 8 + 32 * (BITS);                                           \
+        const int tid = threadIdx.x;                                                           \
+        const int lane = tid & 31;                                                             \
+        const int wave_id = tid >> 5;                                                          \
+        const int ml = lane & 15;                                                              \
+        const int total_m = q_m + k_m + v_m;                                                   \
+        const int row_start = blockIdx.x * 16;                                                 \
+        const int n_block_start = blockIdx.y * (16 * (NW));                                    \
+        const int out_col = n_block_start + wave_id * 16 + ml;                                 \
+        const int safe_batch = (out_col < N) ? out_col : 0;                                    \
+        const int groups_per_row = K / 256;                                                    \
+                                                                                               \
+        /* Tile-major [kt][row][ki]: 16*16*16 half = 8192 B / 4096 fp16. */                    \
+        __shared__ __align__(32) _Float16 w_lds[16][16][16];                                   \
+                                                                                               \
+        float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};                       \
+                                                                                               \
+        for (int g = 0; g < groups_per_row; g++) {                                             \
+            /* 128 logical staging jobs: 16 rows × 8 segments. */                              \
+            for (int job = tid; job < 128; job += 32 * (NW)) {                                 \
+                const int row = job / 8;                                                       \
+                const int segment = job % 8;                                                   \
+                const int safe_row =                                                           \
+                    (row_start + row < total_m) ? (row_start + row) : (total_m - 1);            \
+                const char* A;                                                                 \
+                int local_row;                                                                 \
+                if (safe_row < q_m) {                                                          \
+                    A = A_q;                                                                   \
+                    local_row = safe_row;                                                      \
+                } else if (safe_row < q_m + k_m) {                                             \
+                    A = A_k;                                                                   \
+                    local_row = safe_row - q_m;                                                \
+                } else {                                                                       \
+                    A = A_v;                                                                   \
+                    local_row = safe_row - (q_m + k_m);                                        \
+                }                                                                              \
+                const char* gp = A + (long long)local_row * groups_per_row * GROUP_BYTES +      \
+                                 (long long)g * GROUP_BYTES;                                   \
+                /* One relevant dual-half V2 header for this segment's K half. */              \
+                const unsigned int h =                                                         \
+                    *(const unsigned int*)(gp + ((segment < 4) ? 0 : 4));                      \
+                const _Float16 sc_h =                                                          \
+                    (_Float16)__half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu)));    \
+                const _Float16 zp_h =                                                          \
+                    (_Float16)__half2float(__ushort_as_half((unsigned short)(h >> 16)));        \
+                const unsigned char* payload = (const unsigned char*)(gp + 8);                 \
+                const int kt0 = 2 * segment;                                                   \
+                const int kt1 = kt0 + 1;                                                       \
+                half16_t frag = decode_tile<BITS>(payload, kt0, sc_h, zp_h);                   \
+                *(half16_t*)(&w_lds[kt0][row][0]) = frag;                                      \
+                frag = decode_tile<BITS>(payload, kt1, sc_h, zp_h);                            \
+                *(half16_t*)(&w_lds[kt1][row][0]) = frag;                                      \
+            }                                                                                  \
+            /* All threads reach both barriers every group — no early returns. */              \
+            __syncthreads();                                                                   \
+                                                                                               \
+            /* K2 ascending: kt pairs 0,1; 2,3; ... 14,15. One float8 acc / wave. */           \
+            const _Float16* xg = X + (long long)safe_batch * K + (long long)g * 256;           \
+            _Pragma("unroll")                                                                  \
+            for (int kt = 0; kt < 16; kt += 2) {                                               \
+                half16_t a_reg = *(const half16_t*)(&w_lds[kt][ml][0]);                        \
+                half16_t b_reg = *(const half16_t*)(xg + kt * 16);                             \
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);           \
+                a_reg = *(const half16_t*)(&w_lds[kt + 1][ml][0]);                             \
+                b_reg = *(const half16_t*)(xg + (kt + 1) * 16);                                \
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);           \
+            }                                                                                  \
+                                                                                               \
+            __syncthreads();                                                                   \
+        }                                                                                      \
+                                                                                               \
+        /* RDNA3 wave32 WMMA: acc[j] = C[2*j + (lane>>4)][lane & 15]. Overwrite (=). */        \
+        if (out_col < N) {                                                                     \
+            _Pragma("unroll")                                                                  \
+            for (int j = 0; j < 8; j++) {                                                      \
+                const int out_row = row_start + 2 * j + (lane >> 4);                            \
+                if (out_row < total_m) {                                                       \
+                    if (out_row < q_m) {                                                       \
+                        Y_q[(long long)out_col * q_m + out_row] = acc[j];                      \
+                    } else if (out_row < q_m + k_m) {                                          \
+                        Y_k[(long long)out_col * k_m + (out_row - q_m)] = acc[j];              \
+                    } else {                                                                   \
+                        Y_v[(long long)out_col * v_m + (out_row - (q_m + k_m))] = acc[j];      \
+                    }                                                                          \
+                }                                                                              \
+            }                                                                                  \
+        }                                                                                      \
+    }
+
 // Instantiations: BITS ∈ {3,4,5,6} × NW ∈ {4,8} — 16 extern-C symbols.
 GEN_GATE_UP_MW_LDS(3, 4)
 GEN_GATE_UP_MW_LDS(3, 8)
@@ -264,5 +492,11 @@ GEN_RESID_MW_LDS(5, 4)
 GEN_RESID_MW_LDS(5, 8)
 GEN_RESID_MW_LDS(6, 4)
 GEN_RESID_MW_LDS(6, 8)
+
+// MQ3-only projection families (exact gfx1100 weight-reuse lane).
+GEN_QKVZA_MW_LDS(3, 4)
+GEN_QKVZA_MW_LDS(3, 8)
+GEN_QKV_MW_LDS(3, 4)
+GEN_QKV_MW_LDS(3, 8)
 
 #endif // __gfx1100__ || __gfx1151__
