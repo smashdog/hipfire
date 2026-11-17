@@ -65,7 +65,9 @@ use crate::kvmem_prefix::{
 };
 use crate::layerwise_driver::{layerwise_backend, layerwise_capabilities, OutputAcceptanceSnapshot};
 use crate::layerwise_layout::LayerwiseMtpQ8Layout;
-use crate::layerwise_mtp::{auxiliary_removed_tokens, auxiliary_visible_tokens, AuxiliarySelection};
+use crate::layerwise_mtp::{
+    auxiliary_removed_tokens, auxiliary_visible_tokens, AuxiliarySelection, LayerwiseMtpHistory,
+};
 
 /// KVMem blocks are 128 tokens — the engine's page size (`PAGE_TOKENS`).
 pub const KV_BLOCK_TOKENS: usize = 128;
@@ -83,6 +85,16 @@ const DEFAULT_SELECT_INTERVAL: usize = 4;
 /// A huge prefill chunk must fit alongside a working set worth scoring; the
 /// pool grows past `DEFAULT_POOL_BLOCKS_PER_SLOT` instead of starving it.
 const DEFAULT_RESIDENT_FLOOR: usize = 32;
+
+/// P4.1③ A1 starvation guard: UpstreamGlobal head-history selection only engages
+/// when the head budget is at least this many blocks; below it the policy falls
+/// back to FirstLayer (the trunk keep-set). Grounded by the recite benefit sweep
+/// (2026-11-17): at 8 blocks (BUDGET=1024) the global Mean-K reduction dilutes the
+/// draft-critical signal and UG acceptance regresses (0.381 vs FL 0.782, early
+/// EOS); at 16 blocks (BUDGET=2048) UG wins (+16.7%, 5/5). The UG core algorithm
+/// is unchanged when engaged (faithful to ninfer's literal Mean-K/TopK picker);
+/// this is an operational envelope guard, not a selection-semantics change.
+const MTP_HISTORY_UG_MIN_BLOCKS: usize = 16;
 
 /// Host payload capacity for the packed Q8 pages (RAM tier).
 const DEFAULT_HOST_BYTES: u64 = 16 << 30;
@@ -286,6 +298,30 @@ fn resolve_layerwise_policy(
         ));
     }
     Ok(())
+}
+
+/// Resolve `HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY` (P4.1③ H5): `first-layer` |
+/// `upstream-global`. Absent → the ninfer FirstLayer auto-default under
+/// Layerwise+MTP (else Unspecified, carried unread). An unrecognised spelling is
+/// rejected loudly; a resolved policy off the Layerwise+MTP path is rejected by
+/// the core mirror `validate` (no silent fallback). Pure so the resolution
+/// contract is testable without the process-start config snapshot (same rationale
+/// as [`resolve_recall_strategy`]). Legacy / AR-only never read it ⇒ byte-neutral.
+fn resolve_layerwise_mtp_history(
+    raw: Option<String>,
+    strategy: RecallStrategy,
+    mtp_enabled: bool,
+) -> Result<LayerwiseMtpHistory, String> {
+    let parsed = match raw {
+        Some(v) => LayerwiseMtpHistory::parse(v.trim()).map_err(|_| {
+            format!(
+                "kvmem: HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY={v} invalid \
+                 (first-layer|upstream-global)"
+            )
+        })?,
+        None => LayerwiseMtpHistory::Unspecified,
+    };
+    parsed.resolve_default(strategy, mtp_enabled)
 }
 
 /// Ninfer-faithful layerwise activation quotas (design §3.11, ③-E1). Five
@@ -892,6 +928,13 @@ pub struct KvMemCtl {
     /// ordinals) and every head-plane path. False under Legacy / AR-only, so the
     /// default serve keeps the historical `n_fa_layers` record byte-neutral.
     head_plane: bool,
+    /// P4.1③ H5: resolved `HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY` head-history
+    /// policy. FirstLayer (the ninfer auto-default) binds the head aux from the
+    /// trunk's first-layer restored view; UpstreamGlobal runs the global Mean-K
+    /// private-probe selection (`layerwise_probe`). Only meaningful when
+    /// `head_plane`; under Legacy / AR-only it is Unspecified and never read, so
+    /// the default serve stays byte-neutral.
+    layerwise_mtp_history: LayerwiseMtpHistory,
     /// P4.1② G3: the head aux plane's ordinal in the composite host record
     /// (`= n_fa_layers`, the appended LAST ordinal; ninfer
     /// `model = layer_types.size()`, NL:10577). Only meaningful when `head_plane`;
@@ -1093,6 +1136,15 @@ impl KvMemCtl {
         // explicit Err; Legacy is admitted unconditionally (range checks above
         // already ran), so the default serve stays byte-neutral.
         resolve_layerwise_policy(strategy, select_method, lrfu, watermark_enabled, query_span)?;
+
+        // P4.1③ H5: resolve the head-history policy (FirstLayer auto-default under
+        // Layerwise+MTP; UpstreamGlobal opt-in via env). Legacy / AR-only carry
+        // Unspecified unread, so the default serve stays byte-neutral.
+        let layerwise_mtp_history = resolve_layerwise_mtp_history(
+            env_raw("HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY"),
+            strategy,
+            geom.mtp_head,
+        )?;
 
         // Recall execution model. Legacy (the default) keeps the historical
         // whole-working-set path byte-identical. Layerwise enables the per-layer
@@ -1310,6 +1362,7 @@ impl KvMemCtl {
             q_span: vec![0f32; ring_cap],
             q_layer_rows: vec![0u32; if query_span > 1 { n_record_layers } else { 0 }],
             head_plane,
+            layerwise_mtp_history,
             aux_ordinal: geom.n_fa_layers as u32,
             n_record_layers,
             gen_reserve,
@@ -2675,6 +2728,30 @@ impl KvMemCtl {
         self.head_plane
     }
 
+    /// P4.1③ H5: the resolved head-history policy (FirstLayer auto-default under
+    /// Layerwise+MTP; UpstreamGlobal opt-in). The orchestration branches the head
+    /// aux binding on this at the prefill-seed and the decode/verify carrier
+    /// restore-hooks. Unspecified under Legacy / AR-only (never read there).
+    ///
+    /// A1 starvation guard (single source of truth): below
+    /// [`MTP_HISTORY_UG_MIN_BLOCKS`] the global Mean-K reduction dilutes the
+    /// draft-critical signal at tiny head budgets (recite sweep 8-block
+    /// regression 0.381 vs FL 0.782), so an opted-in UpstreamGlobal is reported
+    /// as FirstLayer here. EVERY decision point (prefill-seed aux binding plus
+    /// the AR-decode and MTP-verify carrier restore-hooks in serve_engine) reads
+    /// this accessor, so the fallback is uniform and the UG core algorithm is
+    /// untouched when engaged (≥ floor). ninfer-faithful operational guard, not
+    /// a core-algorithm change.
+    pub fn layerwise_mtp_history(&self) -> LayerwiseMtpHistory {
+        if self.layerwise_mtp_history == LayerwiseMtpHistory::UpstreamGlobal
+            && self.budget_blocks < MTP_HISTORY_UG_MIN_BLOCKS
+        {
+            LayerwiseMtpHistory::FirstLayer
+        } else {
+            self.layerwise_mtp_history
+        }
+    }
+
     /// P4.1② G3: the head aux plane's ordinal in the composite host record
     /// (`= n_fa_layers`, the appended LAST ordinal). The head aux-plane
     /// write-through gathers the head's `k_gpu[0]`/`v_gpu[0]` into this ordinal;
@@ -3534,7 +3611,7 @@ impl KvMemCtl {
 
     pub fn prepare_step(
         &mut self,
-        gpu: &Gpu,
+        gpu: &mut Gpu,
         pool: &mut SlotPool,
         taps: &KvMemTaps,
         active: &[bool],
@@ -3792,12 +3869,81 @@ impl KvMemCtl {
                     .collect();
                 sel.sort_unstable();
                 sel.dedup();
-                let aux = crate::layerwise_mtp::bind_first_layer_auxiliary(
-                    &sel,
-                    frontier,
-                    KV_BLOCK_TOKENS as u64,
-                )
-                .map_err(|e| format!("kvmem head aux seed (slot {s}): {e}"))?;
+                // P4.1③ H4: branch the head-history policy. FirstLayer (the
+                // auto-default) binds the trunk working set's full pages (② G5).
+                // The A1 starvation floor is applied centrally in
+                // `layerwise_mtp_history()` (below-floor UpstreamGlobal reports
+                // FirstLayer), so this site and the serve_engine carrier hooks
+                // fall back uniformly; the UG algorithm is unchanged when engaged.
+                // UpstreamGlobal restores ALL canonical pages when the whole
+                // history fits the budget (ninfer `begin==history_tokens` fast
+                // path, NL:10058), else runs the global Mean-K probe over the
+                // captured prefill Q tap (H2b — no private forward, no rollback).
+                // The probe needs a fresh Q tap (`final_prefill`/`first_decode`
+                // ran `refresh_scores`); an intermediate prefill step with a stale
+                // tap keeps the picked seed, overwritten by the prompt-completing
+                // step's probe before the first draft. Legacy / AR-only never
+                // reach this block (byte-neutral); zero core C++ change.
+                let aux = if self.layerwise_mtp_history() == LayerwiseMtpHistory::UpstreamGlobal
+                {
+                    if full_pages <= self.budget_blocks as u64 {
+                        let all: Vec<u64> = (0..full_pages).collect();
+                        crate::layerwise_mtp::bind_first_layer_auxiliary(
+                            &all,
+                            frontier,
+                            KV_BLOCK_TOKENS as u64,
+                        )
+                        .map_err(|e| format!("kvmem head aux restore-all (slot {s}): {e}"))?
+                    } else if final_prefill || first_decode {
+                        // The probe admits against a FRESH page-aligned sealed
+                        // Mean-K TopK index (the same `layerwise_policy` the trunk
+                        // carrier uses), NOT the slot's shared Legacy `kv` store
+                        // (which tracks all fed tokens and carries retrieval-round
+                        // state — the core rejects it as a probe index). The
+                        // identity frontier is the page-aligned `full_pages*128`
+                        // (== policy.total_tokens); the bind clips to the native
+                        // `frontier` (fed) exactly like the FirstLayer seed.
+                        let probe_frontier = full_pages * KV_BLOCK_TOKENS as u64;
+                        let probe_policy = self
+                            .layerwise_policy(self.slots[s].fed)
+                            .map_err(|e| format!("kvmem head aux probe policy (slot {s}): {e}"))?;
+                        let id = crate::layerwise_probe::probe_identity(
+                            probe_frontier,
+                            s as u64,
+                            self.slots[s].lw_incarnation,
+                            self.slots[s].lw_seq,
+                        );
+                        let q_rows = &self.sums[..self.n_fa_layers * self.q_width];
+                        crate::layerwise_probe::probe_head_history_qrows(
+                            gpu,
+                            q_rows,
+                            &id,
+                            &probe_policy,
+                            &self.slots[s].raw,
+                            self.n_heads as u32,
+                            self.n_kv_heads as u32,
+                            self.head_dim as u32,
+                            0.0, // → 1/sqrt(head_dim), the trunk scorer's default scale
+                            KV_BLOCK_TOKENS as u32,
+                            frontier,
+                        )
+                        .map_err(|e| format!("kvmem head aux probe (slot {s}): {e}"))?
+                    } else {
+                        crate::layerwise_mtp::bind_first_layer_auxiliary(
+                            &sel,
+                            frontier,
+                            KV_BLOCK_TOKENS as u64,
+                        )
+                        .map_err(|e| format!("kvmem head aux seed (slot {s}): {e}"))?
+                    }
+                } else {
+                    crate::layerwise_mtp::bind_first_layer_auxiliary(
+                        &sel,
+                        frontier,
+                        KV_BLOCK_TOKENS as u64,
+                    )
+                    .map_err(|e| format!("kvmem head aux seed (slot {s}): {e}"))?
+                };
                 self.set_aux_selection(s, aux);
             }
         }
@@ -4482,6 +4628,101 @@ mod tests {
 
     /// Host-only: the strategy parser/resolver mirror the core ordinals and
     /// reject unknown spellings loudly, and the write-through staging is
+    /// P4.1③ H5: the head-history policy resolution contract (pure, env-snapshot
+    /// independent). FirstLayer auto-default under Layerwise+MTP; UpstreamGlobal
+    /// opt-in; invalid spelling rejected; a resolved policy off the Layerwise+MTP
+    /// path rejected (no silent fallback). Legacy / AR-only carry Unspecified.
+    #[test]
+    fn layerwise_mtp_history_resolution() {
+        use crate::layerwise_mtp::LayerwiseMtpHistory::{FirstLayer, Unspecified, UpstreamGlobal};
+        // Absent → FirstLayer auto-default under Layerwise+MTP.
+        assert_eq!(
+            resolve_layerwise_mtp_history(None, RecallStrategy::Layerwise, true).unwrap(),
+            FirstLayer
+        );
+        // Explicit opt-in + trimming.
+        assert_eq!(
+            resolve_layerwise_mtp_history(
+                Some("upstream-global".into()),
+                RecallStrategy::Layerwise,
+                true
+            )
+            .unwrap(),
+            UpstreamGlobal
+        );
+        assert_eq!(
+            resolve_layerwise_mtp_history(
+                Some("  first-layer  ".into()),
+                RecallStrategy::Layerwise,
+                true
+            )
+            .unwrap(),
+            FirstLayer
+        );
+        // Invalid spelling rejected loudly.
+        assert!(resolve_layerwise_mtp_history(
+            Some("bogus".into()),
+            RecallStrategy::Layerwise,
+            true
+        )
+        .is_err());
+        // A resolved policy requires Layerwise + MTP (no silent fallback).
+        assert!(resolve_layerwise_mtp_history(
+            Some("upstream-global".into()),
+            RecallStrategy::Legacy,
+            true
+        )
+        .is_err());
+        assert!(resolve_layerwise_mtp_history(
+            Some("first-layer".into()),
+            RecallStrategy::Layerwise,
+            false
+        )
+        .is_err());
+        // Legacy / AR-only carry Unspecified unread (byte-neutral).
+        assert_eq!(
+            resolve_layerwise_mtp_history(None, RecallStrategy::Legacy, false).unwrap(),
+            Unspecified
+        );
+        assert_eq!(
+            resolve_layerwise_mtp_history(None, RecallStrategy::Legacy, true).unwrap(),
+            Unspecified
+        );
+    }
+
+    /// A1 starvation floor (single source of truth): the `layerwise_mtp_history()`
+    /// accessor reports FirstLayer for an opted-in UpstreamGlobal whenever
+    /// `budget_blocks < MTP_HISTORY_UG_MIN_BLOCKS`, so EVERY decision point
+    /// (prefill-seed aux binding + the serve_engine AR-decode / MTP-verify carrier
+    /// restore-hooks) falls back uniformly. At/above the floor UG is reported
+    /// unchanged; FirstLayer / Unspecified are never altered. Host-only.
+    #[test]
+    fn layerwise_mtp_history_starvation_floor() {
+        use crate::layerwise_mtp::LayerwiseMtpHistory::{FirstLayer, Unspecified, UpstreamGlobal};
+        std::env::set_var("HIPFIRE_KVMEM_HOST_BYTES", "16777216");
+        let mut ctl =
+            KvMemCtl::new_with_strategy(1, &plan(), &geom_mtp(), RecallStrategy::Layerwise)
+                .expect("layerwise mtp ctl");
+        // plan() budget_blocks=4 (< floor). Opted-in UG reports FirstLayer.
+        ctl.layerwise_mtp_history = UpstreamGlobal;
+        assert!(ctl.budget_blocks < MTP_HISTORY_UG_MIN_BLOCKS);
+        assert_eq!(ctl.layerwise_mtp_history(), FirstLayer, "below-floor UG falls back");
+        // Exactly at the floor UG engages (>= guard).
+        ctl.budget_blocks = MTP_HISTORY_UG_MIN_BLOCKS;
+        assert_eq!(ctl.layerwise_mtp_history(), UpstreamGlobal, "at-floor UG engages");
+        // Above the floor UG engages.
+        ctl.budget_blocks = MTP_HISTORY_UG_MIN_BLOCKS + 8;
+        assert_eq!(ctl.layerwise_mtp_history(), UpstreamGlobal, "above-floor UG engages");
+        // One below the floor falls back again.
+        ctl.budget_blocks = MTP_HISTORY_UG_MIN_BLOCKS - 1;
+        assert_eq!(ctl.layerwise_mtp_history(), FirstLayer, "one-below-floor falls back");
+        // FirstLayer / Unspecified are never altered by the floor.
+        ctl.layerwise_mtp_history = FirstLayer;
+        assert_eq!(ctl.layerwise_mtp_history(), FirstLayer);
+        ctl.layerwise_mtp_history = Unspecified;
+        assert_eq!(ctl.layerwise_mtp_history(), Unspecified);
+    }
+
     /// allocated ONLY under Layerwise (Legacy stays byte-neutral — no extra
     /// host buffer, no arena touch). The strategy is INJECTED, not `set_var`d:
     /// the process config is a start-time snapshot, so a runtime env write after

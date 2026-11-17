@@ -537,6 +537,11 @@ struct HkLayerwiseRequest {
 }
 
 #[repr(C)]
+struct HkProbeSelection {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
 struct HkSpill {
     _private: [u8; 0],
 }
@@ -1589,6 +1594,57 @@ mod ffi {
             scorer_user: *mut c_void,
         ) -> c_int;
 
+        // ── layerwise MTP private-probe selection (host-only, additive) ──
+        pub fn hk_probe_metadata_bound(
+            policy: *const HkKvStore,
+            target_layers: u32,
+            out: *mut u64,
+        ) -> c_int;
+        pub fn hk_probe_create(
+            identity: *const LayerwiseIdentity,
+            policy: *const HkKvStore,
+            keys: *const HkRawStore,
+            targets: *const LayerQueryGeometry,
+            n_targets: usize,
+            revision: Option<unsafe extern "C" fn(*mut c_void) -> MemoryStamp>,
+            revision_user: *mut c_void,
+            metadata: *mut HkStorage,
+            mandatory: *const u32,
+            mandatory_count: usize,
+        ) -> *mut HkProbeSelection;
+        pub fn hk_probe_destroy(p: *mut HkProbeSelection);
+        pub fn hk_probe_abort(p: *mut HkProbeSelection);
+        pub fn hk_probe_phase(p: *const HkProbeSelection) -> u32;
+        pub fn hk_probe_scored_rows(p: *const HkProbeSelection) -> u64;
+        pub fn hk_probe_next_layer(p: *const HkProbeSelection) -> u32;
+        pub fn hk_probe_metadata_bytes(p: *const HkProbeSelection) -> u64;
+        pub fn hk_probe_append_native(
+            p: *mut HkProbeSelection,
+            id: *const LayerwiseIdentity,
+            begin: u64,
+            q: *const NativeCurrentLayerQuery,
+            scorer: Option<
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    *const HkRawStore,
+                    *const NativeCurrentLayerQuery,
+                    *const HkQueryScoreFrame,
+                    *mut f64,
+                    usize,
+                ) -> c_int,
+            >,
+            scorer_user: *mut c_void,
+        ) -> c_int;
+        pub fn hk_probe_finish(p: *mut HkProbeSelection, id: *const LayerwiseIdentity) -> c_int;
+        pub fn hk_probe_selected_count(p: *const HkProbeSelection) -> usize;
+        pub fn hk_probe_selected(p: *const HkProbeSelection, i: usize) -> u32;
+        pub fn hk_probe_fixed_count(p: *const HkProbeSelection) -> usize;
+        pub fn hk_probe_fixed(p: *const HkProbeSelection, i: usize) -> u32;
+        pub fn hk_probe_score_count(p: *const HkProbeSelection) -> usize;
+        pub fn hk_probe_score(p: *const HkProbeSelection, i: usize, out: *mut f64) -> c_int;
+        pub fn hk_probe_historical_tokens(p: *const HkProbeSelection) -> u64;
+        pub fn hk_probe_charged_tokens(p: *const HkProbeSelection) -> u64;
+
         // ── layerwise activation accounts + projected-Q history tape ──
         pub fn hk_spill_create(directory: *const c_char, capacity_bytes: u64) -> *mut HkSpill;
         pub fn hk_spill_destroy(s: *mut HkSpill);
@@ -2540,7 +2596,6 @@ impl Drop for RawStore {
         unsafe { ffi::hk_raw_store_destroy(self.ptr.as_ptr()) };
     }
 }
-
 
 /// Block repository + working-set selection for one engine sequence.
 pub struct KvStore {
@@ -5092,4 +5147,178 @@ pub fn plan_content_group_publication(
     let reason = PublicationReason::from_ordinal(reason)
         .ok_or_else(|| KvMemError(format!("unknown publication reason {reason}")))?;
     Ok((slot, reason, retired))
+}
+
+/// Mirrors `kvmem::LayerwiseSelectionPhase` ordinals (the private-probe phase).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ProbePhase {
+    Collecting = 0,
+    Complete = 1,
+    Aborted = 2,
+}
+
+impl ProbePhase {
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            0 => Self::Collecting,
+            1 => Self::Complete,
+            _ => Self::Aborted,
+        }
+    }
+}
+
+/// The pinned upstream private-probe global Mean-K reduction for the MTP head
+/// history (UpstreamGlobal policy), mirroring `kvmem::LayerwiseProbeSelection`.
+///
+/// Scoring/selection ONLY: the hipfire driver owns the private target-layer-major
+/// forward, the exact source/rollback envelope and the GPU scorer. Each
+/// [`Self::append_native`] supplies the private TARGET forward's normalized
+/// pre-RoPE Q; the core averages the target layers (one global reduction, NOT the
+/// real fresh forward) and [`Self::finish`] picks the head history. The
+/// `policy`/`keys`/`metadata` handles are borrowed and must outlive the selection;
+/// the frozen result keeps its metadata charged until both the accumulator and
+/// the result retire (Drop). Neither `Send` nor `Sync` (the serve loop serializes
+/// the C ABI). ZERO core C++ change.
+pub struct ProbeSelection {
+    ptr: NonNull<HkProbeSelection>,
+    // Ownership anchor for the C SourceRevision trampoline's user pointer; freed
+    // only after the C++ accumulator is destroyed (see Drop).
+    #[allow(dead_code)]
+    revision: Box<RevisionState>,
+}
+
+impl ProbeSelection {
+    /// Conservative metadata bound (bytes) to reserve against an independent
+    /// FINITE metadata account BEFORE [`Self::new`].
+    pub fn metadata_bound(policy: &KvStore, target_layers: u32) -> Result<u64> {
+        let mut out = 0u64;
+        checked(|| unsafe {
+            ffi::hk_probe_metadata_bound(policy.ptr.as_ptr(), target_layers, &mut out);
+        })?;
+        Ok(out)
+    }
+
+    /// Admit a private-probe selection. `targets` are the private forward's target
+    /// FA layers in token-major scoring order; `metadata` is the finite account
+    /// reserved via [`Self::metadata_bound`]; `revision` proves the frozen index
+    /// stamp at each native boundary; `mandatory` are pinned canonical ordinals.
+    pub fn new(
+        identity: &LayerwiseIdentity,
+        policy: &KvStore,
+        keys: &RawStore,
+        targets: &[LayerQueryGeometry],
+        revision: impl FnMut() -> MemoryStamp + 'static,
+        metadata: &Storage,
+        mandatory: &[u32],
+    ) -> Result<Self> {
+        let mut state = Box::new(RevisionState { f: Box::new(revision) });
+        let user = &mut *state as *mut RevisionState as *mut c_void;
+        clear_error();
+        let ptr = unsafe {
+            ffi::hk_probe_create(
+                identity,
+                policy.ptr.as_ptr(),
+                keys.ptr.as_ptr(),
+                targets.as_ptr(),
+                targets.len(),
+                Some(revision_trampoline),
+                user,
+                metadata.ptr.as_ptr(),
+                mandatory.as_ptr(),
+                mandatory.len(),
+            )
+        };
+        NonNull::new(ptr)
+            .map(|ptr| Self { ptr, revision: state })
+            .ok_or_else(err_from_last)
+    }
+
+    /// Abort the probe (idempotent); moves the phase to `Aborted`.
+    pub fn abort(&self) {
+        unsafe { ffi::hk_probe_abort(self.ptr.as_ptr()) };
+    }
+    pub fn phase(&self) -> ProbePhase {
+        ProbePhase::from_u32(unsafe { ffi::hk_probe_phase(self.ptr.as_ptr()) })
+    }
+    pub fn scored_rows(&self) -> u64 {
+        unsafe { ffi::hk_probe_scored_rows(self.ptr.as_ptr()) }
+    }
+    pub fn next_layer(&self) -> u32 {
+        unsafe { ffi::hk_probe_next_layer(self.ptr.as_ptr()) }
+    }
+    pub fn metadata_bytes(&self) -> u64 {
+        unsafe { ffi::hk_probe_metadata_bytes(self.ptr.as_ptr()) }
+    }
+
+    /// Token-major: for each Query tile `[begin,begin+rows)` append every target
+    /// layer in geometry order, letting the owner's `scorer` compute per-block
+    /// page mass against the frozen frame. Same native scorer contract as
+    /// [`LayerwiseRequest::projected_native`]: complete the native stream before
+    /// returning and write exactly `frame.starts.len()` non-negative scores.
+    pub fn append_native<F>(
+        &self,
+        id: &LayerwiseIdentity,
+        begin: u64,
+        query: &NativeCurrentLayerQuery,
+        mut scorer: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&NativeCurrentLayerQuery, &QueryScoreFrame<'_>) -> Result<Vec<f64>>,
+    {
+        let p = self.ptr.as_ptr();
+        let user = &mut scorer as *mut F as *mut c_void;
+        checked(|| unsafe {
+            ffi::hk_probe_append_native(p, id, begin, query, Some(scorer_trampoline::<F>), user);
+        })
+    }
+
+    /// Requires every Query target covered; picks the head history (phase
+    /// `Complete`). The frozen result is then readable via the accessors below.
+    pub fn finish(&self, id: &LayerwiseIdentity) -> Result<()> {
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe { ffi::hk_probe_finish(p, id); })
+    }
+
+    // ── frozen result (available only after a successful finish) ──
+    pub fn selected_count(&self) -> usize {
+        unsafe { ffi::hk_probe_selected_count(self.ptr.as_ptr()) }
+    }
+    pub fn selected(&self, i: usize) -> u32 {
+        unsafe { ffi::hk_probe_selected(self.ptr.as_ptr(), i) }
+    }
+    /// The selected canonical head-history block IDs (chronological pick order).
+    pub fn selected_ids(&self) -> Vec<u32> {
+        (0..self.selected_count()).map(|i| self.selected(i)).collect()
+    }
+    pub fn fixed_count(&self) -> usize {
+        unsafe { ffi::hk_probe_fixed_count(self.ptr.as_ptr()) }
+    }
+    pub fn fixed(&self, i: usize) -> u32 {
+        unsafe { ffi::hk_probe_fixed(self.ptr.as_ptr(), i) }
+    }
+    pub fn score_count(&self) -> usize {
+        unsafe { ffi::hk_probe_score_count(self.ptr.as_ptr()) }
+    }
+    pub fn score(&self, i: usize) -> Result<f64> {
+        let mut out = 0f64;
+        let p = self.ptr.as_ptr();
+        checked(|| unsafe { ffi::hk_probe_score(p, i, &mut out); })?;
+        Ok(out)
+    }
+    pub fn historical_tokens(&self) -> u64 {
+        unsafe { ffi::hk_probe_historical_tokens(self.ptr.as_ptr()) }
+    }
+    pub fn charged_tokens(&self) -> u64 {
+        unsafe { ffi::hk_probe_charged_tokens(self.ptr.as_ptr()) }
+    }
+}
+
+impl Drop for ProbeSelection {
+    fn drop(&mut self) {
+        // Destroy the C++ accumulator first (its SourceRevision lambda can no
+        // longer call the trampoline); the result's metadata lease retires here
+        // too; `self.revision` is freed afterwards.
+        unsafe { ffi::hk_probe_destroy(self.ptr.as_ptr()) };
+    }
 }

@@ -87,7 +87,9 @@ fn page_scalar(scalar: u32) -> Result<PageQueryScalar, KvMemError> {
 /// model-layer ↔ ordinal mapping). Called synchronously by
 /// [`hipfire_kvmem::LayerwiseRequest::projected_native`]'s trampoline, which drops
 /// the borrowed `keys` pointer — so the driver captures its own `&RawStore`.
-fn score_current_layer_native(
+/// Also reused by the P4.1③ UpstreamGlobal private-probe accumulator
+/// ([`crate::layerwise_probe::probe_head_history`]) over the captured Q tapes.
+pub(crate) fn score_current_layer_native(
     gpu: &mut Gpu,
     keys: &RawStore,
     il: u32,
