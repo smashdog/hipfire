@@ -1465,6 +1465,16 @@ impl<'a> JinjaChatFrame<'a> {
             messages => messages_val,
             add_generation_prompt => true,
             enable_thinking => self.enable_thinking,
+            // The generation prompt opens the assistant turn with an empty
+            // `<think>\n\n</think>\n\n` block when thinking is off. Templates
+            // that take `preserve_thinking is defined and is true` (Bonsai's
+            // upstream qwen35 template) otherwise drop that block from
+            // historical assistant turns, so the next turn's render is not a
+            // byte/token prefix of what the model actually saw — which makes
+            // native KV/history reuse impossible (KVMem requires the complete
+            // accepted prefix). Templates that treat `undefined` as true
+            // (Qwen's) render identically with this set.
+            preserve_thinking => true,
             bos_token => bos_token,
             eos_token => eos_token,
             reasoning_strength => reasoning_strength_val,
@@ -4863,6 +4873,43 @@ SYS:{{ build_system_message(system_message) }}:END
             );
         }
         assert_eq!(t.decode(&rendered).matches("<tool_call>").count(), 1);
+    }
+
+    /// Bonsai/qwen35 upstream shape: the generation prompt opens the assistant
+    /// turn with an empty `</think>` block when thinking is off, and historical
+    /// assistant turns keep that block only under `preserve_thinking is true`.
+    /// The renderer must therefore supply `preserve_thinking => true`; without
+    /// it the next turn's render is not a token prefix of what the model saw
+    /// and KVMem cannot prove the accepted prefix for a native restore.
+    #[test]
+    fn history_render_preserves_non_thinking_turn_prefix() {
+        const TPL: &str = "{% for m in messages %}<|im_start|>{{ m.role }}\\n{% if m.role == 'assistant' %}{% if preserve_thinking is defined and preserve_thinking is true %}<think>\\n\\n</think>\\n\\n{% endif %}{% endif %}{{ m.content }}<|im_end|>\\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\\n{% if enable_thinking is defined and enable_thinking is false %}<think>\\n\\n</think>\\n\\n{% else %}<think>\\n{% endif %}{% endif %}";
+        let t = make_tokenizer();
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template: TPL,
+            system: None,
+            user: "",
+            enable_thinking: false,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let first = vec![qmsg(Role::User, "hello", None)];
+        let turn1 = frame.render_messages(&first, None, None).unwrap();
+        assert!(
+            turn1.ends_with("<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n"),
+            "thinking-off generation prompt closes an empty think block: {turn1:?}"
+        );
+        let mut consumed = t.encode(&turn1);
+        consumed.extend(t.encode("OK"));
+        let history = vec![
+            qmsg(Role::User, "hello", None),
+            qmsg(Role::Assistant, "OK", None),
+            qmsg(Role::User, "next", None),
+        ];
+        let turn2 = t.encode(&frame.render_messages(&history, None, None).unwrap());
+        assert_strict_extension(&turn2, &consumed, "preserve_thinking history");
     }
 
     #[test]
