@@ -11993,6 +11993,7 @@ impl Carrier for Qwen35Carrier {
     ) -> Result<Box<dyn hipfire_runtime::serve::SlotEngineHandle>, String> {
         use hipfire_arch_qwen35::serve_engine::{EngineConfig, SlotEngine};
         let engine = SlotEngine::spawn(EngineConfig {
+            kvmem: cfg.kvmem.clone(),
             model_path: cfg.model_path,
             n_slots: cfg.n_slots,
             cap_tokens: cfg.cap_tokens,
@@ -14618,6 +14619,9 @@ impl Carrier for Qwen35EmbedCarrier {
         cfg: hipfire_runtime::serve::SlotEngineConfig,
     ) -> Result<Box<dyn hipfire_runtime::serve::SlotEngineHandle>, String> {
         use hipfire_arch_qwen35_embed::slot_engine::{EmbedEngineConfig, EmbedSlotEngine};
+        if cfg.kvmem.as_ref().is_some_and(|config| config.enabled) {
+            return Err("UNSUPPORTED: Qwen embedding slots have no KVMem KV-history consumer".into());
+        }
         let engine = EmbedSlotEngine::spawn(EmbedEngineConfig::from_slot_config(&cfg))
             .map_err(|e| format!("EmbedSlotEngine spawn: {e}"))?;
         Ok(Box::new(engine))
@@ -14705,6 +14709,9 @@ impl Carrier for EmbeddingGemma2Carrier {
         cfg: hipfire_runtime::serve::SlotEngineConfig,
     ) -> Result<Box<dyn hipfire_runtime::serve::SlotEngineHandle>, String> {
         use hipfire_arch_embeddinggemma2::slot_engine::{EmbedEngineConfig, EmbedSlotEngine};
+        if cfg.kvmem.as_ref().is_some_and(|config| config.enabled) {
+            return Err("UNSUPPORTED: embeddinggemma2 slots have no KVMem KV-history consumer".into());
+        }
         let engine = EmbedSlotEngine::spawn(EmbedEngineConfig::from_slot_config(&cfg))
             .map_err(|e| format!("EmbedSlotEngine spawn: {e}"))?;
         Ok(Box::new(engine))

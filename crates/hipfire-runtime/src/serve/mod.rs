@@ -451,9 +451,9 @@ impl EngineStats {
 // single arch-erased surface `handle_generate` drives; the concrete engine
 // (e.g. `hipfire_arch_qwen35::serve_engine::SlotEngine`) implements it.
 //
-// `SlotEngineConfig` is the family-neutral spawn record — every field is a
-// primitive/`PathBuf`/`String`/`Option`, so a carrier can map it onto its
-// own engine config without seeing arch types. It mirrors
+// `SlotEngineConfig` is the family-neutral spawn record — fields are
+// primitives or shared hipfire-config types, never architecture types, so a
+// carrier can map it onto its own engine config. It mirrors
 // `hipfire_arch_qwen35::serve_engine::EngineConfig` field-for-field; keep
 // them in lock-step (the qwen35 carrier maps them 1:1).
 
@@ -461,9 +461,12 @@ impl EngineStats {
 /// the daemon from serve.* config keys + the load request, then handed to
 /// `Carrier::spawn_slot_engine`, which adapts it into the concrete engine's
 /// own config. Field-for-field with the qwen35 `EngineConfig`; a second
-/// engine family may ignore fields it does not implement.
+/// engine family must refuse enabled KVMem if it has no consumer.
 #[derive(Debug, Clone)]
 pub struct SlotEngineConfig {
+    /// Strict Legacy policy from the process-start envelope. Native consumers
+    /// must not reparse these fields from env. None preserves env-only Layerwise.
+    pub kvmem: Option<hipfire_config::kvmem::ResolvedConfig>,
     pub model_path: PathBuf,
     pub n_slots: usize,
     /// Per-slot generation cap (tokens) used by the paged-KV budget.

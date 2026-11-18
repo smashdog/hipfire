@@ -239,14 +239,40 @@ impl Scheduler {
         eligible: &[bool],
         hold_tail: &[bool],
     ) -> SlotBatch {
+        self.next_batch_eligible_capped(
+            work, remaining_rows, prefill_min_tokens, eligible, hold_tail, &[],
+        )
+    }
+
+    /// Apply an executor-proven prefill limit before consuming prompt rows.
+    /// Legacy Query capture uses this to stop exactly at its native recovery
+    /// point; truncating an already-produced batch would lose token provenance.
+    /// Empty caps preserve the existing scheduler, and decode rows are untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn next_batch_eligible_capped(
+        &mut self,
+        work: &mut [PendingWork],
+        remaining_rows: usize,
+        prefill_min_tokens: usize,
+        eligible: &[bool],
+        hold_tail: &[bool],
+        prefill_caps: &[usize],
+    ) -> SlotBatch {
         let n = work.len();
-        let plan = self.allocate_rows_hold(
+        let mut plan = self.allocate_rows_hold(
             work,
             remaining_rows,
             prefill_min_tokens,
             eligible,
             hold_tail,
         );
+        for (slot, allocation) in plan.alloc.iter_mut().enumerate() {
+            if !work[slot].decoding {
+                if let Some(cap) = prefill_caps.get(slot) {
+                    *allocation = (*allocation).min(*cap);
+                }
+            }
+        }
         if let Some(c) = plan.next_prefill_cursor {
             self.prefill_cursor = c;
         }
@@ -504,6 +530,38 @@ mod tests {
 
     fn prompt(n: usize) -> Vec<u32> {
         (0..n as u32).collect()
+    }
+
+    #[test]
+    fn executor_prefill_cap_stops_before_recovery_point_without_losing_rows() {
+        let mut scheduler = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut work = vec![work_prefill(0, 600, 100)];
+        let batch = scheduler.next_batch_eligible_capped(
+            &mut work, 256, 128, &[true], &[], &[28],
+        );
+        assert_eq!(batch.m_per_slot, vec![28]);
+        assert_eq!(batch.positions, (100..128).collect::<Vec<_>>());
+        assert_eq!(work[0].next_pos, 128);
+        assert_eq!(work[0].remaining_prompt, (28..600).collect::<Vec<_>>());
+        let next = scheduler.next_batch_eligible_capped(
+            &mut work, 256, 128, &[true], &[], &[256],
+        );
+        assert_eq!(next.tokens.first(), Some(&28));
+        assert_eq!(next.positions.first(), Some(&128));
+    }
+
+    #[test]
+    fn executor_prefill_cap_does_not_limit_decode_or_consume_held_prefill() {
+        let mut scheduler = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut work = vec![work_prefill(0, 300, 0), work_decode(1, 99, 42)];
+        let batch = scheduler.next_batch_eligible_capped(
+            &mut work, 256, 128, &[true, true], &[], &[0, 0],
+        );
+        assert_eq!(batch.m_per_slot, vec![0, 1]);
+        assert_eq!(batch.tokens, vec![99]);
+        assert_eq!(work[0].remaining_prompt.len(), 300);
+        assert_eq!(work[0].next_pos, 0);
+        assert_eq!(work[1].next_pos, 43);
     }
 
     #[test]

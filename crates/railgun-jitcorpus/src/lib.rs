@@ -394,6 +394,7 @@ fn product_config() -> ProcessConfig {
     ProcessConfig {
         schema_version: CONFIG_SCHEMA_VERSION,
         values: ConfigLayer::default(),
+        kvmem: None,
     }
 }
 

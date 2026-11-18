@@ -1230,6 +1230,28 @@ impl MtpSpecState {
         Ok(())
     }
 
+    /// Invalidate recordings before installing a native host image. This does
+    /// not reset KV or request sampling state. The image owner validates all
+    /// payloads first and publishes `prev_hidden_pos` only after every upload
+    /// succeeds. Graph failure latches/counters remain lifetime diagnostics.
+    pub fn invalidate_native_image_graphs(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        if gpu.graphs.capture_mode || gpu.replay.is_recording() {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MTP native image restore during recording",
+            ));
+        }
+        gpu.bind_thread()?;
+        // Includes the optional trunk-snapshot side stream.
+        gpu.hip.device_synchronize()?;
+        destroy_mtp_proposal_graph(gpu, self);
+        destroy_mtp_verify_graph(gpu, self);
+        self.mtp_proposal_graph_warmed = false;
+        self.mtp_verify_graph_mode = "direct";
+        self.prev_hidden_pos = None;
+        Ok(())
+    }
+
     pub fn free_gpu(self, gpu: &mut Gpu) {
         gpu.bind_thread_or_warn();
         // Drain launches and destroy their nodes before releasing captured buffers.

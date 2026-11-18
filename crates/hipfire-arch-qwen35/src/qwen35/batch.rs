@@ -721,6 +721,10 @@ impl PrefillBatchScratch {
             }
         }
         if let Some(taps) = self.kvmem_taps {
+            if let Some(capture) = taps.query_capture {
+                note(gpu.free_tensor(capture.values));
+                note(gpu.free_tensor(capture.source_rows));
+            }
             note(gpu.free_tensor(taps.q_tap));
             note(gpu.free_tensor(taps.k_tap));
         }

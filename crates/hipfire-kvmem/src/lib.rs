@@ -158,6 +158,19 @@ struct HkKvStore {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+struct HkRetrievalCheckpoint {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct HkLegacyReplayPlan {
+    begin: u64,
+    end: u64,
+    admitted: c_int,
+    reason: *const c_char,
+}
+
 // ── layerwise native payload foundation: C struct mirrors + opaque handles ──
 
 /// `hk_session_identity` — mirrors `kvmem::SessionIdentity`.
@@ -1216,6 +1229,72 @@ mod ffi {
         pub fn hk_kv_store_set_retrieval_scores(ks: *mut HkKvStore, scores: *const f64, n: u32);
         pub fn hk_kv_store_begin_retrieval_round(ks: *mut HkKvStore);
         pub fn hk_kv_store_commit_retrieval_round(ks: *mut HkKvStore) -> c_int;
+        pub fn hk_kv_store_retrieval_checkpoint(ks: *const HkKvStore) -> *mut HkRetrievalCheckpoint;
+        pub fn hk_retrieval_checkpoint_clone(
+            checkpoint: *const HkRetrievalCheckpoint,
+        ) -> *mut HkRetrievalCheckpoint;
+        pub fn hk_retrieval_checkpoint_destroy(checkpoint: *mut HkRetrievalCheckpoint);
+        pub fn hk_kv_store_restore_retrieval(
+            ks: *mut HkKvStore,
+            checkpoint: *const HkRetrievalCheckpoint,
+        ) -> c_int;
+        pub fn hk_retrieval_checkpoint_meta(
+            checkpoint: *const HkRetrievalCheckpoint,
+            round: *mut u64,
+            committed: *mut c_int,
+        ) -> c_int;
+        pub fn hk_retrieval_checkpoint_scores(
+            checkpoint: *const HkRetrievalCheckpoint,
+            out: *mut f64,
+            capacity: usize,
+            out_count: *mut usize,
+        ) -> c_int;
+        pub fn hk_kv_store_selection_score(
+            ks: *const HkKvStore,
+            block: u32,
+            out: *mut f64,
+        ) -> c_int;
+        pub fn hk_pressure_selection(
+            candidates: *const u32,
+            n_candidates: usize,
+            scores: *const f64,
+            n_scores: usize,
+            mandatory: *const u32,
+            n_mandatory: usize,
+            budget_blocks: u32,
+            out: *mut u32,
+            capacity: usize,
+            out_count: *mut usize,
+        ) -> c_int;
+        pub fn hk_bounded_query(
+            begin: u64,
+            count: u64,
+            total: u64,
+            limit: u32,
+            out: *mut QueryRange,
+        ) -> c_int;
+        pub fn hk_query_replay_plan(
+            query: QueryRange,
+            restore_begin: u64,
+            end: u64,
+            limit: u32,
+            block: u32,
+            history_pages: u64,
+            device_pages: u64,
+            workspace: u32,
+            out: *mut HkLegacyReplayPlan,
+        ) -> c_int;
+        pub fn hk_query_prefix_required(
+            prefix: u64,
+            block: u32,
+            sink: u32,
+            recent: u32,
+            media: *const u32,
+            n_media: usize,
+            out: *mut u32,
+            capacity: usize,
+            out_count: *mut usize,
+        ) -> c_int;
         pub fn hk_kv_store_prefill_needs_offload(
             ks: *const HkKvStore,
             resident_tokens: u32,
@@ -2684,6 +2763,35 @@ impl KvStore {
         Ok(committed)
     }
 
+    /// Snapshot the core's committed LRFU history, not the current preview or
+    /// non-LRFU block scores. The owned snapshot can outlive this store.
+    pub fn retrieval_checkpoint(&self) -> Result<RetrievalCheckpoint> {
+        clear_error();
+        let ptr = unsafe { ffi::hk_kv_store_retrieval_checkpoint(self.ptr.as_ptr()) };
+        NonNull::new(ptr)
+            .map(|ptr| RetrievalCheckpoint { ptr })
+            .ok_or_else(err_from_last)
+    }
+
+    /// Restore LRFU history and discard any preview. Borrows (never consumes)
+    /// the checkpoint; restoring it repeatedly does not reward the round again.
+    /// Native history/frontier compatibility remains the caller's responsibility.
+    pub fn restore_retrieval(&self, checkpoint: &RetrievalCheckpoint) -> Result<()> {
+        legacy_status(unsafe {
+            ffi::hk_kv_store_restore_retrieval(self.ptr.as_ptr(), checkpoint.ptr.as_ptr())
+        })
+    }
+
+    /// Current selection score (LRFU preview if present, otherwise committed
+    /// LRFU, or the block score when LRFU is off). Rejects block >= block_count.
+    pub fn selection_score(&self, block: u32) -> Result<f64> {
+        let mut out = 0.0;
+        legacy_status(unsafe {
+            ffi::hk_kv_store_selection_score(self.ptr.as_ptr(), block, &mut out)
+        })?;
+        Ok(out)
+    }
+
     pub fn prefill_needs_offload(
         &self,
         resident_tokens: u32,
@@ -2717,6 +2825,205 @@ impl Drop for KvStore {
     fn drop(&mut self) {
         unsafe { ffi::hk_kv_store_destroy(self.ptr.as_ptr()) };
     }
+}
+
+/// Owned immutable core `LrfuState`. Like the other opaque handles this is
+/// deliberately neither Send nor Sync. Copies share immutable scores, while
+/// later store commits/restore calls cannot change this checkpoint.
+#[derive(Debug)]
+pub struct RetrievalCheckpoint {
+    ptr: NonNull<HkRetrievalCheckpoint>,
+}
+
+impl RetrievalCheckpoint {
+    /// Fallible C++ snapshot copy; does not rebuild history from its scores.
+    pub fn try_clone(&self) -> Result<Self> {
+        clear_error();
+        let ptr = unsafe { ffi::hk_retrieval_checkpoint_clone(self.ptr.as_ptr()) };
+        NonNull::new(ptr)
+            .map(|ptr| Self { ptr })
+            .ok_or_else(err_from_last)
+    }
+
+    fn meta(&self) -> Result<(u64, bool)> {
+        let mut round = 0;
+        let mut committed = 0;
+        legacy_status(unsafe {
+            ffi::hk_retrieval_checkpoint_meta(self.ptr.as_ptr(), &mut round, &mut committed)
+        })?;
+        Ok((round, committed != 0))
+    }
+
+    pub fn round(&self) -> Result<u64> {
+        Ok(self.meta()?.0)
+    }
+
+    pub fn committed(&self) -> Result<bool> {
+        Ok(self.meta()?.1)
+    }
+
+    /// Exact committed scores, copied into caller-owned Rust storage. An open
+    /// round's uncommitted preview is intentionally absent from the snapshot.
+    pub fn scores(&self) -> Result<Vec<f64>> {
+        legacy_vec(|out, capacity, count| unsafe {
+            ffi::hk_retrieval_checkpoint_scores(self.ptr.as_ptr(), out, capacity, count)
+        })
+    }
+}
+
+impl Drop for RetrievalCheckpoint {
+    fn drop(&mut self) {
+        unsafe { ffi::hk_retrieval_checkpoint_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+// New legacy entries clear their own diagnostic slot. Read it immediately on
+// this thread, before any other FFI call (including an opaque handle's Drop).
+fn legacy_status(status: c_int) -> Result<()> {
+    let error = last_error();
+    if status != 0 {
+        Err(KvMemError(error.unwrap_or_else(|| format!("legacy FFI status {status}"))))
+    } else if let Some(error) = error {
+        Err(KvMemError(error))
+    } else {
+        Ok(())
+    }
+}
+
+fn legacy_vec<T: Default + Clone>(
+    mut f: impl FnMut(*mut T, usize, *mut usize) -> c_int,
+) -> Result<Vec<T>> {
+    let mut needed = 0;
+    legacy_status(f(ptr::null_mut(), 0, &mut needed))?;
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(needed)
+        .map_err(|e| KvMemError(format!("legacy output allocation: {e}")))?;
+    values.resize(needed, T::default());
+    let mut written = 0;
+    legacy_status(f(values.as_mut_ptr(), values.len(), &mut written))?;
+    if written != needed {
+        return Err(KvMemError(format!(
+            "legacy output count changed between calls ({needed} -> {written})"
+        )));
+    }
+    Ok(values)
+}
+
+/// Ordinary resident-only Pressure selection through core `pressure_selection`.
+/// `candidates` must be the caller's frozen accepted resident IDs; scores are
+/// candidate-aligned. Rejects duplicate candidates, mismatched/nonfinite scores,
+/// nonresident mandatory IDs, mandatory overflow and core-invalid mass/budget
+/// (negative scores or zero budget). Mandatory duplicates count only once.
+/// Ties prefer larger IDs; output is ascending. This never scans cold history;
+/// Query recall continues to use [`KvStore::pick_topk_blocks`].
+pub fn pressure_selection(
+    candidates: &[u32],
+    scores: &[f64],
+    mandatory: &[u32],
+    budget_blocks: u32,
+) -> Result<Vec<u32>> {
+    legacy_vec(|out, capacity, count| unsafe {
+        ffi::hk_pressure_selection(
+            candidates.as_ptr(),
+            candidates.len(),
+            scores.as_ptr(),
+            scores.len(),
+            mandatory.as_ptr(),
+            mandatory.len(),
+            budget_blocks,
+            out,
+            capacity,
+            count,
+        )
+    })
+}
+
+/// Core bounded user Query range. A zero limit produces an empty range;
+/// begin/count are clamped against total without overflowing.
+pub fn bounded_query(begin: u64, count: u64, total: u64, limit: u32) -> Result<QueryRange> {
+    let mut out = QueryRange { begin: 0, end: 0 };
+    legacy_status(unsafe { ffi::hk_bounded_query(begin, count, total, limit, &mut out) })?;
+    Ok(out)
+}
+
+/// Core replay admission result. Refusal is a successful policy evaluation
+/// with `admitted == false`, not an FFI error. `reason` is an owned core string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyReplayPlan {
+    pub begin: u64,
+    pub end: u64,
+    pub admitted: bool,
+    pub reason: String,
+}
+
+/// Evaluate the full causal replay span, including partial-page overlap and
+/// draft workspace. Zero limit is NOT unlimited. Invalid boundaries/overflow
+/// retain the core's refusal reason and do not mutate the first-pass view.
+#[allow(clippy::too_many_arguments)]
+pub fn query_replay_plan(
+    query: QueryRange,
+    restore_begin: u64,
+    end: u64,
+    limit: u32,
+    block: u32,
+    history_pages: u64,
+    device_pages: u64,
+    workspace: u32,
+) -> Result<LegacyReplayPlan> {
+    let mut out = HkLegacyReplayPlan {
+        begin: 0,
+        end: 0,
+        admitted: 0,
+        reason: ptr::null(),
+    };
+    legacy_status(unsafe {
+        ffi::hk_query_replay_plan(
+            query,
+            restore_begin,
+            end,
+            limit,
+            block,
+            history_pages,
+            device_pages,
+            workspace,
+            &mut out,
+        )
+    })?;
+    if out.reason.is_null() {
+        return Err(KvMemError("query replay plan returned a null reason".into()));
+    }
+    Ok(LegacyReplayPlan {
+        begin: out.begin,
+        end: out.end,
+        admitted: out.admitted != 0,
+        reason: unsafe { CStr::from_ptr(out.reason) }.to_string_lossy().into_owned(),
+    })
+}
+
+/// Core sink/recent/media requirements over the recoverable Query prefix.
+/// The partial tail stays required even with recent=0. Core filters media
+/// outside the prefix; a zero block size or page-count overflow is an error.
+pub fn query_prefix_required(
+    prefix: u64,
+    block: u32,
+    sink: u32,
+    recent: u32,
+    media: &[u32],
+) -> Result<Vec<u32>> {
+    legacy_vec(|out, capacity, count| unsafe {
+        ffi::hk_query_prefix_required(
+            prefix,
+            block,
+            sink,
+            recent,
+            media.as_ptr(),
+            media.len(),
+            out,
+            capacity,
+            count,
+        )
+    })
 }
 
 /// Two-call selection helper: `pick` writes the required count on out=NULL.
@@ -5320,5 +5627,169 @@ impl Drop for ProbeSelection {
         // longer call the trampoline); the result's metadata lease retires here
         // too; `self.revision` is freed afterwards.
         unsafe { ffi::hk_probe_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+#[cfg(test)]
+mod legacy_ffi_tests {
+    use super::*;
+
+    fn scored_store() -> KvStore {
+        let kv = KvStore::new(&KvStoreConfig {
+            block_tokens: 4,
+            lrfu: 1,
+            lrfu_top_fraction: 1.0,
+            ..KvStoreConfig::default()
+        })
+        .unwrap();
+        kv.register_append(12).unwrap();
+        kv.begin_retrieval_round().unwrap();
+        kv.set_retrieval_scores(&[1.0, 2.0, 3.0]).unwrap();
+        assert!(kv.commit_retrieval_round().unwrap());
+        kv
+    }
+
+    #[test]
+    fn null_handles_and_outputs_never_report_success() {
+        let kv = scored_store();
+        let snapshot = kv.retrieval_checkpoint().unwrap();
+        let p = snapshot.ptr.as_ptr();
+        let k = kv.ptr.as_ptr();
+        let mut round = 0;
+        let mut committed = 0;
+        let mut count = 0;
+        let mut score = 0.0;
+        unsafe {
+            assert!(ffi::hk_kv_store_retrieval_checkpoint(ptr::null()).is_null());
+            assert!(last_error().is_some());
+            assert!(ffi::hk_retrieval_checkpoint_clone(ptr::null()).is_null());
+            assert!(last_error().is_some());
+            assert_eq!(ffi::hk_kv_store_restore_retrieval(ptr::null_mut(), p), -1);
+            assert_eq!(ffi::hk_kv_store_restore_retrieval(k, ptr::null()), -1);
+            assert_eq!(
+                ffi::hk_retrieval_checkpoint_meta(ptr::null(), &mut round, &mut committed),
+                -1
+            );
+            assert_eq!(ffi::hk_retrieval_checkpoint_meta(p, ptr::null_mut(), &mut committed), -1);
+            assert_eq!(ffi::hk_retrieval_checkpoint_meta(p, &mut round, ptr::null_mut()), -1);
+            assert_eq!(
+                ffi::hk_retrieval_checkpoint_scores(ptr::null(), ptr::null_mut(), 0, &mut count),
+                -1
+            );
+            assert_eq!(ffi::hk_kv_store_selection_score(ptr::null(), 0, &mut score), -1);
+            assert_eq!(ffi::hk_kv_store_selection_score(k, 0, ptr::null_mut()), -1);
+            assert_eq!(ffi::hk_kv_store_selection_score(k, 3, &mut score), -1);
+            assert_eq!(ffi::hk_bounded_query(0, 1, 1, 1, ptr::null_mut()), -1);
+            assert_eq!(
+                ffi::hk_query_replay_plan(
+                    QueryRange { begin: 0, end: 1 }, 0, 1, 1, 1, 0, 1, 0, ptr::null_mut()
+                ),
+                -1
+            );
+            ffi::hk_retrieval_checkpoint_destroy(ptr::null_mut());
+            assert!(last_error().is_some());
+            assert_eq!(ffi::hk_kv_store_selection_score(k, 0, &mut score), 0);
+            assert_eq!(score, 1.0);
+            assert!(last_error().is_none(), "successful FFI clears the prior error");
+        }
+    }
+
+    fn check_output<T: Copy + PartialEq + fmt::Debug>(
+        mut f: impl FnMut(*mut T, usize, *mut usize) -> c_int,
+        expected: &[T],
+        sentinel: T,
+    ) {
+        let mut count = 0;
+        assert_eq!(f(ptr::null_mut(), 0, &mut count), 0);
+        assert_eq!(count, expected.len());
+        let mut buffer = vec![sentinel; count + 1];
+        assert_eq!(f(buffer.as_mut_ptr(), count - 1, &mut count), -2);
+        assert_eq!(count, expected.len());
+        assert!(buffer.iter().all(|v| *v == sentinel), "no partial writes");
+        assert!(last_error().unwrap().contains("capacity"));
+        assert_eq!(f(buffer.as_mut_ptr(), buffer.len(), &mut count), 0);
+        assert_eq!(&buffer[..count], expected);
+        assert_eq!(buffer[count], sentinel, "no write beyond the returned count");
+        assert!(last_error().is_none());
+        assert_eq!(f(ptr::null_mut(), 1, &mut count), -1);
+        assert_eq!(f(buffer.as_mut_ptr(), buffer.len(), ptr::null_mut()), -1);
+        assert_eq!(f(buffer.as_mut_ptr(), usize::MAX, &mut count), -1);
+    }
+
+    #[test]
+    fn vector_outputs_report_required_capacity_and_never_partially_write() {
+        let kv = scored_store();
+        let snapshot = kv.retrieval_checkpoint().unwrap();
+        check_output(
+            |out, capacity, count| unsafe {
+                ffi::hk_retrieval_checkpoint_scores(snapshot.ptr.as_ptr(), out, capacity, count)
+            },
+            &[1.0, 2.0, 3.0],
+            99.0,
+        );
+        check_output(
+            |out, capacity, count| unsafe {
+                ffi::hk_pressure_selection(
+                    [3, 1, 2].as_ptr(), 3, [1.0; 3].as_ptr(), 3, ptr::null(), 0,
+                    2, out, capacity, count,
+                )
+            },
+            &[2, 3],
+            99,
+        );
+        check_output(
+            |out, capacity, count| unsafe {
+                ffi::hk_query_prefix_required(9, 4, 1, 0, ptr::null(), 0, out, capacity, count)
+            },
+            &[0, 2],
+            99,
+        );
+    }
+
+    #[test]
+    fn invalid_spans_are_rejected_before_dereferencing_or_narrowing() {
+        let mut count = 0;
+        let id = 1u32;
+        let score = 1.0f64;
+        let mut pressure = |c, nc, s, ns, m, nm| unsafe {
+            ffi::hk_pressure_selection(c, nc, s, ns, m, nm, 1, ptr::null_mut(), 0, &mut count)
+        };
+        assert_eq!(pressure(ptr::null(), 1, &score, 1, ptr::null(), 0), -1);
+        assert_eq!(pressure(&id, 1, ptr::null(), 1, ptr::null(), 0), -1);
+        assert_eq!(pressure(&id, 1, &score, 1, ptr::null(), 1), -1);
+        assert_eq!(pressure(&id, usize::MAX, &score, usize::MAX, ptr::null(), 0), -1);
+        let misaligned = unsafe { (&id as *const u32).cast::<u8>().add(1).cast::<u32>() };
+        assert_eq!(pressure(misaligned, 1, &score, 1, ptr::null(), 0), -1);
+        let mut prefix = |media, len| unsafe {
+            ffi::hk_query_prefix_required(4, 4, 0, 0, media, len, ptr::null_mut(), 0, &mut count)
+        };
+        assert_eq!(prefix(ptr::null(), 1), -1);
+        assert_eq!(prefix(&id, usize::MAX), -1);
+        assert_eq!(prefix(misaligned, 1), -1);
+    }
+
+    #[test]
+    fn diagnostic_slots_are_thread_local_and_rust_errors_are_owned() {
+        use std::sync::mpsc;
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        clear_error();
+        let worker = std::thread::spawn(move || {
+            let status = unsafe { ffi::hk_bounded_query(0, 1, 1, 1, ptr::null_mut()) };
+            assert_eq!(status, -1);
+            let message = last_error().unwrap();
+            ready_tx.send(()).unwrap();
+            done_rx.recv().unwrap();
+            assert_eq!(last_error().unwrap(), message, "other thread cannot clear this error");
+            let owned = legacy_status(status).unwrap_err();
+            bounded_query(0, 1, 1, 1).unwrap();
+            assert!(last_error().is_none());
+            owned
+        });
+        ready_rx.recv().unwrap();
+        assert!(last_error().is_none(), "worker's error must not leak into this thread");
+        bounded_query(0, 1, 1, 1).unwrap();
+        done_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().0.contains("buffer"));
     }
 }

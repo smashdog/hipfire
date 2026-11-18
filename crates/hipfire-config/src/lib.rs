@@ -20,6 +20,7 @@ pub mod evidence;
 pub mod host_memory;
 pub mod http_auth;
 pub mod intent;
+pub mod kvmem;
 pub mod load_summary;
 pub mod rocm;
 pub mod secret;
@@ -4375,12 +4376,28 @@ impl ResolvedConfig {
 pub struct ProcessConfig {
     pub schema_version: i64,
     pub values: ConfigLayer,
+    /// Strict, versioned Legacy policy; None retains the env-only Layerwise path
+    /// or identifies an older client awaiting snapshot-only normalization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kvmem: Option<kvmem::ResolvedConfig>,
 }
 
 static ACTIVE_PROCESS_CONFIG: OnceLock<ProcessConfig> = OnceLock::new();
 
 impl ProcessConfig {
     pub fn from_resolved(resolved: &ResolvedConfig) -> Result<Self> {
+        Self::from_resolved_with_kvmem(resolved, &BTreeMap::new())
+    }
+
+    /// Apply raw CLI presence before strict KVMem validation, so a winning CLI
+    /// value can override an invalid, shadowed compatibility environment value.
+    pub fn from_resolved_with_kvmem(
+        resolved: &ResolvedConfig,
+        cli: &BTreeMap<String, String>,
+    ) -> Result<Self> {
+        let kvmem = kvmem::RawConfig::from_global(resolved, cli)
+            .and_then(|raw| raw.resolve())
+            .map_err(kvmem_config_error)?;
         let mut values = ConfigLayer::default();
         for schema in FIELDS {
             if schema.env_compat.is_none() {
@@ -4407,6 +4424,7 @@ impl ProcessConfig {
         let config = Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             values,
+            kvmem,
         };
         config.validate()?;
         Ok(config)
@@ -4423,6 +4441,9 @@ impl ProcessConfig {
             });
         }
         self.values.validate()?;
+        if let Some(kvmem) = &self.kvmem {
+            kvmem.validate().map_err(kvmem_config_error)?;
+        }
         for key in self.values.values.keys() {
             if is_developer_key(key) {
                 continue;
@@ -4440,6 +4461,17 @@ impl ProcessConfig {
         Ok(())
     }
 
+    /// Normalize older clients using only the supplied developer snapshot.
+    /// Layerwise returns None and keeps its existing native policy parser.
+    pub fn resolve_missing_kvmem(&mut self) -> Result<()> {
+        if self.kvmem.is_none() {
+            self.kvmem = kvmem::RawConfig::from_process_values(&self.values)
+                .and_then(|raw| raw.resolve())
+                .map_err(kvmem_config_error)?;
+        }
+        self.validate()
+    }
+
     /// Render the compatibility spelling expected by an internal snapshot
     /// parser. This is an in-memory adapter only; it does not mutate or inspect
     /// the ambient process environment.
@@ -4449,6 +4481,13 @@ impl ProcessConfig {
         }
         let key = developer_key_for_env(name)?;
         self.values.get(&key).and_then(render_compat_value)
+    }
+}
+
+fn kvmem_config_error(error: kvmem::ResolveError) -> ConfigError {
+    ConfigError::InvalidValue {
+        key: format!("kvmem.{}", error.parameter),
+        message: error.message,
     }
 }
 
@@ -6339,8 +6378,15 @@ pub fn load_env_layer() -> Result<ConfigLayer> {
         let Some(key) = developer_key_for_env(name) else {
             continue;
         };
-        let Ok(raw) = raw.into_string() else {
-            continue;
+        let raw = match raw.into_string() {
+            Ok(raw) => raw,
+            Err(_) if name == "HIPFIRE_KVMEM" || name.starts_with("HIPFIRE_KVMEM_") => {
+                return Err(ConfigError::InvalidValue {
+                    key,
+                    message: format!("{name} must be valid UTF-8; explicit KVMem input cannot be silently omitted"),
+                });
+            }
+            Err(_) => continue,
         };
         layer.set(&key, ConfigValue::String(raw))?;
     }
@@ -7347,6 +7393,7 @@ mod tests {
             let process = ProcessConfig {
                 schema_version: CONFIG_SCHEMA_VERSION,
                 values: layer,
+                kvmem: None,
             };
             assert_eq!(
                 process.legacy_value(SYM_IU4_ENV).as_deref(),
@@ -8468,6 +8515,7 @@ mod tests {
         let config = ProcessConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
             values,
+            kvmem: None,
         };
         let table = legacy_table(&config);
         let mut names: Vec<&str> = FIELDS

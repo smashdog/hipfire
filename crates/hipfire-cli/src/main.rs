@@ -958,8 +958,144 @@ struct SidecarArgs {
     skip_validation: bool,
 }
 
+/// Raw public KVMem flags. Numeric inputs deliberately remain strings until
+/// the shared resolver has applied CLI > env > developer > default precedence.
+#[derive(Args, Debug, Clone, Default)]
+pub(crate) struct KvmemArgs {
+    /// Enable Legacy KVMem (B=32768, R=1024, H=16384 MiB, Sessions=4).
+    #[arg(long, conflicts_with = "no_kvmem")]
+    kvmem: bool,
+    /// Disable KVMem; conflicts with a supplied positive budget.
+    #[arg(long)]
+    no_kvmem: bool,
+    /// Read-only JSON configuration/capability check; no model or GPU is loaded.
+    #[arg(long)]
+    kvmem_check: bool,
+    /// Selected history B>0 in tokens, excluding R; positive B implicitly enables.
+    #[arg(long, value_name = "TOKENS", allow_hyphen_values = true)]
+    kvmem_budget: Option<String>,
+    /// Reusable append reserve R>0, not an output limit; default 1024 tokens.
+    #[arg(long, value_name = "TOKENS", allow_hyphen_values = true)]
+    kvmem_gen_reserve: Option<String>,
+    /// Protected prefix in B; floor to G=128. Zero means literal zero protection.
+    #[arg(long, value_name = "TOKENS", allow_hyphen_values = true)]
+    kvmem_sink_tokens: Option<String>,
+    /// Protected suffix in B; floor to G=128, including zero (public default 64).
+    #[arg(long, value_name = "TOKENS", allow_hyphen_values = true)]
+    kvmem_recent_tokens: Option<String>,
+    /// Shared native payload RAM hard budget H>0 in MiB; default 16384.
+    #[arg(long, value_name = "MIB", allow_hyphen_values = true)]
+    kvmem_host_mib: Option<String>,
+    /// Shared SSD payload quota D>=0 in MiB; positive D requires --kvmem-disk-path.
+    #[arg(long, value_name = "MIB", allow_hyphen_values = true)]
+    kvmem_disk_mib: Option<String>,
+    /// SSD directory; forbidden when D=0. Check mode does not probe writability.
+    #[arg(long, value_name = "PATH")]
+    kvmem_disk_path: Option<String>,
+    /// Retained inactive histories N>=1; active request is excluded. Default 4.
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
+    kvmem_sessions: Option<String>,
+    /// Minimum recoverable cache history: only 0 supported (no native consumer).
+    #[arg(long, value_name = "TOKENS", allow_hyphen_values = true)]
+    kvmem_cache_min_tokens: Option<String>,
+    /// Fixed native block size; only 128 is supported. B>=256 and R>=128 after floor.
+    #[arg(long, value_name = "128", allow_hyphen_values = true)]
+    kvmem_block_tokens: Option<String>,
+    /// Formal policy: legacy only; the existing Layerwise env-only path is separate.
+    #[arg(long, value_name = "legacy")]
+    kvmem_recall_strategy: Option<String>,
+    /// Query scorer: meanq-cosine or page-softmax (default); independent of aggregation.
+    #[arg(long, value_name = "SCORER")]
+    kvmem_query_scorer: Option<String>,
+    /// mean or max; defaults to max for cosine, mean for page-softmax.
+    #[arg(long, value_name = "AGG")]
+    kvmem_score_agg: Option<String>,
+    /// Enable LRFU (default on for cosine, off for page-softmax).
+    #[arg(long, conflicts_with = "no_kvmem_lrfu")]
+    kvmem_lrfu: bool,
+    /// Disable LRFU; explicit lambda/top-frac then conflicts.
+    #[arg(long)]
+    no_kvmem_lrfu: bool,
+    /// Finite [0,1], default 0.5; requires enabled LRFU.
+    #[arg(long, value_name = "FLOAT", allow_hyphen_values = true)]
+    kvmem_lrfu_lambda: Option<String>,
+    /// Finite (0,1], default 0.9; requires enabled LRFU.
+    #[arg(long, value_name = "FLOAT", allow_hyphen_values = true)]
+    kvmem_lrfu_top_frac: Option<String>,
+    /// Graph scoring is unsupported: only 0, also the effective default.
+    #[arg(long, value_name = "0", allow_hyphen_values = true)]
+    kvmem_graph_alpha: Option<String>,
+    /// Positive Query capture-tail limit, default 512; 0 is rejected, not unlimited.
+    #[arg(long, value_name = "TOKENS", allow_hyphen_values = true)]
+    kvmem_query_max_tokens: Option<String>,
+    /// Positive complete causal replay bound, default 2048; 0 is rejected.
+    #[arg(long, value_name = "TOKENS", allow_hyphen_values = true)]
+    kvmem_query_replay_max_tokens: Option<String>,
+}
+
+impl KvmemArgs {
+    pub(crate) fn raw_map(&self) -> BTreeMap<String, String> {
+        let mut raw = BTreeMap::new();
+        for (flag, present) in [
+            ("--kvmem", self.kvmem), ("--no-kvmem", self.no_kvmem),
+            ("--kvmem-lrfu", self.kvmem_lrfu), ("--no-kvmem-lrfu", self.no_kvmem_lrfu),
+        ] {
+            if present { raw.insert(flag.to_owned(), "1".to_owned()); }
+        }
+        for (flag, value) in [
+            ("--kvmem-budget", &self.kvmem_budget),
+            ("--kvmem-gen-reserve", &self.kvmem_gen_reserve),
+            ("--kvmem-sink-tokens", &self.kvmem_sink_tokens),
+            ("--kvmem-recent-tokens", &self.kvmem_recent_tokens),
+            ("--kvmem-host-mib", &self.kvmem_host_mib),
+            ("--kvmem-disk-mib", &self.kvmem_disk_mib),
+            ("--kvmem-disk-path", &self.kvmem_disk_path),
+            ("--kvmem-sessions", &self.kvmem_sessions),
+            ("--kvmem-cache-min-tokens", &self.kvmem_cache_min_tokens),
+            ("--kvmem-block-tokens", &self.kvmem_block_tokens),
+            ("--kvmem-recall-strategy", &self.kvmem_recall_strategy),
+            ("--kvmem-query-scorer", &self.kvmem_query_scorer),
+            ("--kvmem-score-agg", &self.kvmem_score_agg),
+            ("--kvmem-lrfu-lambda", &self.kvmem_lrfu_lambda),
+            ("--kvmem-lrfu-top-frac", &self.kvmem_lrfu_top_frac),
+            ("--kvmem-graph-alpha", &self.kvmem_graph_alpha),
+            ("--kvmem-query-max-tokens", &self.kvmem_query_max_tokens),
+            ("--kvmem-query-replay-max-tokens", &self.kvmem_query_replay_max_tokens),
+        ] {
+            if let Some(value) = value { raw.insert(flag.to_owned(), value.clone()); }
+        }
+        raw
+    }
+
+    pub(crate) fn append_child_args(&self, command: &mut Command) {
+        for (flag, value) in self.raw_map() {
+            if matches!(flag.as_str(), "--kvmem" | "--no-kvmem" | "--kvmem-lrfu" | "--no-kvmem-lrfu") {
+                command.arg(flag);
+            } else {
+                // Equals syntax preserves empty/negative lexemes and paths
+                // beginning with a hyphen through detached argv reconstruction.
+                command.arg(format!("{flag}={value}"));
+            }
+        }
+    }
+}
+
+fn validate_kvmem_storage_args(arguments: &[OsString]) -> Result<()> {
+    if !matches!(arguments.get(1).and_then(|arg| arg.to_str()), Some("serve" | "restart")) {
+        return Ok(());
+    }
+    for argument in arguments.iter().skip(2).take_while(|arg| arg.as_os_str() != std::ffi::OsStr::new("--")) {
+        if let Some(text) = argument.to_str() {
+            hipfire_config::kvmem::reject_retired_storage_flag(text)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ServeArgs {
+    #[command(flatten)]
+    kvmem: KvmemArgs,
     /// Optional model, host, host:port, and/or port in legacy-compatible order.
     #[arg(value_name = "MODEL_HOST_OR_PORT", num_args = 0..=3)]
     positionals: Vec<String>,
@@ -1093,13 +1229,22 @@ fn finish_command(result: Result<()>) {
     }
 }
 fn run() -> Result<()> {
-    let cli = Cli::parse_from(env::args_os().map(|argument| {
+    let arguments: Vec<_> = env::args_os().map(|argument| {
         if argument == "-md" {
             OsString::from("--model-draft")
         } else {
             argument
         }
-    }));
+    }).collect();
+    validate_kvmem_storage_args(&arguments)?;
+    let cli = Cli::parse_from(arguments);
+    // Must precede Paths::discover, registry/model lookup, restart/stop, detach
+    // and every daemon/GPU side effect. Only global config files are read.
+    if let Some(Commands::Serve(args) | Commands::Restart(args)) = &cli.command {
+        if args.kvmem.kvmem_check {
+            return crate::serve::kvmem_check_command(&args.kvmem);
+        }
+    }
     // Print-only commands die quietly on a closed stdout (`hipfire list -r |
     // head -1`) like any Unix filter instead of panicking in `println!`.
     // Commands that drive a daemon, server or child over pipes keep Rust's
@@ -1157,6 +1302,14 @@ fn run() -> Result<()> {
         Some(Commands::Serve(args)) => crate::serve::serve_command(&paths, args),
         Some(Commands::Stop(args)) => crate::serve::stop_command(&paths, args),
         Some(Commands::Restart(args)) => {
+            // Invalid KVMem inputs must not stop a healthy service first.
+            let (_, global) = resolved_global(&paths, true)?;
+            let process = hipfire_config::ProcessConfig::from_resolved_with_kvmem(&global, &args.kvmem.raw_map())?;
+            if process.kvmem.as_ref().is_some_and(|config| config.enabled)
+                && !config_bool(&global, "serve.multi_slot")?
+            {
+                bail!("UNSUPPORTED: Legacy KVMem requires serve.multi_slot=true; standard serving cannot consume this policy");
+            }
             let port = args.positionals.iter().find_map(|value| {
                 value.parse::<u16>().ok().or_else(|| {
                     crate::serve::parse_host_port(value)
@@ -4102,6 +4255,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
 
     if !service_ready(&endpoint, Duration::from_millis(150)) {
         let serve_args = ServeArgs {
+            kvmem: KvmemArgs::default(),
             positionals: vec![host.clone(), port.to_string()],
             model: None,
             detach: true,

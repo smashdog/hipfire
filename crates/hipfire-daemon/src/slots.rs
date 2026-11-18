@@ -681,6 +681,9 @@ impl SlotBackend {
         let engine = spawn_slot_engine(
             arch_id,
             SlotEngineConfig {
+                kvmem: hipfire_config::active_or_local_process_config()
+                    .kvmem
+                    .clone(),
                 model_path: PathBuf::from(model_path),
                 n_slots,
                 cap_tokens,
@@ -3003,8 +3006,12 @@ fn rendered_query_span(
     // nInfer `bounded_query`: the Query is the recent question window, not a
     // whole pasted document — clamp the proven span to the last
     // `default_query_tokens` (512) tokens.
-    const QUERY_LIMIT: u64 = 512;
-    let begin = (before.len() as u64).max((through.len() as u64).saturating_sub(QUERY_LIMIT));
+    let query_limit = hipfire_config::active_or_local_process_config()
+        .kvmem
+        .as_ref()
+        .filter(|config| config.enabled)
+        .map_or(512, |config| u64::from(config.query_max_tokens));
+    let begin = (before.len() as u64).max((through.len() as u64).saturating_sub(query_limit));
     Some((begin, through.len() as u64))
 }
 
