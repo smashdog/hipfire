@@ -518,6 +518,7 @@ mod tests {
         ProcessConfig {
             schema_version: hipfire_config::CONFIG_SCHEMA_VERSION,
             values: Default::default(),
+            kvmem: None,
         }
     }
 

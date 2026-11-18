@@ -730,17 +730,27 @@ fn check_daemon_build_matches(daemon: &Path) -> Result<()> {
     if CLIENT_BUILD_COMMIT == "unknown" {
         return Ok(());
     }
-    let mut child = match std::process::Command::new(daemon)
-        .arg("--version")
-        // A daemon fixture that reads stdin must see EOF, not this caller's
-        // pipes; the real daemon answers before touching stdin anyway.
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return Ok(()),
+    let mut attempt = 0u32;
+    let mut child = loop {
+        match std::process::Command::new(daemon)
+            .arg("--version")
+            // A daemon fixture that reads stdin must see EOF, not this caller's
+            // pipes; the real daemon answers before touching stdin anyway.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => break child,
+            // A concurrent fixture write can leave a writable fd inherited by
+            // this fork until the writer's exec; retry instead of silently
+            // passing the probe (which would hide install skew).
+            Err(source) if source.raw_os_error() == Some(26) && attempt < 400 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => return Ok(()),
+        }
     };
     // The real daemon answers --version before any process init. Anything
     // still running after the deadline is not a version answer (a fixture
@@ -842,6 +852,30 @@ impl Engine {
             .envs(environment);
         #[cfg(test)]
         let fixture_process_guard = FIXTURE_PROCESS_GATE.lock().unwrap();
+        #[cfg(test)]
+        let mut child = {
+            // Another test's fork (the ungated `--version` probe above) can
+            // briefly inherit a writable fd of this fixture between fork and
+            // exec, which makes our exec fail ETXTBSY even though the write
+            // has already closed. Retry under the gate until that child execs.
+            let mut attempt = 0u32;
+            loop {
+                match command.spawn() {
+                    Ok(child) => break child,
+                    Err(source) if source.raw_os_error() == Some(26) && attempt < 400 => {
+                        attempt += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(source) => {
+                        return Err(ClientError::Spawn {
+                            path: daemon.to_owned(),
+                            source,
+                        })
+                    }
+                }
+            }
+        };
+        #[cfg(not(test))]
         let mut child = command.spawn().map_err(|source| ClientError::Spawn {
             path: daemon.to_owned(),
             source,
@@ -996,16 +1030,15 @@ impl Engine {
         model: Option<&Path>,
         stderr: Stdio,
     ) -> Result<Self> {
+        let configure = configuration_request(config, model)?;
         let engine = Self::spawn_with_stderr(daemon, environment, stderr)?;
-        let mut configure = serde_json::json!({
-            "type": "configure",
-            "config": config,
-        });
-        if let Some(model) = model {
-            configure["model"] = serde_json::json!(model);
-        }
         let response = engine.request(&configure)?;
-        expect_type(&response, "configured")?;
+        if let Err(error) = validate_configured_response(config, &response) {
+            // An old daemon must never continue with enabled policy silently
+            // ignored, even if it tolerates unknown configure JSON fields.
+            engine.terminate();
+            return Err(error);
+        }
         Ok(engine)
     }
 
@@ -1836,6 +1869,29 @@ impl Drop for EngineInner {
     }
 }
 
+fn configuration_request(config: &hipfire_config::ProcessConfig, model: Option<&Path>) -> Result<Value> {
+    config.validate().map_err(|error| ClientError::Protocol(error.to_string()))?;
+    let mut configure = serde_json::json!({ "type": "configure", "config": config });
+    if let Some(model) = model {
+        configure["model"] = serde_json::json!(model);
+    }
+    Ok(configure)
+}
+
+fn validate_configured_response(config: &hipfire_config::ProcessConfig, response: &Value) -> Result<()> {
+    expect_type(response, "configured")?;
+    if config.kvmem.is_some()
+        && response.get("kvmem_contract_version").and_then(Value::as_u64)
+            != Some(u64::from(hipfire_config::kvmem::CONTRACT_VERSION))
+    {
+        return Err(ClientError::Protocol(format!(
+            "daemon did not acknowledge KVMem contract {}; refusing to ignore the resolved policy (upgrade daemon)",
+            hipfire_config::kvmem::CONTRACT_VERSION,
+        )));
+    }
+    Ok(())
+}
+
 fn expect_type(response: &Value, expected: &str) -> Result<()> {
     match response.get("type").and_then(Value::as_str) {
         Some(actual) if actual == expected => Ok(()),
@@ -2036,6 +2092,38 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::{env, fs};
+
+    #[test]
+    fn kvmem_jsonl_contract_roundtrip_and_old_daemon_rejection() {
+        let global = hipfire_config::resolve(Vec::<hipfire_config::NamedLayer>::new()).unwrap();
+        let cli = BTreeMap::from([
+            ("--kvmem-budget".to_owned(), "8193".to_owned()),
+            ("--kvmem-query-scorer".to_owned(), "meanq-cosine".to_owned()),
+        ]);
+        let config = hipfire_config::ProcessConfig::from_resolved_with_kvmem(&global, &cli).unwrap();
+        let request = configuration_request(&config, None).unwrap();
+        assert_eq!(request["type"], "configure");
+        assert!(request.get("model").is_none());
+        let wire = serde_json::to_string(&request).unwrap();
+        let request: Value = serde_json::from_str(&wire).unwrap();
+        let received: hipfire_config::ProcessConfig = serde_json::from_value(request["config"].clone()).unwrap();
+        received.validate().unwrap();
+        assert_eq!(received, config);
+        assert!(validate_configured_response(&config, &serde_json::json!({"type": "configured"})).is_err());
+        for version in [0, 2] {
+            assert!(validate_configured_response(&config, &serde_json::json!({"type": "configured", "kvmem_contract_version": version})).is_err());
+        }
+        validate_configured_response(&config, &serde_json::json!({"type": "configured", "kvmem_contract_version": 1})).unwrap();
+        let mut disabled = config.clone();
+        disabled.kvmem = hipfire_config::kvmem::RawConfig::from_maps(
+            &BTreeMap::from([("--no-kvmem".into(), "1".into())]), &BTreeMap::new(), &BTreeMap::new(),
+        ).unwrap().resolve().unwrap();
+        // A disable override also cannot be dropped by an old daemon.
+        assert!(validate_configured_response(&disabled, &serde_json::json!({"type": "configured"})).is_err());
+        let mut tampered = config;
+        tampered.kvmem.as_mut().unwrap().query_max_tokens = 0;
+        assert!(configuration_request(&tampered, None).is_err());
+    }
 
     fn collect_sse(raw: &str) -> Result<Vec<OpenAiSseEvent>> {
         let mut out = Vec::new();
@@ -2397,7 +2485,7 @@ mod tests {
         ));
         let daemon = write_fake_daemon(
             &root,
-            "#!/bin/sh\nconfigured=0\nwhile IFS= read -r line; do\n case \"$line\" in *'\"configure\"'*) case \"$line\" in *'\"hardware.devices\":\"2,3\"'*) configured=1; echo '{\"type\":\"configured\"}' ;; *) echo '{\"type\":\"error\",\"message\":\"device policy missing\"}' ;; esac ;; *'\"ping\"'*) if [ \"$configured\" = 1 ]; then echo '{\"type\":\"pong\"}'; else echo '{\"type\":\"error\",\"message\":\"not configured\"}'; fi ;; *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
+            "#!/bin/sh\nconfigured=0\nwhile IFS= read -r line; do\n case \"$line\" in *'\"configure\"'*) case \"$line\" in *'\"hardware.devices\":\"2,3\"'*) configured=1; echo '{\"type\":\"configured\",\"kvmem_contract_version\":1}' ;; *) echo '{\"type\":\"error\",\"message\":\"device policy missing\"}' ;; esac ;; *'\"ping\"'*) if [ \"$configured\" = 1 ]; then echo '{\"type\":\"pong\"}'; else echo '{\"type\":\"error\",\"message\":\"not configured\"}'; fi ;; *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
         );
         let mut layer = hipfire_config::ConfigLayer::default();
         layer.set_cli("hardware.devices", "2,3").unwrap();

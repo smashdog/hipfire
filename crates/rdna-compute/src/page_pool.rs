@@ -254,7 +254,27 @@ impl BlockTable {
         }
     }
 
-    /// Number of pages currently allocated.
+    /// Build CPU-only logical coverage for a non-resident prefix. This owns
+    /// no physical pages and accepts no physical IDs. Zero tokens produces
+    /// an empty table; a partial tail is also spilled. The caller must restore
+    /// the required working set (including that tail) before a forward.
+    pub(crate) fn new_spilled_prefix(frontier: usize) -> Result<Self, String> {
+        let n_pages = frontier
+            .checked_add(PAGE_TOKENS - 1)
+            .ok_or_else(|| "BlockTable: spilled prefix page rounding overflows usize".to_string())?
+            / PAGE_TOKENS;
+        let mut pages = Vec::new();
+        pages.try_reserve_exact(n_pages).map_err(|e| {
+            format!("BlockTable: cannot reserve {n_pages} spilled logical pages: {e}")
+        })?;
+        pages.resize(n_pages, SPILLED_PAGE);
+        Ok(Self {
+            pages,
+            live_tokens: frontier,
+        })
+    }
+
+    /// Number of logical pages, including non-resident spilled entries.
     pub fn num_pages(&self) -> usize {
         self.pages.len()
     }
@@ -1522,6 +1542,58 @@ impl PagePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spilled_prefix_rounds_logical_coverage() {
+        for (frontier, pages) in [
+            (0, 0),
+            (1, 1),
+            (PAGE_TOKENS - 1, 1),
+            (PAGE_TOKENS, 1),
+            (PAGE_TOKENS + 1, 2),
+        ] {
+            let table = BlockTable::new_spilled_prefix(frontier).unwrap();
+            assert_eq!(table.live_tokens(), frontier);
+            assert_eq!(table.num_pages(), pages);
+            assert_eq!(table.page_indices(), vec![SPILLED_PAGE; pages].as_slice());
+            for lp in 0..pages {
+                assert_eq!(table.physical(lp), None);
+            }
+            assert_eq!(table.raw_entry(pages), None);
+        }
+    }
+
+    #[test]
+    fn spilled_prefix_refuses_rounding_overflow() {
+        for frontier in [usize::MAX, usize::MAX - (PAGE_TOKENS - 2)] {
+            let err = BlockTable::new_spilled_prefix(frontier).unwrap_err();
+            assert!(err.contains("rounding overflows"), "unexpected: {err}");
+        }
+    }
+
+    #[test]
+    fn spilled_prefix_release_table_skips_sentinels() {
+        for restore in [false, true] {
+            let mut pool = PagePool::new(2, 1088).unwrap();
+            let mut table = BlockTable::new_spilled_prefix(5 * PAGE_TOKENS + 7).unwrap();
+            if restore {
+                for lp in [1, 4] {
+                    let phys = pool.alloc_page_unbound().unwrap();
+                    table.bind_physical(lp, phys).unwrap();
+                }
+            }
+            // Check the Result directly: SlotPool's reset/release discard it,
+            // which would hide attempts to decrement a sentinel's refcount.
+            pool.release_table(&mut table).unwrap();
+            assert_eq!(table.num_pages(), 0);
+            assert_eq!(table.live_tokens(), 0);
+            assert_eq!(pool.free_pages(), 2);
+            pool.check_invariants();
+            pool.release_table(&mut table).unwrap();
+            assert_eq!(pool.free_pages(), 2);
+            pool.check_invariants();
+        }
+    }
 
     // ── Existing tests (updated for Wave 2 API) ───────────────────────
 

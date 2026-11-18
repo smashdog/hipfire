@@ -48,7 +48,7 @@ for line in sys.stdin:
     req = json.loads(line)
     kind = req.get("type")
     if kind == "configure":
-        out({{"type": "configured"}})
+        out({{"type": "configured", "kvmem_contract_version": 1}})
     elif kind == "ping":
         out({{"type": "pong"}})
     elif kind == "diag":

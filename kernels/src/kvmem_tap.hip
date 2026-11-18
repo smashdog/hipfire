@@ -54,3 +54,29 @@ __global__ void kvmem_tap_f32(
     if (!last) return;
     q_tap[(long long)slot * q_width + i] = q[(long long)row * q_width + i];
 }
+
+// Independent, bounded Query capture. The scheduler supplies real user-span
+// batch indices; this kernel knows nothing about slots, accepted tokens, or
+// Query policy. Unlike the legacy entry above it never picks a slot's tail.
+// Hipfire's tensor_ops.hip uses this same hip_bfloat16 cast (RNE, preserving
+// non-finite values); do not replace it with an ad-hoc scalar bit encoding.
+#include <hip/hip_bfloat16.h>
+using __hip_bfloat16 = hip_bfloat16;
+
+extern "C" __launch_bounds__(256)
+__global__ void kvmem_capture_query_bf16(
+    const float* __restrict__ q,                  // [n_rows, q_width], pre-RoPE
+    const unsigned int* __restrict__ source_rows, // [n_query_rows], host validated
+    __hip_bfloat16* __restrict__ query_rows,       // [capacity, q_width]
+    int n_rows,
+    int n_query_rows,
+    int q_width
+) {
+    const int row = blockIdx.y;
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_query_rows || i >= (unsigned int)q_width) return;
+    const unsigned int source = source_rows[row];
+    if (source >= (unsigned int)n_rows) return;
+    query_rows[(long long)row * q_width + i] =
+        static_cast<__hip_bfloat16>(q[(long long)source * q_width + i]);
+}

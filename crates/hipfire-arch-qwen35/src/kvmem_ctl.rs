@@ -475,7 +475,9 @@ fn resolve_pressure_admission(
 /// that the crate was built with the `kvmem` feature — the engine refuses the
 /// knob loudly when it was not.
 pub fn requested() -> bool {
-    env_flag("HIPFIRE_KVMEM")
+    hipfire_config::active_process_config()
+        .and_then(|process| process.kvmem.as_ref())
+        .map_or_else(|| env_flag("HIPFIRE_KVMEM"), |config| config.enabled)
 }
 
 /// Resolved pool geometry for a KVMem-enabled engine.
@@ -553,6 +555,69 @@ pub fn resolve_plan(
         budget_blocks,
         grow_blocks,
         interval,
+    })
+}
+
+/// Admit the public Legacy contract after token normalization. Unlike the
+/// historical env-only pool planner, the physical pool never silently reduces
+/// the requested history budget. NInfer's device window is B + R: a pressure
+/// selection returns to B and every subsequent append can reuse R.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_legacy_plan(
+    n_slots: usize,
+    cap_tokens: usize,
+    max_step_rows: usize,
+    budget_tokens: usize,
+    reserve_tokens: usize,
+    explicit_pages: Option<usize>,
+) -> Result<KvMemPlan, String> {
+    if n_slots == 0 || cap_tokens == 0 || max_step_rows == 0 {
+        return Err("kvmem: Legacy requires positive slots, context and step capacity".into());
+    }
+    if budget_tokens < 2 * KV_BLOCK_TOKENS
+        || reserve_tokens < KV_BLOCK_TOKENS
+        || budget_tokens % KV_BLOCK_TOKENS != 0
+        || reserve_tokens % KV_BLOCK_TOKENS != 0
+    {
+        return Err(format!(
+            "kvmem: normalized Legacy B/R must be multiples of {KV_BLOCK_TOKENS}, \
+             with B >= {} and R >= {KV_BLOCK_TOKENS}",
+            2 * KV_BLOCK_TOKENS
+        ));
+    }
+    let window = budget_tokens
+        .checked_add(reserve_tokens)
+        .ok_or("kvmem: Legacy B + R overflow")?;
+    if window > cap_tokens {
+        return Err(format!(
+            "kvmem: Legacy B + R ({budget_tokens} + {reserve_tokens} = {window}) \
+             exceeds logical context C={cap_tokens}"
+        ));
+    }
+    if max_step_rows > reserve_tokens {
+        return Err(format!(
+            "kvmem: native append/verify width {max_step_rows} exceeds R={reserve_tokens}; \
+             normalize prefill or increase --kvmem-gen-reserve"
+        ));
+    }
+    let required_pages = (window / KV_BLOCK_TOKENS)
+        .checked_mul(n_slots)
+        .ok_or("kvmem: Legacy physical pool page count overflow")?;
+    let pages_total = explicit_pages.unwrap_or(required_pages);
+    if pages_total < required_pages {
+        return Err(format!(
+            "kvmem: explicit physical pool has {pages_total} pages, but Legacy \
+             B={budget_tokens}, R={reserve_tokens}, slots={n_slots} require at least \
+             {required_pages} pages; the history budget is not reduced automatically"
+        ));
+    }
+    Ok(KvMemPlan {
+        pages_total,
+        budget_blocks: budget_tokens / KV_BLOCK_TOKENS,
+        grow_blocks: max_step_rows.div_ceil(KV_BLOCK_TOKENS),
+        // Public Legacy selects at actual window pressure, not every N blocks.
+        // Retain the field for the unchanged Layerwise/env-only planner.
+        interval: 1,
     })
 }
 
@@ -849,6 +914,31 @@ struct StepPlan {
     restore: Vec<usize>,
 }
 
+/// Immutable host-owned Legacy recovery point. It owns no GPU page references;
+/// restoring forks a private raw/statistics branch and never consumes the source.
+/// The engine pairs this object with the exact native recurrent/conv image and
+/// accepted token proof at `frontier` before publishing it as reusable history.
+pub struct LegacyStoreSnapshot {
+    raw: RawStore,
+    pub frontier: u32,
+    pub resident_pages: Vec<u32>,
+    mean_tail: Option<Vec<f32>>,
+    retrieval: hipfire_kvmem::RetrievalCheckpoint,
+    /// Retains the core's immutable sealed origins and proves every layer/page
+    /// was captured, including the valid portion of a non-full tail page.
+    sealed: hipfire_kvmem::KvSnapshot,
+    layout_id: u64,
+    request_query: Option<(u64, u64)>,
+    last_query: Option<(u64, u64)>,
+    group: u64,
+}
+
+impl LegacyStoreSnapshot {
+    pub fn payload_bytes(&self) -> u64 {
+        self.sealed.bytes()
+    }
+}
+
 pub struct KvMemCtl {
     /// Declared before `storage` so the per-slot stores (which hold a
     /// shared_ptr into it) are destroyed first.
@@ -857,6 +947,9 @@ pub struct KvMemCtl {
     storage: Storage,
     raw_cfg: RawStoreConfig,
     kv_cfg: KvStoreConfig,
+    /// Admitted public Legacy policy. None is the unchanged Layerwise/internal
+    /// route; public consumers never re-read the corresponding environment keys.
+    legacy: Option<hipfire_config::kvmem::ResolvedConfig>,
     budget_blocks: usize,
     /// P2.2a generation reserve R (ninfer `reserve_tokens`): layerwise window
     /// capacity is `budget_blocks*128 + gen_reserve`. `HIPFIRE_KVMEM_GEN_RESERVE`.
@@ -1019,6 +1112,35 @@ impl KvMemCtl {
         geom: &KvMemGeometry,
         strategy: RecallStrategy,
     ) -> Result<Self, String> {
+        Self::construct(n_slots, plan, geom, strategy, None)
+    }
+
+    pub fn new_with_config(
+        n_slots: usize,
+        plan: &KvMemPlan,
+        geom: &KvMemGeometry,
+        config: Option<&hipfire_config::kvmem::ResolvedConfig>,
+    ) -> Result<Self, String> {
+        match config {
+            Some(config) => {
+                if !config.enabled || config.block_tokens as usize != KV_BLOCK_TOKENS
+                    || config.budget_tokens as usize / KV_BLOCK_TOKENS != plan.budget_blocks
+                {
+                    return Err("kvmem: resolved Legacy configuration differs from admitted pool geometry".into());
+                }
+                Self::construct(n_slots, plan, geom, RecallStrategy::Legacy, Some(config.clone()))
+            }
+            None => Self::new(n_slots, plan, geom),
+        }
+    }
+
+    fn construct(
+        n_slots: usize,
+        plan: &KvMemPlan,
+        geom: &KvMemGeometry,
+        strategy: RecallStrategy,
+        legacy: Option<hipfire_config::kvmem::ResolvedConfig>,
+    ) -> Result<Self, String> {
         if n_slots == 0 || geom.n_fa_layers == 0 || geom.head_dim == 0 {
             return Err("kvmem: zero-sized controller request".to_string());
         }
@@ -1045,8 +1167,14 @@ impl KvMemCtl {
             k_gpu_row_bytes: geom.per_pos_bytes as u64,
             v_gpu_row_bytes: geom.per_pos_v_bytes as u64,
         };
-        let sink = env_usize("HIPFIRE_KVMEM_SINK_BLOCKS").unwrap_or(1);
-        let recent = env_usize("HIPFIRE_KVMEM_RECENT_BLOCKS").unwrap_or(1);
+        let sink = legacy.as_ref().map_or_else(
+            || env_usize("HIPFIRE_KVMEM_SINK_BLOCKS").unwrap_or(1),
+            |c| c.sink_tokens as usize / KV_BLOCK_TOKENS,
+        );
+        let recent = legacy.as_ref().map_or_else(
+            || env_usize("HIPFIRE_KVMEM_RECENT_BLOCKS").unwrap_or(1),
+            |c| c.recent_tokens as usize / KV_BLOCK_TOKENS,
+        );
         if sink + recent > plan.budget_blocks {
             return Err(format!(
                 "kvmem: sink ({sink}) + recent ({recent}) blocks exceed the \
@@ -1056,7 +1184,10 @@ impl KvMemCtl {
             ));
         }
         let budget_tokens = (plan.budget_blocks * KV_BLOCK_TOKENS) as u32;
-        let gen_reserve = env_u64("HIPFIRE_KVMEM_GEN_RESERVE").unwrap_or(DEFAULT_GEN_RESERVE);
+        let gen_reserve = legacy.as_ref().map_or_else(
+            || env_u64("HIPFIRE_KVMEM_GEN_RESERVE").unwrap_or(DEFAULT_GEN_RESERVE),
+            |c| u64::from(c.gen_reserve_tokens),
+        );
         if gen_reserve == 0 {
             return Err("kvmem: HIPFIRE_KVMEM_GEN_RESERVE must be positive".to_string());
         }
@@ -1074,10 +1205,15 @@ impl KvMemCtl {
         // ── opt-in policy knobs (defaults reproduce the historical behaviour) ──
         // LRFU replaces the raw retrieval score with a decaying heavy-hitter
         // history in the core's `selection_score`; lambda/top tune that decay.
-        let lrfu = env_flag("HIPFIRE_KVMEM_LRFU");
-        let lrfu_lambda = env_f64("HIPFIRE_KVMEM_LRFU_LAMBDA").unwrap_or(0.5);
-        let lrfu_top = env_f64("HIPFIRE_KVMEM_LRFU_TOP").unwrap_or(0.9);
-        let select_method = match env_raw("HIPFIRE_KVMEM_SELECT_METHOD") {
+        let lrfu = legacy.as_ref().map_or_else(|| env_flag("HIPFIRE_KVMEM_LRFU"), |c| c.lrfu);
+        let lrfu_lambda = legacy.as_ref().map_or_else(
+            || env_f64("HIPFIRE_KVMEM_LRFU_LAMBDA").unwrap_or(0.5), |c| c.lrfu_lambda,
+        );
+        let lrfu_top = legacy.as_ref().map_or_else(
+            || env_f64("HIPFIRE_KVMEM_LRFU_TOP").unwrap_or(0.9), |c| c.lrfu_top_fraction,
+        );
+        let select_method = match legacy.as_ref().map(|_| "retrieval".to_string())
+            .or_else(|| env_raw("HIPFIRE_KVMEM_SELECT_METHOD")) {
             Some(v) => parse_select_method(&v).ok_or_else(|| {
                 format!("kvmem: HIPFIRE_KVMEM_SELECT_METHOD={v} invalid (retrieval|h2o|recency)")
             })?,
@@ -1105,8 +1241,8 @@ impl KvMemCtl {
         }
         // Watermark ratios are stored on the config; the page thresholds are
         // derived from the CORE watermark functions after the stores exist.
-        let wm_high_env = env_f64("HIPFIRE_KVMEM_GPU_HIGH_WATERMARK");
-        let wm_low_env = env_f64("HIPFIRE_KVMEM_GPU_LOW_WATERMARK");
+        let wm_high_env = if legacy.is_none() { env_f64("HIPFIRE_KVMEM_GPU_HIGH_WATERMARK") } else { None };
+        let wm_low_env = if legacy.is_none() { env_f64("HIPFIRE_KVMEM_GPU_LOW_WATERMARK") } else { None };
         let watermark_enabled = wm_high_env.is_some() || wm_low_env.is_some();
         let wm_high = wm_high_env.unwrap_or(0.95);
         let wm_low = wm_low_env.unwrap_or(0.85);
@@ -1123,7 +1259,9 @@ impl KvMemCtl {
 
         // Query span: 1 keeps the single-row mean-K retrieval (byte-identical);
         // >1 accumulates a per-slot host Q ring and scores by page-softmax.
-        let query_span = env_usize("HIPFIRE_KVMEM_QUERY_SPAN").unwrap_or(1);
+        let query_span = if legacy.is_some() { 1 } else {
+            env_usize("HIPFIRE_KVMEM_QUERY_SPAN").unwrap_or(1)
+        };
         if !(1..=512).contains(&query_span) {
             return Err(format!(
                 "kvmem: HIPFIRE_KVMEM_QUERY_SPAN={query_span} out of range [1,512]"
@@ -1169,9 +1307,10 @@ impl KvMemCtl {
             ..KvStoreConfig::default()
         };
 
-        let host_bytes = env_u64("HIPFIRE_KVMEM_HOST_BYTES")
-            .unwrap_or(DEFAULT_HOST_BYTES)
-            .max(1);
+        let host_bytes = legacy.as_ref().map_or_else(
+            || env_u64("HIPFIRE_KVMEM_HOST_BYTES").unwrap_or(DEFAULT_HOST_BYTES).max(1),
+            |c| c.host_bytes,
+        );
         // 期3 G3: internal content groups (fairness-only; ninfer
         // `--kvmem-sessions` analogue). 0 keeps the historical LRU catalog.
         let content_groups = env_usize("HIPFIRE_KVMEM_CONTENT_GROUPS").unwrap_or(0);
@@ -1215,14 +1354,17 @@ impl KvMemCtl {
             ),
             None => ColdPackIndex::default(),
         };
-        let storage = match env_raw("HIPFIRE_KVMEM_SPILL_DIR") {
+        let (spill_dir, spill_bytes) = match legacy.as_ref() {
+            Some(c) => (c.disk_path.clone(), c.disk_bytes),
+            None => (
+                env_raw("HIPFIRE_KVMEM_SPILL_DIR").map(PathBuf::from),
+                env_u64("HIPFIRE_KVMEM_SPILL_BYTES").unwrap_or(DEFAULT_SPILL_BYTES).max(1),
+            ),
+        };
+        let storage = match spill_dir {
             Some(dir) => {
-                let dir = PathBuf::from(dir);
                 std::fs::create_dir_all(&dir)
                     .map_err(|e| format!("kvmem spill dir {}: {e}", dir.display()))?;
-                let spill_bytes = env_u64("HIPFIRE_KVMEM_SPILL_BYTES")
-                    .unwrap_or(DEFAULT_SPILL_BYTES)
-                    .max(1);
                 Storage::new_tiered(host_bytes, &dir, spill_bytes)
             }
             None => Storage::new_ram(host_bytes),
@@ -1324,6 +1466,7 @@ impl KvMemCtl {
             storage,
             raw_cfg,
             kv_cfg,
+            legacy,
             budget_blocks: plan.budget_blocks,
             interval: plan.interval,
             trace: env_flag("HIPFIRE_KVMEM_TRACE"),
@@ -1396,6 +1539,225 @@ impl KvMemCtl {
             draft_image_hits_total: 0,
             draft_image_misses_total: 0,
         })
+    }
+
+    pub fn legacy_config(&self) -> Option<&hipfire_config::kvmem::ResolvedConfig> {
+        self.legacy.as_ref()
+    }
+
+    pub fn request_query(&self, slot: usize) -> Option<(u64, u64)> {
+        self.slots.get(slot).and_then(|state| state.request_query)
+    }
+
+    pub fn legacy_query_for_request(
+        &self,
+        slot: usize,
+        source: Option<(u64, u64)>,
+        prompt_end: usize,
+    ) -> Result<Option<crate::legacy_query::LegacyQuery>, String> {
+        let Some(config) = &self.legacy else { return Ok(None) };
+        let frontier = self.slots.get(slot).ok_or("kvmem: Query slot out of range")?.fed;
+        let source = source.map(|(begin, end)| {
+            end.checked_sub(begin).map(|count| (begin, count))
+                .ok_or_else(|| "kvmem: reversed frontend Query range".to_string())
+        }).transpose()?;
+        let query = crate::legacy_query::LegacyQuery::new(
+            source, frontier as usize, prompt_end, config.query_max_tokens,
+            config.query_replay_max_tokens, KV_BLOCK_TOKENS, self.n_fa_layers, self.q_width,
+        )?;
+        // A Query that would restore an empty store has no accepted history to
+        // score or rewind to: the public API rejects a zero-page snapshot, and
+        // there is nothing behind the query to recall. Leave the request on the
+        // ordinary first-pass/prefill path instead of half-starting a probe.
+        if query.as_ref().is_some_and(|query| query.restore_begin() == 0) {
+            return Ok(None);
+        }
+        Ok(query)
+    }
+
+    /// Score the immutable pre-Query history using every proven user Q row.
+    /// The temporary selector previews LRFU but never commits a logical round;
+    /// only the accepted end of first pass/replay may publish that history.
+    pub fn select_legacy_query(
+        &self,
+        source: &LegacyStoreSnapshot,
+        query: &crate::legacy_query::LegacyQuery,
+    ) -> Result<(Vec<u32>, Vec<f64>), String> {
+        let config = self.legacy.as_ref().ok_or("kvmem: missing Legacy Query policy")?;
+        if source.frontier as usize != query.restore_begin()
+            || source.layout_id != layout_fingerprint(&self.raw_cfg)
+        {
+            return Err("kvmem: Query source does not match the captured restore frontier".into());
+        }
+        let blocks = (source.frontier as usize).div_ceil(KV_BLOCK_TOKENS) as u32;
+        if blocks == 0 { return Ok((Vec::new(), Vec::new())); }
+        let aggregation = match config.score_agg {
+            hipfire_config::kvmem::ScoreAgg::Mean => GqaAggregation::Mean,
+            hipfire_config::kvmem::ScoreAgg::Max => GqaAggregation::Max,
+        };
+        let scores = match config.query_scorer {
+            hipfire_config::kvmem::QueryScorer::MeanQCosine => {
+                let sums = query.query_sums()?;
+                let rows: u64 = query.query_row_counts().iter().map(|&n| u64::from(n)).sum();
+                let norm = sums.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>().sqrt();
+                eprintln!(
+                    "[kvmem-legacy] QuerySums rows={rows} widths={} norm={norm:.4}",
+                    sums.len()
+                );
+                mean_key_retrieval_scores(
+                    &source.raw, blocks, &sums, query.query_row_counts(),
+                    self.n_fa_layers as u32, self.head_dim as u32,
+                    self.n_heads as u32, self.n_kv_heads as u32, aggregation,
+                )
+            }
+            hipfire_config::kvmem::QueryScorer::PageSoftmax => page_softmax_scores(
+                &source.raw, blocks, source.frontier as u64, KV_BLOCK_TOKENS as u32,
+                self.budget_blocks as u32, self.kv_cfg.sink_blocks, self.kv_cfg.recent_blocks,
+                query.query_rows(), query.query_row_counts(), self.n_fa_layers as u32,
+                query.query_len() as u32, self.n_heads as u32, self.n_kv_heads as u32,
+                self.head_dim as u32, 0.0, aggregation,
+            ),
+        }.map_err(|e| format!("kvmem proven Query scoring: {e}"))?;
+        {
+            let mut ranked: Vec<(usize, f64)> = scores.iter().copied().enumerate().collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.cmp(&a.0)));
+            let top: Vec<String> = ranked.iter().take(6).map(|(id, s)| format!("{id}={s:.4}")).collect();
+            let low: Vec<String> = ranked.iter().rev().take(4).map(|(id, s)| format!("{id}={s:.4}")).collect();
+            let counts: Vec<String> = [28u32, 32, 37]
+                .into_iter()
+                .filter(|&id| id < blocks)
+                .map(|id| format!("{id}={}", source.raw.n_tokens(id)))
+                .collect();
+            eprintln!(
+                "[kvmem-legacy] QueryScores top=[{}] low=[{}] raw_tokens=[{}]",
+                top.join(","), low.join(","), counts.join(",")
+            );
+        }
+        let required = hipfire_kvmem::query_prefix_required(
+            source.frontier as u64, KV_BLOCK_TOKENS as u32,
+            self.kv_cfg.sink_blocks, self.kv_cfg.recent_blocks, &[],
+        ).map_err(|e| format!("kvmem Query mandatory: {e}"))?;
+        if required.len() > self.budget_blocks {
+            return Err("kvmem: Query protected prefix and partial tail exceed B".into());
+        }
+        let selector = KvStore::new(&self.kv_cfg).map_err(|e| format!("kvmem Query selector: {e}"))?;
+        selector.register_append(source.frontier).map_err(|e| e.to_string())?;
+        selector.restore_retrieval(&source.retrieval).map_err(|e| e.to_string())?;
+        selector.begin_retrieval_round().map_err(|e| e.to_string())?;
+        selector.set_retrieval_scores(&scores).map_err(|e| e.to_string())?;
+        let selected = selector.pick_topk_blocks(&required).map_err(|e| e.to_string())?;
+        if selected.len() > self.budget_blocks || selected.iter().any(|&id| id >= blocks) {
+            return Err("kvmem: Query selector returned an invalid history budget".into());
+        }
+        eprintln!(
+            "[kvmem-legacy] Query span={}..{} rows={} restore_begin={} history_pages={blocks} selected={selected:?} scorer={:?} agg={:?}",
+            query.query().begin, query.query().end, query.query_len(), source.frontier,
+            config.query_scorer, config.score_agg,
+        );
+        Ok((selected, scores))
+    }
+
+    pub fn commit_legacy_query(&mut self, slot: usize, scores: &[f64]) -> Result<(), String> {
+        if self.legacy.is_none() { return Err("kvmem: Query commit without Legacy policy".into()); }
+        let st = self.slots.get_mut(slot).ok_or("kvmem: Query commit slot out of range")?;
+        if st.first_decode_done {
+            return Err("kvmem: Query statistical round already published for this request".into());
+        }
+        st.kv.begin_retrieval_round().map_err(|e| e.to_string())?;
+        st.kv.set_retrieval_scores(scores).map_err(|e| e.to_string())?;
+        let reinforced = st.kv.commit_retrieval_round().map_err(|e| e.to_string())?;
+        st.first_decode_done = true;
+        eprintln!("[kvmem-legacy] QueryCommit slot={slot} frontier={} lrfu_committed={reinforced}", st.fed);
+        Ok(())
+    }
+
+    /// Ordinary prefill/decode pressure is NOT a Query. Only accepted resident
+    /// pages are candidates, exactly as NInfer's non-Query prepare_window arm.
+    /// No old Q tap, full-history retrieval, or LRFU round is used here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_legacy_step(
+        &mut self,
+        gpu: &mut Gpu,
+        pool: &mut SlotPool,
+        active: &[bool],
+        resident: &[bool],
+        incoming_rows: &[usize],
+        decoding: &[bool],
+        replaying: &[bool],
+        k_arenas: &[GpuTensor],
+        v_arenas: &[GpuTensor],
+    ) -> Result<(), String> {
+        if self.legacy.is_none() || self.strategy.is_layerwise() {
+            return Err("kvmem: public Legacy pressure requires its admitted contract".into());
+        }
+        let window_pages = self.budget_blocks + self.gen_reserve as usize / KV_BLOCK_TOKENS;
+        for slot in 0..self.slots.len() {
+            let live_owner = active.get(slot).copied().unwrap_or(false)
+                || resident.get(slot).copied().unwrap_or(false);
+            if !live_owner && self.slots[slot].fed != 0 {
+                self.reset_slot(slot)?;
+            }
+            if !active.get(slot).copied().unwrap_or(false) { continue; }
+            let incoming = incoming_rows.get(slot).copied().unwrap_or(0);
+            if incoming == 0 { continue; }
+            if incoming as u64 > self.gen_reserve {
+                return Err(format!("kvmem: append {incoming} exceeds Legacy R={}", self.gen_reserve));
+            }
+            let bt = pool.block_table(SlotId(slot)).ok_or("kvmem: missing Legacy page table")?;
+            let frontier = bt.live_tokens();
+            if self.slots[slot].fed as usize != frontier {
+                return Err(format!("kvmem: pressure frontier {frontier} differs from accepted statistics {}", self.slots[slot].fed));
+            }
+            let end = frontier.checked_add(incoming).ok_or("kvmem: append position overflow")?;
+            let growing = end.div_ceil(KV_BLOCK_TOKENS) - frontier.div_ceil(KV_BLOCK_TOKENS);
+            let candidates: Vec<u32> = (0..bt.num_pages())
+                .filter(|&lp| bt.physical(lp).is_some()).map(|lp| lp as u32).collect();
+            if candidates.len().saturating_add(growing) <= window_pages { continue; }
+            if replaying.get(slot).copied().unwrap_or(false) {
+                return Err("kvmem: admitted Query replay exceeded its physical window; Pressure during replay is forbidden".into());
+            }
+            let required = hipfire_kvmem::query_prefix_required(
+                frontier as u64, KV_BLOCK_TOKENS as u32,
+                self.kv_cfg.sink_blocks, self.kv_cfg.recent_blocks, &[],
+            ).map_err(|e| format!("kvmem pressure mandatory: {e}"))?;
+            // Hipfire has no accepted attention-mass producer on this Legacy
+            // route. The core's empty-feedback frame has zero mass and uses
+            // its own deterministic recency tie-break; never recycle Query
+            // similarity or rejected verify Q as fake attention feedback.
+            let scores = vec![0.0; candidates.len()];
+            let keep = hipfire_kvmem::pressure_selection(
+                &candidates, &scores, &required, self.budget_blocks as u32,
+            ).map_err(|e| format!("kvmem resident-only pressure: {e}"))?;
+            let mut spill = Vec::new();
+            for &lp in &candidates {
+                if keep.contains(&lp) { continue; }
+                let phys = bt.physical(lp as usize).ok_or("kvmem: pressure candidate vanished")?;
+                if !pool.page_pool().is_some_and(|p| p.page_evictable(phys)) {
+                    return Err("kvmem: Legacy pressure cannot evict an externally pinned page".into());
+                }
+                if (lp as usize + 1) * KV_BLOCK_TOKENS > frontier {
+                    return Err("kvmem: Legacy pressure attempted to drop a non-full tail".into());
+                }
+                spill.push((lp as usize, phys));
+            }
+            if keep.len().saturating_add(growing) > window_pages {
+                return Err("kvmem: protected Legacy working set leaves insufficient append reserve".into());
+            }
+            let mut elapsed = std::time::Duration::ZERO;
+            let mut ignored_count = 0;
+            self.flush_spill_batch(
+                gpu, pool, slot, &spill, k_arenas, v_arenas, time_flag(),
+                &mut elapsed, &mut ignored_count,
+            )?;
+            self.spill_pages_total += spill.len() as u64;
+            let bytes = spill.len() * self.n_fa_layers * (self.k_page_bytes + self.v_page_bytes);
+            eprintln!(
+                "[kvmem-legacy] {} slot={slot} frontier={frontier} incoming={incoming} resident_before={} kept={} window_pages={window_pages} spill_pages={} spill_bytes={bytes} restore_bytes=0",
+                if decoding.get(slot).copied().unwrap_or(false) { "DecodePressure" } else { "Pressure" },
+                candidates.len(), keep.len(), spill.len(),
+            );
+        }
+        Ok(())
     }
 
     /// P4.4: the KV tier this controller resolves to (per-tier layerwise format
@@ -1482,6 +1844,13 @@ impl KvMemCtl {
     /// (media) pins, so an admission check must add them.
     pub fn sink_blocks(&self) -> usize {
         self.kv_cfg.sink_blocks as usize
+    }
+
+    /// Always-resident recent pages (`HIPFIRE_KVMEM_RECENT_BLOCKS`). Together
+    /// with the sink they form the fixed allocation every layerwise selection
+    /// budget must cover.
+    pub fn recent_blocks(&self) -> usize {
+        self.kv_cfg.recent_blocks as usize
     }
 
     /// P2.2a: generation reserve R (ninfer `reserve_tokens`).
@@ -2193,6 +2562,173 @@ impl KvMemCtl {
             draft_image_hits: self.draft_image_hits_total,
             draft_image_misses: self.draft_image_misses_total,
         }
+    }
+
+    /// Seal a complete host recovery point without changing the live view.
+    /// Legacy is write-back, so resident pages must be captured here as well
+    /// as the cold pages already held by RawStore. A failure leaves the GPU
+    /// view authoritative; callers may decline this optional checkpoint.
+    pub fn capture_legacy_snapshot(
+        &mut self,
+        gpu: &Gpu,
+        pool: &SlotPool,
+        k_arenas: &[GpuTensor],
+        v_arenas: &[GpuTensor],
+        slot: usize,
+    ) -> Result<LegacyStoreSnapshot, String> {
+        if self.strategy.is_layerwise() {
+            return Err("kvmem: Legacy snapshot requested from Layerwise executor".into());
+        }
+        if k_arenas.len() != self.n_fa_layers || v_arenas.len() != self.n_fa_layers {
+            return Err("kvmem: Legacy snapshot arena geometry mismatch".into());
+        }
+        let st = self.slots.get(slot).ok_or("kvmem: snapshot slot out of range")?;
+        let frontier = st.fed;
+        let bt = pool.block_table(SlotId(slot)).ok_or("kvmem: snapshot missing page table")?;
+        if bt.live_tokens() != frontier as usize {
+            return Err(format!(
+                "kvmem: snapshot KV frontier {} differs from statistics {frontier}",
+                bt.live_tokens()
+            ));
+        }
+        let blocks = (frontier as usize).div_ceil(KV_BLOCK_TOKENS);
+        let mut resident_pages = Vec::new();
+        for lp in 0..blocks {
+            let rows = (frontier as usize - lp * KV_BLOCK_TOKENS).min(KV_BLOCK_TOKENS);
+            if let Some(phys) = bt.physical(lp) {
+                copy_legacy_page_to_host(
+                    gpu, &st.raw, &mut self.page_k, &mut self.page_v,
+                    k_arenas, v_arenas, self.k_page_bytes, self.v_page_bytes,
+                    phys, lp, rows,
+                )?;
+                resident_pages.push(lp as u32);
+            } else {
+                for layer in 0..self.n_fa_layers {
+                    if !st.raw.has_k_gpu(lp as u32, layer as u32, rows as u32)
+                        || !st.raw.has_v_gpu(lp as u32, layer as u32, rows as u32)
+                    {
+                        return Err(format!(
+                            "kvmem: cold snapshot page {lp} layer {layer} has incomplete native payload"
+                        ));
+                    }
+                }
+            }
+        }
+        let mean_tail = st.raw.mean_checkpoint(frontier)
+            .map_err(|e| format!("kvmem snapshot mean tail: {e}"))?;
+        let raw = st.raw.fork_prefix(frontier)
+            .map_err(|e| format!("kvmem snapshot sealed fork: {e}"))?;
+        if let Some(tail) = &mean_tail {
+            raw.restore_mean_checkpoint(frontier, tail)
+                .map_err(|e| format!("kvmem snapshot mean fork: {e}"))?;
+        }
+        let sealed = raw.capture_snapshot(blocks as u32, None)
+            .map_err(|e| format!("kvmem snapshot manifest: {e}"))?;
+        if !sealed.ready() || !sealed.covers_packed(blocks as u32, self.n_fa_layers as u32) {
+            return Err("kvmem: Legacy snapshot is not a complete all-layer image".into());
+        }
+        let retrieval = st.kv.retrieval_checkpoint()
+            .map_err(|e| format!("kvmem snapshot retrieval: {e}"))?;
+        Ok(LegacyStoreSnapshot {
+            raw, frontier, resident_pages, mean_tail, retrieval, sealed,
+            layout_id: layout_fingerprint(&self.raw_cfg),
+            request_query: st.request_query,
+            last_query: st.last_query,
+            group: st.convo_group,
+        })
+    }
+
+    /// Restore a private branch at the snapshot's exact frontier. The caller
+    /// has already admitted the selection and must restore the matching native
+    /// recurrent image before forwarding. After pool.reset any error is a
+    /// destructive-restore failure, never a first-pass fallback.
+    pub fn restore_legacy_snapshot(
+        &mut self,
+        gpu: &Gpu,
+        pool: &mut SlotPool,
+        k_arenas: &[GpuTensor],
+        v_arenas: &[GpuTensor],
+        slot: usize,
+        source: &LegacyStoreSnapshot,
+        selected: &[u32],
+    ) -> Result<u64, String> {
+        if self.strategy.is_layerwise() || slot >= self.slots.len()
+            || source.layout_id != layout_fingerprint(&self.raw_cfg)
+            || k_arenas.len() != self.n_fa_layers || v_arenas.len() != self.n_fa_layers
+        {
+            return Err("kvmem: Legacy restore identity/geometry mismatch".into());
+        }
+        let blocks = (source.frontier as usize).div_ceil(KV_BLOCK_TOKENS);
+        let mut keep = selected.to_vec();
+        keep.sort_unstable();
+        keep.dedup();
+        if keep.len() != selected.len() || keep.iter().any(|&p| p as usize >= blocks) {
+            return Err("kvmem: Legacy restore contains duplicate or out-of-range pages".into());
+        }
+        if source.frontier as usize % KV_BLOCK_TOKENS != 0
+            && !keep.contains(&((blocks - 1) as u32))
+        {
+            return Err("kvmem: Legacy restore must retain the non-full tail page".into());
+        }
+        if !source.sealed.ready()
+            || !source.sealed.covers_packed(blocks as u32, self.n_fa_layers as u32)
+        {
+            return Err("kvmem: Legacy restore source is incomplete".into());
+        }
+        let releasable = pool.block_table(SlotId(slot)).map_or(0, |bt| {
+            (0..bt.num_pages()).filter(|&lp| {
+                bt.physical(lp).is_some_and(|phys| {
+                    pool.page_pool().is_some_and(|p| p.page_evictable(phys))
+                })
+            }).count()
+        });
+        if keep.len() > pool.free_pages().saturating_add(releasable) {
+            return Err("kvmem: Legacy restore has insufficient physical page capacity".into());
+        }
+        // Allocate/fork every host owner before invalidating the first-pass view.
+        let raw = source.raw.fork_prefix(source.frontier)
+            .map_err(|e| format!("kvmem restore branch: {e}"))?;
+        if let Some(tail) = &source.mean_tail {
+            raw.restore_mean_checkpoint(source.frontier, tail)
+                .map_err(|e| format!("kvmem restore mean tail: {e}"))?;
+        }
+        let kv = KvStore::new(&self.kv_cfg).map_err(|e| format!("kvmem restore selector: {e}"))?;
+        kv.register_append(source.frontier)
+            .map_err(|e| format!("kvmem restore selector frontier: {e}"))?;
+        kv.restore_retrieval(&source.retrieval)
+            .map_err(|e| format!("kvmem restore retrieval: {e}"))?;
+        pool.reset(SlotId(slot));
+        pool.install_spilled_prefix(SlotId(slot), source.frontier as usize)?;
+        let mut restored_bytes = 0u64;
+        for &lp in &keep {
+            let rows = (source.frontier as usize - lp as usize * KV_BLOCK_TOKENS)
+                .min(KV_BLOCK_TOKENS);
+            let phys = pool.page_pool_mut().ok_or("kvmem restore requires paged pool")?
+                .alloc_page_unbound().map_err(|e| format!("kvmem restore alloc: {e}"))?;
+            pool.bind_restored_page(SlotId(slot), lp as usize, phys)?;
+            copy_legacy_page_to_device(
+                gpu, &raw, &mut self.page_k, &mut self.page_v,
+                k_arenas, v_arenas, self.k_page_bytes, self.v_page_bytes,
+                phys, lp as usize, rows,
+            )?;
+            restored_bytes += (rows * self.n_fa_layers
+                * (self.k_page_bytes + self.v_page_bytes) / KV_BLOCK_TOKENS) as u64;
+        }
+        let incarnation = self.slots[slot].lw_incarnation.checked_add(1)
+            .ok_or("kvmem: restore incarnation overflow")?;
+        let mut state = self.fresh_slot_state(
+            raw, kv, source.frontier, source.frontier, incarnation,
+        );
+        state.request_query = source.request_query;
+        state.last_query = source.last_query;
+        state.convo_group = source.group;
+        self.slots[slot] = state;
+        self.restore_pages_total += keep.len() as u64;
+        eprintln!(
+            "[kvmem-legacy] restore slot={slot} frontier={} pages={keep:?} bytes={restored_bytes}",
+            source.frontier
+        );
+        Ok(restored_bytes)
     }
 
     /// P4.3 fed coordination: truncate slot `slot`'s host store to a
@@ -4349,6 +4885,112 @@ impl KvMemCtl {
     }
 }
 
+/// Capture exactly the accepted rows of one Legacy page, including a partial
+/// tail. Moving opaque packed bytes preserves K/V scales and format metadata;
+/// no K is reconstructed or rotated during a recovery-point transfer.
+#[allow(clippy::too_many_arguments)]
+fn copy_legacy_page_to_host(
+    gpu: &Gpu,
+    raw: &RawStore,
+    page_k: &mut [u8],
+    page_v: &mut [u8],
+    k_arenas: &[GpuTensor],
+    v_arenas: &[GpuTensor],
+    k_page_bytes: usize,
+    v_page_bytes: usize,
+    phys: u32,
+    lp: usize,
+    rows: usize,
+) -> Result<(), String> {
+    if rows == 0 || rows > KV_BLOCK_TOKENS
+        || k_arenas.len() != v_arenas.len()
+        || k_page_bytes % KV_BLOCK_TOKENS != 0 || v_page_bytes % KV_BLOCK_TOKENS != 0
+        || page_k.len() < k_page_bytes || page_v.len() < v_page_bytes
+    {
+        return Err("kvmem: invalid Legacy page capture geometry".into());
+    }
+    let klen = rows * (k_page_bytes / KV_BLOCK_TOKENS);
+    let vlen = rows * (v_page_bytes / KV_BLOCK_TOKENS);
+    let pos = u32::try_from(lp.checked_mul(KV_BLOCK_TOKENS)
+        .ok_or("kvmem: Legacy capture position overflow")?)
+        .map_err(|_| "kvmem: Legacy capture position exceeds u32")?;
+    for layer in 0..k_arenas.len() {
+        gpu.hip.memcpy_dtoh_at(&mut page_k[..klen], &k_arenas[layer].buf,
+            phys as usize * k_page_bytes)
+            .map_err(|e| format!("kvmem capture K layer {layer}: {e:?}"))?;
+        gpu.hip.memcpy_dtoh_at(&mut page_v[..vlen], &v_arenas[layer].buf,
+            phys as usize * v_page_bytes)
+            .map_err(|e| format!("kvmem capture V layer {layer}: {e:?}"))?;
+        raw.write_layer_k_gpu(pos, rows as u32, layer as u32, &page_k[..klen])
+            .map_err(|e| format!("kvmem capture K archive layer {layer}: {e}"))?;
+        raw.write_layer_v_gpu(pos, rows as u32, layer as u32, &page_v[..vlen])
+            .map_err(|e| format!("kvmem capture V archive layer {layer}: {e}"))?;
+        if verify_flag() {
+            eprintln!(
+                "[kvmem-verify] capture layer={layer} lp={lp} rows={rows} k={:016x} v={:016x}",
+                fnv64(&page_k[..klen]), fnv64(&page_v[..vlen])
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_legacy_page_to_device(
+    gpu: &Gpu,
+    raw: &RawStore,
+    page_k: &mut [u8],
+    page_v: &mut [u8],
+    k_arenas: &[GpuTensor],
+    v_arenas: &[GpuTensor],
+    k_page_bytes: usize,
+    v_page_bytes: usize,
+    phys: u32,
+    lp: usize,
+    rows: usize,
+) -> Result<(), String> {
+    if rows == 0 || rows > KV_BLOCK_TOKENS
+        || k_arenas.len() != v_arenas.len()
+        || k_page_bytes % KV_BLOCK_TOKENS != 0 || v_page_bytes % KV_BLOCK_TOKENS != 0
+        || page_k.len() < k_page_bytes || page_v.len() < v_page_bytes
+    {
+        return Err("kvmem: invalid Legacy page restore geometry".into());
+    }
+    let klen = rows * (k_page_bytes / KV_BLOCK_TOKENS);
+    let vlen = rows * (v_page_bytes / KV_BLOCK_TOKENS);
+    for layer in 0..k_arenas.len() {
+        if !raw.copy_k_gpu(lp as u32, layer as u32, &mut page_k[..klen], rows as u32)
+            || !raw.copy_v_gpu(lp as u32, layer as u32, &mut page_v[..vlen], rows as u32)
+        {
+            return Err(format!("kvmem: incomplete restore payload layer={layer} lp={lp} rows={rows}"));
+        }
+        gpu.hip.memcpy_htod_offset(&k_arenas[layer].buf,
+            phys as usize * k_page_bytes, &page_k[..klen])
+            .map_err(|e| format!("kvmem restore K layer {layer}: {e:?}"))?;
+        gpu.hip.memcpy_htod_offset(&v_arenas[layer].buf,
+            phys as usize * v_page_bytes, &page_v[..vlen])
+            .map_err(|e| format!("kvmem restore V layer {layer}: {e:?}"))?;
+        if verify_flag() {
+            let mut actual_k = vec![0u8; klen];
+            let mut actual_v = vec![0u8; vlen];
+            gpu.hip.memcpy_dtoh_at(&mut actual_k, &k_arenas[layer].buf,
+                phys as usize * k_page_bytes)
+                .map_err(|e| format!("kvmem verify K layer {layer}: {e:?}"))?;
+            gpu.hip.memcpy_dtoh_at(&mut actual_v, &v_arenas[layer].buf,
+                phys as usize * v_page_bytes)
+                .map_err(|e| format!("kvmem verify V layer {layer}: {e:?}"))?;
+            if actual_k != page_k[..klen] || actual_v != page_v[..vlen] {
+                return Err(format!("kvmem: byte-exact restore failed layer={layer} lp={lp} rows={rows}"));
+            }
+            eprintln!(
+                "[kvmem-verify] restore layer={layer} lp={lp} rows={rows} k={:016x} v={:016x} readback_mismatch k=0 v=0",
+                fnv64(&actual_k), fnv64(&actual_v)
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Copy a full page's K/V bytes out of the arenas into the host store, then
 /// (the caller) marks the logical page spilled.
 #[allow(clippy::too_many_arguments)]
@@ -4572,6 +5214,37 @@ pub fn layerwise_import_admission(
 mod tests {
     use super::*;
     use rdna_compute::DType;
+
+    #[test]
+    fn legacy_window_plan_keeps_budget_separate_from_reserve() {
+        let p = resolve_legacy_plan(1, 32768, 256, 8192, 1024, None).unwrap();
+        assert_eq!(p.budget_blocks, 64);
+        assert_eq!(p.pages_total, 72);
+        assert_eq!(p.grow_blocks, 2);
+        let two = resolve_legacy_plan(2, 32768, 512, 8192, 2048, None).unwrap();
+        assert_eq!(two.pages_total, 160);
+        assert_eq!(two.budget_blocks, 64);
+    }
+
+    #[test]
+    fn legacy_window_plan_refuses_silent_budget_clamping() {
+        let error = resolve_legacy_plan(1, 65536, 256, 36864, 1024, Some(160))
+            .unwrap_err();
+        assert!(error.contains("not reduced automatically"), "{error}");
+        assert!(resolve_legacy_plan(1, 32768, 256, 8192, 1024, Some(71)).is_err());
+        assert!(resolve_legacy_plan(1, 32768, 256, 8192, 1024, Some(72)).is_ok());
+    }
+
+    #[test]
+    fn legacy_window_plan_checks_context_step_and_alignment() {
+        assert!(resolve_legacy_plan(1, 9216, 1024, 8192, 1024, None).is_ok());
+        assert!(resolve_legacy_plan(1, 9215, 1024, 8192, 1024, None).is_err());
+        assert!(resolve_legacy_plan(1, 32768, 1025, 8192, 1024, None).is_err());
+        assert!(resolve_legacy_plan(1, 32768, 128, 255, 1024, None).is_err());
+        assert!(resolve_legacy_plan(1, 32768, 128, 8193, 1024, None).is_err());
+        assert!(resolve_legacy_plan(1, 32768, 128, 8192, 127, None).is_err());
+        assert!(resolve_legacy_plan(0, 32768, 256, 8192, 1024, None).is_err());
+    }
 
     /// Small Q8 geometry: 2 fa layers, 2 KV heads, head_dim 64 →
     /// `per_pos_bytes = 2 * (64/32) * 34 = 136`.

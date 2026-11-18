@@ -436,6 +436,16 @@ pub fn reset_dflash_slot(st: &mut DflashSlotState, session: u64) {
     st.draft = None;
 }
 
+/// Release an unconsumed speculative draft before a state capture. The draft
+/// rows are request-local rollback scratch; they are never part of the
+/// published native conditioning state, and a parked/captured image must not
+/// carry them. Frees the draft's GPU tensors (dropping it would leak VRAM).
+pub fn dflash_abandon_inflight(gpu: &mut Gpu, st: &mut DflashSlotState) {
+    if let Some(draft) = st.draft.take() {
+        draft.free_gpu(gpu);
+    }
+}
+
 /// 期4 (KVMem/nInfer DFlash2 integration): stable identity of the draft
 /// geometry a state image was captured from. A restore refuses a mismatch
 /// instead of seeding garbage into the rings.
@@ -459,6 +469,7 @@ pub fn dflash_geometry_id(shared: &DflashShared) -> u64 {
 /// frontier equals the draft's LIVE seeded frontier (nInfer native full-state
 /// serialization). Earlier frontiers cannot be reconstructed from the cached
 /// ring — those checkpoints simply carry no image and reseed on reuse.
+#[cfg(feature = "kvmem")]
 pub fn dflash_capture_image(
     gpu: &Gpu,
     shared: &DflashShared,
@@ -517,6 +528,7 @@ pub fn dflash_capture_image(
 /// and publish the restored conditioning frontier + suffix bound. The next
 /// draft cycle conditions on exactly the rows the target verify sees; the
 /// suffix floor is recomputed per draft step from the live Layerwise policy.
+#[cfg(feature = "kvmem")]
 pub fn dflash_restore_image(
     gpu: &mut Gpu,
     shared: &DflashShared,

@@ -1400,8 +1400,65 @@ pub(crate) fn unauthenticated_bind_notice(
     ))
 }
 
+/// Pure JSON report seam: no model, filesystem probing, process startup or GPU.
+fn kvmem_check_report(
+    args: &crate::KvmemArgs,
+    global: &hipfire_config::ResolvedConfig,
+) -> Result<serde_json::Value> {
+    let config = hipfire_config::kvmem::RawConfig::from_global(global, &args.raw_map())?.resolve()?;
+    Ok(serde_json::json!({
+        "contract_version": hipfire_config::kvmem::CONTRACT_VERSION,
+        "scope": "configuration-only; native execution and model admission are not tested",
+        "compiled_with_kvmem": cfg!(feature = "kvmem"),
+        "config": config,
+        "capabilities": {
+            "formal_recall_strategy": ["legacy"],
+            "native_owner": "serve.multi_slot=true required; standard and embedding owners reject enabled policy",
+            "query_scorer": ["meanq-cosine", "page-softmax"],
+            "score_agg": ["mean", "max"],
+            "block_tokens": [128],
+            "budget_min_tokens_after_floor": 256,
+            "reserve_min_tokens_after_floor": 128,
+            "integer_max": hipfire_config::kvmem::INTEGER_MAX,
+            "graph_alpha": [0],
+            "graph_note": "UNSUPPORTED nonzero; effective default 0 differs from public page-softmax 0.2",
+            "cache_min_tokens": [0],
+            "cache_min_note": "UNSUPPORTED positive values: no native consumer",
+            "query_and_replay_zero": "rejected (not unlimited)",
+            "sink_recent_zero": "literal zero protected tokens",
+            "layerwise": "existing env/developer-only route; config=null means no Legacy defaults injected",
+            "native_admission": "deferred: C, pool, scratch, model, KV and speculation capabilities",
+            "disk_path_writability": "not probed by this read-only check"
+        }
+    }))
+}
+
+pub(crate) fn kvmem_check_command(args: &crate::KvmemArgs) -> Result<()> {
+    let paths = hipfire_config::ConfigPaths::try_discover()?;
+    let loaded = hipfire_config::load_global(&paths)?;
+    let global = hipfire_config::resolve(vec![
+        hipfire_config::NamedLayer {
+            source: hipfire_config::ConfigSource::GlobalUser { path: loaded.path },
+            layer: loaded.layer,
+        },
+        hipfire_config::NamedLayer {
+            source: hipfire_config::ConfigSource::LegacyEnv { name: "HIPFIRE_*".into() },
+            layer: hipfire_config::load_env_layer()?,
+        },
+    ])?;
+    println!("{}", serde_json::to_string_pretty(&kvmem_check_report(args, &global)?)?);
+    Ok(())
+}
+
 pub(crate) fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
     let (_, resolved) = resolved_global(paths, true)?;
+    // Reject invalid KVMem policy before model parsing or detached startup.
+    let process = hipfire_config::ProcessConfig::from_resolved_with_kvmem(&resolved, &args.kvmem.raw_map())?;
+    if process.kvmem.as_ref().is_some_and(|config| config.enabled)
+        && !config_bool(&resolved, "serve.multi_slot")?
+    {
+        bail!("UNSUPPORTED: Legacy KVMem requires the multi-slot native owner; set serve.multi_slot=true (standard serving cannot consume this policy)");
+    }
     let default_host = config_string(&resolved, "serve.host")?;
     let default_port = config_u64(&resolved, "serve.port")? as u16;
     let (host, port, positional_model) =
@@ -1541,6 +1598,7 @@ fn detached_serve_command(executable: &Path, args: &ServeArgs, host: &str, port:
         .arg(host)
         .arg(port.to_string())
         .arg("--foreground-child");
+    args.kvmem.append_child_args(&mut command);
     if args.no_prewarm {
         command.arg("--no-prewarm");
     }
@@ -1802,7 +1860,9 @@ pub(crate) fn serve_foreground(
     // process config. Apply the CLI overrides there rather than in the load
     // request, so a direct `--swap-*` and the matching schema key cannot
     // diverge and the values survive every respawn.
-    let mut process_config = hipfire_config::ProcessConfig::from_resolved(&global)?;
+    let mut process_config = hipfire_config::ProcessConfig::from_resolved_with_kvmem(
+        &global, &args.kvmem.raw_map(),
+    )?;
     if let Some(bytes) = args.swap_host_bytes {
         process_config
             .values
@@ -3426,6 +3486,109 @@ mod tests {
             panic!("expected serve command")
         };
         args
+    }
+
+    #[test]
+    fn kvmem_cli_config_jsonl_and_detach_roundtrip() {
+        let args = parse_serve_args(&[
+            "hipfire", "serve", "--detach", "--kvmem",
+            "--kvmem-budget", "08193", "--kvmem-gen-reserve", "1153",
+            "--kvmem-sink-tokens", "129", "--kvmem-recent-tokens", "257",
+            "--kvmem-host-mib", "256", "--kvmem-disk-mib", "512",
+            "--kvmem-disk-path", "/not accessed/a path", "--kvmem-sessions", "2",
+            "--kvmem-cache-min-tokens", "0", "--kvmem-block-tokens", "128",
+            "--kvmem-recall-strategy", "legacy", "--kvmem-query-scorer", "meanq-cosine",
+            "--kvmem-score-agg", "mean", "--kvmem-lrfu", "--kvmem-lrfu-lambda", "0.25",
+            "--kvmem-lrfu-top-frac", "0.8", "--kvmem-graph-alpha", "0",
+            "--kvmem-query-max-tokens", "17", "--kvmem-query-replay-max-tokens", "33",
+        ]);
+        let global = hipfire_config::resolve(Vec::<hipfire_config::NamedLayer>::new()).unwrap();
+        let process = hipfire_config::ProcessConfig::from_resolved_with_kvmem(&global, &args.kvmem.raw_map()).unwrap();
+        let command = detached_serve_command(Path::new("hipfire"), &args, "127.0.0.1", 11435);
+        let child = reparse_child(&command_args(&command));
+        assert_eq!(args.kvmem.raw_map(), child.kvmem.raw_map());
+        let child_process = hipfire_config::ProcessConfig::from_resolved_with_kvmem(&global, &child.kvmem.raw_map()).unwrap();
+        assert_eq!(child_process, process);
+        let wire = serde_json::json!({ "type": "configure", "config": child_process });
+        let roundtrip: hipfire_config::ProcessConfig = serde_json::from_value(wire["config"].clone()).unwrap();
+        roundtrip.validate().unwrap();
+        assert_eq!(roundtrip, process);
+        let config = process.kvmem.unwrap();
+        assert_eq!((config.budget_tokens, config.gen_reserve_tokens, config.sink_tokens, config.recent_tokens), (8192, 1152, 128, 256));
+        assert_eq!(config.report["budget_tokens"].requested, "08193");
+        assert_eq!(config.report["budget_tokens"].source, hipfire_config::kvmem::Source::Cli);
+        assert_eq!(config.query_max_tokens, 17);
+        assert_eq!(config.query_replay_max_tokens, 33);
+    }
+
+    #[test]
+    fn kvmem_negative_switches_and_absence_survive_detach() {
+        for argv in [
+            vec!["hipfire", "serve", "--no-kvmem", "--no-kvmem-lrfu"],
+            vec!["hipfire", "serve"],
+            vec!["hipfire", "serve", "--kvmem-budget", "8192", "--no-kvmem-lrfu"],
+        ] {
+            let args = parse_serve_args(&argv);
+            let child = reparse_child(&command_args(&detached_serve_command(Path::new("hipfire"), &args, "127.0.0.1", 11435)));
+            assert_eq!(args.kvmem.raw_map(), child.kvmem.raw_map());
+        }
+    }
+
+    #[test]
+    fn kvmem_check_is_model_free_and_keeps_invalid_lexemes_for_the_resolver() {
+        let global = hipfire_config::resolve(Vec::<hipfire_config::NamedLayer>::new()).unwrap();
+        let args = parse_serve_args(&["hipfire", "serve", "--kvmem-check", "--detach"]);
+        assert!(args.model.is_none() && args.positionals.is_empty());
+        let report = kvmem_check_report(&args.kvmem, &global).unwrap();
+        assert_eq!(report["config"]["enabled"], false);
+        assert_eq!(report["capabilities"]["block_tokens"], serde_json::json!([128]));
+        // Even explicit bogus model text is not resolved by the check seam.
+        let args = parse_serve_args(&["hipfire", "serve", "missing-model", "--kvmem-check", "--kvmem"]);
+        assert!(kvmem_check_report(&args.kvmem, &global).is_ok());
+        for bad in ["0", "-1", "", "2147483648", "1.5", "invalid"] {
+            let args = parse_serve_args(&["hipfire", "serve", "--kvmem-check", "--kvmem-budget", bad]);
+            assert_eq!(args.kvmem.raw_map()["--kvmem-budget"], bad);
+            assert!(kvmem_check_report(&args.kvmem, &global).is_err());
+        }
+        assert!(Cli::try_parse_from(["hipfire", "serve", "--kvmem", "--no-kvmem"]).is_err());
+        assert!(Cli::try_parse_from(["hipfire", "serve", "--kvmem-lrfu", "--no-kvmem-lrfu"]).is_err());
+        assert!(Cli::try_parse_from(["hipfire", "serve", "--kvmem-unknown"]).is_err());
+    }
+
+    #[test]
+    fn kvmem_retired_storage_argv_errors_are_scoped_to_serve() {
+        for flag in hipfire_config::kvmem::RETIRED_STORAGE_FLAGS {
+            for value in [flag.to_string(), format!("{flag}=1")] {
+                let argv = ["hipfire".into(), "serve".into(), value.into()];
+                let error = crate::validate_kvmem_storage_args(&argv).unwrap_err().to_string();
+                assert!(error.contains("retired") && error.contains("--kvmem-disk-path"));
+            }
+        }
+        crate::validate_kvmem_storage_args(&["hipfire".into(), "run".into(), "--kvmem-nvme-gb".into()]).unwrap();
+    }
+
+    #[test]
+    fn kvmem_cli_beats_env_and_developer_snapshot_before_validation() {
+        let mut developer = hipfire_config::ConfigLayer::default();
+        developer.set_cli("developer.kvmem_budget_tokens", "2048").unwrap();
+        developer.set_cli("developer.kvmem_recent_blocks", "2").unwrap();
+        let mut environment = hipfire_config::ConfigLayer::default();
+        environment.set_cli("developer.kvmem_budget_tokens", "invalid-shadowed-input").unwrap();
+        environment.set_cli("developer.kvmem_host_bytes", "17179869184").unwrap();
+        let global = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser { path: PathBuf::from("/not-read/config.toml") }, layer: developer,
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::LegacyEnv { name: "HIPFIRE_*".into() }, layer: environment,
+            },
+        ]).unwrap();
+        let args = parse_serve_args(&["hipfire", "serve", "--kvmem-budget", "4097"]);
+        let process = hipfire_config::ProcessConfig::from_resolved_with_kvmem(&global, &args.kvmem.raw_map()).unwrap();
+        let c = process.kvmem.unwrap();
+        assert_eq!((c.budget_tokens, c.recent_tokens, c.host_bytes), (4096, 256, 17179869184));
+        assert_eq!(c.report["host_bytes"].source, hipfire_config::kvmem::Source::Environment);
+        assert_eq!(c.report["recent_tokens"].source, hipfire_config::kvmem::Source::Developer);
     }
 
     #[test]

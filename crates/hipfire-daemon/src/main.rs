@@ -793,10 +793,15 @@ fn report_gpu_init_failure(err: &hip_bridge::HipError) {
 /// the KFD topology before any GPU runtime initializes. `claim` reserves each
 /// resolved card as part of that same step.
 fn install_process_config(
-    config: hipfire_config::ProcessConfig,
+    mut config: hipfire_config::ProcessConfig,
     claim: &mut hipfire_config::devices::ClaimFn<'_>,
 ) -> Result<(), String> {
-    config.validate().map_err(|error| error.to_string())?;
+    // Older clients carry only developer values. Resolve that snapshot, never
+    // ambient env, before native initialization; env-only Layerwise stays None.
+    config.resolve_missing_kvmem().map_err(|error| error.to_string())?;
+    if config.kvmem.as_ref().is_some_and(|kvmem| kvmem.enabled) && !cfg!(feature = "kvmem") {
+        return Err("UNSUPPORTED: enabled KVMem requires a daemon built with the kvmem feature".into());
+    }
     let selection = hipfire_config::devices::apply_device_visibility(&config, claim)
         .map_err(|error| error.to_string())?;
     match &selection {
@@ -1080,8 +1085,9 @@ fn main() {
     if acknowledge_config {
         writeln!(
             stdout,
-            r#"{{"type":"configured","schema_version":{}}}"#,
-            hipfire_config::CONFIG_SCHEMA_VERSION
+            r#"{{"type":"configured","schema_version":{},"kvmem_contract_version":{}}}"#,
+            hipfire_config::CONFIG_SCHEMA_VERSION,
+            hipfire_config::kvmem::CONTRACT_VERSION
         )
         .unwrap_or_else(|error| {
             eprintln!("FATAL: failed to acknowledge process configuration: {error}");
@@ -1350,6 +1356,17 @@ fn main() {
                     .and_then(|p| p.get("experimental_multi_slot"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                if hipfire_config::active_or_local_process_config().kvmem.as_ref()
+                    .is_some_and(|config| config.enabled) && !experimental_multi_slot
+                {
+                    emit_uncorrelated_error(
+                        &mut stdout, None,
+                        "UNSUPPORTED: enabled Legacy KVMem requires the multi-slot native owner; standard load cannot consume this policy",
+                        "validation", false, false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 // Omitted max_seq is resolved from model metadata and card
                 // capacity by source admission. Explicit zero still refuses
                 // before teardown (the fixed slot owner retains its 4096 default).

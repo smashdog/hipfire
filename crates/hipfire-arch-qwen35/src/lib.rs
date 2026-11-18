@@ -126,6 +126,15 @@ pub mod kvmem_prefix;
 /// logic; no engine call site yet (additive, byte-neutral).
 #[cfg(feature = "kvmem")]
 pub mod kvmem_media;
+/// Host-only bounded user Query capture and single-use Legacy replay state.
+#[cfg(feature = "kvmem")]
+pub mod legacy_query;
+/// NInfer-backed immutable inactive-history directory (no GPU page ownership).
+#[cfg(feature = "kvmem")]
+pub mod legacy_catalog;
+/// Native Legacy MTP/DFlash images paired with the target's recovery frontier.
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+pub mod legacy_draft;
 /// Layerwise Q8 packed-page layout adapter (Phase 3.2 ①地基): bridges hipfire Q8
 /// geometry to the core generic `PayloadLayout` manifest + the crate-agnostic
 /// packed arena. Clean sibling to `kvmem_ctl`; not wired into live serve in ①.

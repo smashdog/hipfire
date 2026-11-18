@@ -614,7 +614,7 @@ for line in sys.stdin:
     log_req(req)
     ty = req.get("type")
     if ty == "configure":
-        out({"type": "configured"})
+        out({"type": "configured", "kvmem_contract_version": 1})
     elif ty == "ping":
         out({"type": "pong"})
     elif ty == "load":

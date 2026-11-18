@@ -66,6 +66,15 @@ fn kvmem_requested() -> Result<bool, String> {
 
 #[cfg(not(feature = "kvmem"))]
 fn kvmem_requested() -> Result<bool, String> {
+    if let Some(config) = hipfire_config::active_process_config()
+        .and_then(|process| process.kvmem.as_ref())
+    {
+        return if config.enabled {
+            Err("KVMem requires a worker built with the kvmem feature".into())
+        } else {
+            Ok(false)
+        };
+    }
     match hipfire_config::developer_var("HIPFIRE_KVMEM")
         .ok()
         .map(|v| v.trim().to_string())
@@ -92,6 +101,107 @@ fn kvmem_enabled(rig: &Rig) -> bool {
     {
         let _ = rig;
         false
+    }
+}
+
+/// The public Legacy lifecycle is independent of the existing Layerwise
+/// executor. In particular, its continuation proof must cover the client's
+/// complete rendered history, not only the user-turn candidate index.
+fn kvmem_legacy_enabled(rig: &Rig) -> bool {
+    #[cfg(feature = "kvmem")]
+    {
+        rig.model
+            .kvmem
+            .as_ref()
+            .is_some_and(|ctl| !ctl.strategy().is_layerwise())
+    }
+    #[cfg(not(feature = "kvmem"))]
+    {
+        let _ = rig;
+        false
+    }
+}
+
+/// Conversation hashes locate candidates; only exact accepted tokens prove
+/// reuse. Include the final accepted-but-not-yet-materialized token too: a
+/// changed assistant/tool suffix must not inherit an earlier recurrent state.
+fn legacy_continuation_matches(accepted: &[u32], rendered: &[u32]) -> bool {
+    !accepted.is_empty() && rendered.starts_with(accepted)
+}
+
+/// KVMem-observability: locate and report where the freshly rendered prompt
+/// stops matching the session's accepted token stream. Split token-level
+/// divergence from text-level divergence: identical decoded text means the
+/// stored generation re-encoded to a non-canonical (sampled) segmentation.
+/// Only called under `HIPFIRE_SLOT_TRACE=1`.
+fn trace_continuation_divergence(
+    tokenizer: &Tokenizer,
+    label: &str,
+    accepted: &[u32],
+    rendered: &[u32],
+) {
+    let first_tok = accepted
+        .iter()
+        .zip(rendered.iter())
+        .position(|(a, b)| a != b)
+        .or_else(|| (accepted.len() != rendered.len()).then(|| accepted.len().min(rendered.len())));
+    let accepted_text = tokenizer.decode(accepted);
+    let rendered_text = tokenizer.decode(rendered);
+    let canonical = tokenizer.encode(&accepted_text);
+    eprintln!(
+        "[kvmem-prefix] {label}: accepted={} rendered={} first_token_div={:?} accepted_roundtrips={}",
+        accepted.len(),
+        rendered.len(),
+        first_tok,
+        canonical.as_slice() == accepted,
+    );
+    if let Some(i) = first_tok {
+        let lo = i.saturating_sub(3);
+        eprintln!(
+            "[kvmem-prefix]   tokens: accepted[{lo}..]={:?} rendered[{lo}..]={:?}",
+            accepted.get(lo..(i + 6).min(accepted.len())),
+            rendered.get(lo..(i + 6).min(rendered.len())),
+        );
+    }
+    let a_chars: Vec<char> = accepted_text.chars().collect();
+    let r_chars: Vec<char> = rendered_text.chars().collect();
+    let first_char = a_chars
+        .iter()
+        .zip(r_chars.iter())
+        .position(|(a, b)| a != b)
+        .or_else(|| (a_chars.len() != r_chars.len()).then(|| a_chars.len().min(r_chars.len())));
+    let window = |chars: &[char], at: usize| {
+        let lo = at.saturating_sub(70);
+        let hi = (at + 90).min(chars.len());
+        chars[lo..hi].iter().collect::<String>()
+    };
+    match first_char {
+        None => eprintln!("[kvmem-prefix]   decoded text identical"),
+        Some(at) => eprintln!(
+            "[kvmem-prefix]   text diverges at char {at} (len {} vs {}):\n    accepted: {:?}\n    rendered: {:?}",
+            a_chars.len(),
+            r_chars.len(),
+            window(&a_chars, at),
+            window(&r_chars, at),
+        ),
+    }
+}
+
+/// A live VL session may only be extended when the request's current image is
+/// the same media the session's prefix was built from. Token ids cannot
+/// distinguish two images (their `image_pad` runs are identical), so the
+/// sticky content digest is the only safe gate. A text follow-up carries no
+/// new image and inherits the session's digest unchanged.
+fn media_continuation_matches(
+    session: &hipfire_runtime::session_table::Session,
+    visual: Option<&hipfire_runtime::serve::VisualData>,
+) -> bool {
+    if !session.has_image {
+        return true;
+    }
+    match visual.map(|vd| vd.media_digest()) {
+        Some(digest) => session.media_digest.is_none_or(|held| held == digest),
+        None => true,
     }
 }
 
@@ -144,11 +254,25 @@ enum EngineCommand {
     Reset {
         reply: Sender<Result<(), String>>,
     },
+    /// Cooperative in-turn pass termination (think-recovery): end the
+    /// CURRENT pass of `session` at the next token boundary but keep the
+    /// session's KV resident, so the daemon can immediately start a
+    /// continuation pass against the accepted prefix. The engine reports
+    /// `Done { reason: MaxTokens }` for the interrupted pass; the daemon
+    /// distinguishes it from a real budget exhaustion by the request it
+    /// sent. No-op when the session has no in-flight slot (already done,
+    /// parked, or unknown) — interruption is advisory, not synchronous.
+    Interrupt {
+        session: u64,
+    },
 }
 
 #[derive(Clone)]
 pub struct EngineConfig {
     pub model_path: PathBuf,
+    /// Resolved public KVMem contract carried by the daemon configure message.
+    /// None retains the existing non-public/Layerwise configuration route.
+    pub kvmem: Option<hipfire_config::kvmem::ResolvedConfig>,
     pub n_slots: usize,
     pub cap_tokens: usize,
     /// Prefill tokens taken from one slot per step. Bounds the batch scratch
@@ -278,6 +402,17 @@ impl SlotEngine {
         }
     }
 
+    /// Ask the engine to end the CURRENT pass of `session` at the next token
+    /// boundary while keeping its KV resident (think-recovery pass loop).
+    /// Fire-and-forget: the daemon observes the pass end through the request's
+    /// `Done { reason: MaxTokens }` event. Idempotent and safe to call for a
+    /// session that is already done (no-op).
+    pub fn interrupt(&self, session: u64) {
+        if let Some(tx) = self.tx.as_ref() {
+            let _ = tx.send(EngineCommand::Interrupt { session });
+        }
+    }
+
     /// Close a session synchronously. If the session is mid-generation its
     /// in-flight request is cancelled (InFlight removed, reply sender dropped,
     /// work cleared), swap forgotten and SessionTable/pool/admission closed,
@@ -358,7 +493,11 @@ impl SlotEngine {
                             st.speculative = rig.speculative_config();
                         }
                         let _ = ready_tx.send(Ok(()));
-                        run_loop(rig, rx, stats_thread)
+                        let result = run_loop(rig, rx, stats_thread);
+                        if let Err(error) = &result {
+                            eprintln!("[serve] engine loop exited: {error}");
+                        }
+                        result
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e.clone()));
@@ -419,6 +558,9 @@ impl hipfire_runtime::serve::SlotEngineHandle for SlotEngine {
     }
     fn cancel_waiting(&self, request_tag: u64) {
         SlotEngine::cancel_waiting(self, request_tag)
+    }
+    fn interrupt(&self, session: u64) {
+        SlotEngine::interrupt(self, session)
     }
     fn close(&self, session: u64) -> Result<(), String> {
         SlotEngine::close(self, session)
@@ -887,6 +1029,574 @@ fn convo_group(convo: &[u64]) -> u64 {
     h.finish()
 }
 
+#[cfg(feature = "kvmem")]
+enum LegacyDraftImage {
+    None,
+    Mtp(crate::legacy_draft::LegacyMtpImage),
+    Dflash(crate::legacy_draft::LegacyDflashImage),
+}
+
+#[cfg(feature = "kvmem")]
+struct LegacyNativeImage {
+    store: crate::kvmem_ctl::LegacyStoreSnapshot,
+    dn: Vec<u8>,
+    draft: LegacyDraftImage,
+}
+
+#[cfg(feature = "kvmem")]
+impl LegacyNativeImage {
+    fn auxiliary_bytes(&self) -> Result<usize, String> {
+        let draft = match &self.draft {
+            LegacyDraftImage::None => 0,
+            LegacyDraftImage::Mtp(image) => image.host_bytes(),
+            LegacyDraftImage::Dflash(image) => image.host_bytes(),
+        };
+        self.dn.len().checked_add(draft).ok_or_else(|| "kvmem: native image size overflow".into())
+    }
+
+    fn supports(&self, kind: SpecKind) -> bool {
+        matches!((kind, &self.draft),
+            (SpecKind::None, _) | (SpecKind::Mtp, LegacyDraftImage::Mtp(_))
+                | (SpecKind::Dflash, LegacyDraftImage::Dflash(_)))
+            || self.store.frontier == 0
+    }
+}
+
+#[cfg(feature = "kvmem")]
+struct LegacyQueryRun {
+    query: crate::legacy_query::LegacyQuery,
+    source: Option<LegacyNativeImage>,
+    scores: Option<Vec<f64>>,
+    kind: SpecKind,
+}
+
+#[cfg(feature = "kvmem")]
+fn capture_legacy_native_image(rig: &mut Rig, slot: usize, kind: SpecKind) -> Result<LegacyNativeImage, String> {
+    rig.gpu.hip.device_synchronize().map_err(|e| format!("kvmem snapshot drain: {e}"))?;
+    let ctl = rig.model.kvmem.as_mut().ok_or("kvmem: snapshot without controller")?;
+    let frontier = ctl.fed_tokens(slot).ok_or("kvmem: snapshot slot out of range")? as usize;
+    let dn = crate::speculative::DeltaNetSnapshot::export_host_from_state(
+        &rig.gpu, &rig.model.dn_states[slot],
+    )?;
+    let draft = if frontier == 0 {
+        LegacyDraftImage::None
+    } else {
+        match kind {
+            SpecKind::None => LegacyDraftImage::None,
+            SpecKind::Mtp => LegacyDraftImage::Mtp(crate::legacy_draft::LegacyMtpImage::capture(
+                &rig.gpu, rig.model.mtp_states[slot].as_ref().ok_or("kvmem: missing MTP history at snapshot")?, frontier,
+            )?),
+            SpecKind::Dflash => {
+                // A checkpoint/image is taken at a prefill boundary, never in
+                // the middle of a speculative verify round. Any retained draft
+                // rows are the previous round's request-local rollback scratch
+                // and must not be frozen into (or block) the published image.
+                if let Some(st) = rig.model.dflash_states[slot].as_mut() {
+                    crate::dflash_slot::dflash_abandon_inflight(&mut rig.gpu, st);
+                }
+                LegacyDraftImage::Dflash(crate::legacy_draft::LegacyDflashImage::capture(
+                    &rig.gpu, rig.model.dflash.as_ref().ok_or("kvmem: missing DFlash model")?,
+                    rig.model.dflash_states[slot].as_ref().ok_or("kvmem: missing DFlash history at snapshot")?,
+                    frontier, 0,
+                )?)
+            }
+        }
+    };
+    let store = ctl.capture_legacy_snapshot(
+        &rig.gpu, &rig.pool, &rig.model.k_arenas, &rig.model.v_arenas, slot,
+    )?;
+    eprintln!("[kvmem-legacy] capture slot={slot} frontier={frontier} payload_bytes={} dn_bytes={} spec={kind:?}", store.payload_bytes(), dn.len());
+    Ok(LegacyNativeImage { store, dn, draft })
+}
+
+/// Park a finished session's native state in the inactive-history catalog so
+/// a later request whose complete rendered prompt extends it can restore
+/// instead of re-prefilling (`Sessions` = non-active histories). Called while
+/// the slot is still intact, right before its session is closed: after the
+/// close the parked image is the only owner of this frontier, so the catalog
+/// charge is the real host cost (KV payload + recurrent bytes), not a
+/// duplicate of a resident store.
+#[cfg(feature = "kvmem")]
+fn park_legacy_history(rig: &mut Rig, session: SessionId) -> Result<Option<u64>, String> {
+    if !kvmem_legacy_enabled(rig) || rig.legacy_history.is_none() {
+        return Ok(None);
+    }
+    let Some(sess) = rig.sessions.get(session) else { return Ok(None) };
+    if sess.tokens.is_empty() {
+        return Ok(None);
+    }
+    let Some(slot) = sess.slot else { return Ok(None) };
+    let tokens = sess.tokens.clone();
+    // A VL history is parked with the session's sticky media digest. The
+    // catalog then refuses it for any request whose current image digest
+    // differs, so two images with identical `image_pad` token ids can never
+    // share a restored prefix.
+    let media = sess.media_digest.filter(|_| sess.has_image);
+    // Catalog group is the conversation identity: several parked versions of
+    // the same chat (different turn counts) must contend as versions of one
+    // group. The first user turn is the stable root of a rendered conversation;
+    // an empty convo has no identity, so fall back to a nonzero per-session
+    // group. Group 0 is reserved for "unknown".
+    let mut group = convo_group(&sess.convo[..sess.convo.len().min(1)]);
+    if group == 0 {
+        group = session.0.checked_add(1).ok_or("kvmem: history group overflow")?;
+    }
+    // Park with the spec provenance the slot actually ran: a draft-less image
+    // can only be reused by a draft-less request, so dropping a live MTP/DFlash
+    // image would make the parked history unusable under the default config.
+    // The idle slot's work entry was cleared at Done, but the draft states
+    // persist, so the capture either proves its native frontier or reports a
+    // miss (then the target-only image is parked).
+    let run_kind = rig.legacy_spec_kind[slot.0];
+    if run_kind == SpecKind::Dflash {
+        // The idle slot may still hold the last cycle's unconsumed draft
+        // (request-local scratch). Park only the published conditioning state.
+        if let Some(st) = rig.model.dflash_states[slot.0].as_mut() {
+            crate::dflash_slot::dflash_abandon_inflight(&mut rig.gpu, st);
+        }
+    }
+    let image = match capture_legacy_native_image(rig, slot.0, run_kind) {
+        Ok(image) => image,
+        Err(e) => {
+            eprintln!(
+                "[kvmem-legacy] HistoryPark slot={} draft capture ({run_kind:?}) failed: {e}",
+                slot.0
+            );
+            match capture_legacy_native_image(rig, slot.0, SpecKind::None) {
+                Ok(image) => image,
+                Err(e) => {
+                    eprintln!("[kvmem-legacy] HistoryPark slot={} skipped: {e}", slot.0);
+                    return Ok(None);
+                }
+            }
+        }
+    };
+    if image.store.frontier == 0 {
+        return Ok(None);
+    }
+    let charge = usize::try_from(image.store.payload_bytes())
+        .ok()
+        .and_then(|bytes| bytes.checked_add(image.auxiliary_bytes().ok()?))
+        .ok_or("kvmem: history image size overflow")?;
+    let source = image.store.frontier as usize;
+    let payload = image.store.payload_bytes();
+    let catalog = rig.legacy_history.as_mut().ok_or("kvmem: catalog vanished")?;
+    let publication = match catalog.publish(
+        session.0,
+        group,
+        tokens,
+        source,
+        media,
+        charge,
+        std::rc::Rc::new(image),
+    ) {
+        Ok(publication) => publication,
+        Err(e) => {
+            eprintln!("[kvmem-legacy] HistoryPark session={} skipped: {e}", session.0);
+            return Ok(None);
+        }
+    };
+    for retired in &publication.retired {
+        eprintln!(
+            "[kvmem-legacy] HistoryRetire id={} source_session={}",
+            retired.id, retired.source_session
+        );
+    }
+    eprintln!(
+        "[kvmem-legacy] HistoryPark id={} session={} frontier={} charge_bytes={charge} kv_bytes={payload} catalog_entries={}",
+        publication.id,
+        session.0,
+        source,
+        catalog.len()
+    );
+    Ok(Some(publication.id))
+}
+
+/// Restore target and draft as one execution frontier. The source stays owned
+/// by its caller; any error invalidates this destination before more inference.
+#[cfg(feature = "kvmem")]
+fn restore_legacy_native_image(
+    rig: &mut Rig, slot: usize, session: u64, source: &LegacyNativeImage,
+    selected: &[u32], kind: SpecKind,
+) -> Result<u64, String> {
+    if !source.supports(kind) {
+        return Err(format!("kvmem: cached source has no complete {kind:?} history"));
+    }
+    rig.gpu.hip.device_synchronize().map_err(|e| format!("kvmem restore drain: {e}"))?;
+    // Decode the recurrent image into a private temporary first. Invalid image
+    // shape/length cannot partially overwrite the live recurrent state.
+    let mut snapshot = crate::speculative::DeltaNetSnapshot::new_for(
+        &mut rig.gpu, &rig.model.dn_states[slot],
+    ).map_err(|e| format!("kvmem restore DN scratch: {e}"))?;
+    let result = (|| {
+        snapshot.import_host(&rig.gpu, &source.dn)?;
+        let bytes = rig.model.kvmem.as_mut().ok_or("kvmem: restore without controller")?
+            .restore_legacy_snapshot(
+                &rig.gpu, &mut rig.pool, &rig.model.k_arenas, &rig.model.v_arenas,
+                slot, &source.store, selected,
+            )?;
+        snapshot.restore_to(&mut rig.model.dn_states[slot], &mut rig.gpu)
+            .map_err(|e| format!("kvmem restore DN: {e}"))?;
+        if source.store.frontier == 0 {
+            if let Some(state) = rig.model.mtp_states[slot].as_mut() {
+                state.reset(&mut rig.gpu).map_err(|e| format!("kvmem zero-frontier MTP reset: {e}"))?;
+            }
+            if let Some(state) = rig.model.dflash_states[slot].take() {
+                state.free_gpu(&mut rig.gpu);
+            }
+        } else {
+            match (&source.draft, kind) {
+                (LegacyDraftImage::Mtp(image), SpecKind::Mtp) => image.restore(
+                    &mut rig.gpu,
+                    rig.model.mtp_states[slot].as_mut().ok_or("kvmem: missing destination MTP state")?,
+                    source.store.frontier as usize,
+                )?,
+                (LegacyDraftImage::Dflash(image), SpecKind::Dflash) => {
+                    // Cold admission frees the previous occupant's draft state;
+                    // allocate the empty destination the same way the first
+                    // prefill chunk would, then let the image reinstate it.
+                    if rig.model.dflash_states[slot].is_none() {
+                        let st = crate::dflash_slot::new_dflash_slot_state(
+                            &mut rig.gpu,
+                            rig.model
+                                .dflash
+                                .as_ref()
+                                .ok_or("kvmem: missing destination DFlash model")?,
+                            &rig.model.config,
+                            &rig.model.dn_states[slot],
+                        )
+                        .map_err(|e| format!("kvmem restore DFlash state alloc: {e}"))?;
+                        rig.model.dflash_states[slot] = Some(st);
+                    }
+                    image.restore(
+                        &mut rig.gpu,
+                        rig.model.dflash.as_ref().ok_or("kvmem: missing destination DFlash model")?,
+                        rig.model.dflash_states[slot].as_mut().ok_or("kvmem: missing destination DFlash state")?,
+                        session,
+                        source.store.frontier as usize,
+                    )?
+                }
+                (_, SpecKind::None) => {
+                    // A non-zero frontier can be restored without a native
+                    // draft image (the catalog parks store+DN only), but the
+                    // destination's draft state then carries another
+                    // request's history. NInfer restores a draft only from a
+                    // matching serialized image; anything else is reset, not
+                    // reused.
+                    if let Some(state) = rig.model.mtp_states[slot].as_mut() {
+                        state
+                            .reset(&mut rig.gpu)
+                            .map_err(|e| format!("kvmem draftless-restore MTP reset: {e}"))?;
+                    }
+                    if let Some(state) = rig.model.dflash_states[slot].take() {
+                        state.free_gpu(&mut rig.gpu);
+                    }
+                }
+                _ => return Err("kvmem: native draft image kind mismatch".into()),
+            }
+        }
+        if hipfire_config::developer_bool("HIPFIRE_KVMEM_VERIFY", false) {
+            let actual = crate::speculative::DeltaNetSnapshot::export_host_from_state(
+                &rig.gpu, &rig.model.dn_states[slot],
+            )?;
+            if actual != source.dn { return Err("kvmem: recurrent/conv native image readback mismatch".into()); }
+            eprintln!("[kvmem-verify] restore slot={slot} frontier={} dn_bytes={} recurrent_conv_mismatch=0", source.store.frontier, source.dn.len());
+        }
+        Ok(bytes)
+    })();
+    snapshot.free_gpu(&mut rig.gpu);
+    result
+}
+
+#[cfg(feature = "kvmem")]
+fn prepare_legacy_query_checkpoints(
+    rig: &mut Rig, slots: &[Option<InFlight>], work: &[PendingWork],
+) -> Result<Vec<usize>, String> {
+    let mut caps = vec![usize::MAX; work.len()];
+    if !rig.model.kvmem.as_ref().is_some_and(|c| c.legacy_config().is_some()) {
+        return Ok(caps);
+    }
+    for slot in 0..work.len() {
+        if slots[slot].is_none() || work[slot].decoding { continue; }
+        if rig.legacy_queries[slot].is_none() && !rig.legacy_query_decided[slot] {
+            let ctl = rig.model.kvmem.as_ref().unwrap();
+            let end = work[slot].next_pos.checked_add(work[slot].remaining_prompt.len())
+                .ok_or("kvmem: prompt end overflow")?;
+            match ctl.legacy_query_for_request(slot, ctl.request_query(slot), end)? {
+                Some(query) => {
+                    rig.legacy_queries[slot] = Some(LegacyQueryRun {
+                        query, source: None, scores: None, kind: work[slot].spec,
+                    });
+                }
+                None => {
+                    // No recall for this request (no recoverable history, the
+                    // query sits at the accepted frontier, or a checkpoint is
+                    // impossible). Latch the decision: retrying after the
+                    // frontier advanced would build a Query that crosses
+                    // already-accepted rows and abort the request.
+                    rig.legacy_query_decided[slot] = true;
+                }
+            }
+        }
+        let due = rig.legacy_queries[slot].as_ref()
+            .is_some_and(|run| run.query.checkpoint_due(work[slot].next_pos));
+        if due {
+            let kind = rig.legacy_queries[slot].as_ref().unwrap().kind;
+            let capture = capture_legacy_native_image(rig, slot, kind);
+            let run = rig.legacy_queries[slot].as_mut().unwrap();
+            match capture {
+                Ok(image) if image.store.frontier as usize == run.query.restore_begin() => {
+                    run.source = Some(image);
+                    run.query.checkpoint_captured()?;
+                }
+                Ok(image) => {
+                    // A frontier mismatch means the native owner is not at the
+                    // recovery point this Query needs. Recall is optional; the
+                    // intact first pass stays authoritative.
+                    let reason = format!(
+                        "checkpoint_frontier {} != recovery point {}",
+                        image.store.frontier,
+                        run.query.restore_begin()
+                    );
+                    run.query.bypass(&reason)?;
+                    eprintln!("[kvmem-legacy] QueryBypass slot={slot} reason={reason} first_pass_preserved=true");
+                }
+                Err(error) => {
+                    // Nothing restored or published: the live first-pass view
+                    // remains authoritative, matching NInfer's optional-source
+                    // materialization failure path.
+                    let reason = format!("checkpoint_unavailable: {error}");
+                    run.query.bypass(&reason)?;
+                    eprintln!("[kvmem-legacy] QueryBypass slot={slot} reason={reason} first_pass_preserved=true");
+                }
+            }
+        }
+        if let Some(run) = rig.legacy_queries[slot].as_ref() {
+            caps[slot] = run.query.cap_prefill(
+                work[slot].next_pos, work[slot].remaining_prompt.len().min(rig.prefill_chunk),
+            );
+        }
+    }
+    Ok(caps)
+}
+
+/// Outcome of the post-probe Query policy evaluation.
+#[cfg(feature = "kvmem")]
+enum LegacyQueryDecision {
+    /// Keep the intact first pass. Publish the score round only when one was
+    /// actually scored (a refused selection produced none).
+    Skip { reason: String, scores: Option<Vec<f64>> },
+    /// Admitted: the destructive rewind is allowed and required.
+    Replay {
+        selected: Vec<u32>,
+        scores: Vec<f64>,
+        plan: hipfire_kvmem::LegacyReplayPlan,
+    },
+}
+
+/// Decide what a completed Query probe does, mirroring NInfer: score the
+/// pre-Query history, then admit a full causal replay only when the window
+/// actually needed recall (cold pages or prompt+workspace beyond the resident
+/// window) and the core plan admits the span. Refusals never disturb the
+/// first pass.
+#[cfg(feature = "kvmem")]
+fn plan_legacy_query_replay(
+    rig: &Rig, run: &mut LegacyQueryRun,
+) -> Result<LegacyQueryDecision, String> {
+    let Some(control) = rig.model.kvmem.as_ref() else {
+        return Ok(LegacyQueryDecision::Skip { reason: "controller_missing".into(), scores: None });
+    };
+    let Some(source) = run.source.as_ref() else {
+        return Ok(LegacyQueryDecision::Skip { reason: "checkpoint_missing".into(), scores: None });
+    };
+    let range = run.query.query();
+    if range.begin == 0 {
+        // NInfer requires history in front of the Query; nothing to recall.
+        return Ok(LegacyQueryDecision::Skip { reason: "query_at_frontier".into(), scores: None });
+    }
+    let (selected, scores) = match control.select_legacy_query(&source.store, &run.query) {
+        Ok(result) => result,
+        Err(e) => {
+            return Ok(LegacyQueryDecision::Skip {
+                reason: format!("selection_refused: {e}"),
+                scores: None,
+            })
+        }
+    };
+    let prompt_end = run.query.prompt_end() as u64;
+    let restore_begin = run.query.restore_begin() as u64;
+    let window_tokens = control.window_capacity_tokens();
+    let device_pages = control.budget_blocks() as u64 + control.gen_reserve().div_ceil(128u64);
+    let history_pages = restore_begin.div_ceil(128u64).min(control.budget_blocks() as u64);
+    let workspace = if run.kind.active() { rig.model.spec_rows as u64 } else { 0 };
+    // `resident_pages` counts accepted pages with a live physical binding; the
+    // token estimate over-counts a partial tail, so "spilled" is conservative.
+    let resident_tokens = source.store.resident_pages.len() as u64 * 128;
+    let needs_recall = resident_tokens < restore_begin
+        || prompt_end.saturating_add(workspace) > window_tokens;
+    if !needs_recall {
+        // The whole context is resident: a rewind would recreate the same view.
+        return Ok(LegacyQueryDecision::Skip { reason: "window_resident".into(), scores: Some(scores) });
+    }
+    let plan = match run.query.replay_plan(
+        history_pages,
+        device_pages,
+        workspace.min(u32::MAX as u64) as u32,
+    ) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return Ok(LegacyQueryDecision::Skip {
+                reason: format!("plan_error: {e}"),
+                scores: Some(scores),
+            })
+        }
+    };
+    if !plan.admitted {
+        return Ok(LegacyQueryDecision::Skip {
+            reason: format!("replay_refused: {}", plan.reason),
+            scores: Some(scores),
+        });
+    }
+    Ok(LegacyQueryDecision::Replay { selected, scores, plan })
+}
+
+/// One Query decision per iteration, after the step's accepted rows are fed.
+/// Probe completion is measured at the accepted native frontier. A refused or
+/// pointless replay keeps the intact first pass and still publishes the score
+/// round exactly once; a replayed query publishes it once after the replay
+/// reaches the prompt end again (the restore rolled LRFU back to pre-Query).
+#[cfg(feature = "kvmem")]
+fn advance_legacy_query_replay(
+    rig: &mut Rig,
+    slots: &[Option<InFlight>],
+    work: &mut [PendingWork],
+    rewound: &mut [bool],
+) -> Result<(), String> {
+    use crate::legacy_query::LegacyQueryPhase;
+    for s in 0..work.len() {
+        let phase = match rig.legacy_queries[s].as_ref() {
+            None => continue,
+            Some(run) => run.query.phase(),
+        };
+        match phase {
+            LegacyQueryPhase::AwaitingCheckpoint => continue,
+            LegacyQueryPhase::Complete | LegacyQueryPhase::Bypassed => {
+                rig.legacy_queries[s] = None;
+                rig.legacy_query_decided[s] = true;
+                continue;
+            }
+            LegacyQueryPhase::Replaying => {
+                let Some(run) = rig.legacy_queries[s].as_ref() else { continue };
+                if work[s].next_pos != run.query.prompt_end() {
+                    continue;
+                }
+                let prompt_end = run.query.prompt_end();
+                let mut run = rig.legacy_queries[s].take().unwrap();
+                run.query.finish_replay(prompt_end)?;
+                let scores = match run.scores {
+                    Some(scores) => scores,
+                    None => return Err("kvmem: Query replay without recorded scores".into()),
+                };
+                let ctl = rig
+                    .model
+                    .kvmem
+                    .as_mut()
+                    .ok_or("kvmem: Query replay without controller")?;
+                ctl.commit_legacy_query(s, &scores)?;
+                eprintln!("[kvmem-legacy] QueryReplayDone slot={s} prompt_end={prompt_end}");
+                continue;
+            }
+            LegacyQueryPhase::Probing => {}
+        }
+        if slots[s].is_none() {
+            rig.legacy_queries[s] = None;
+            rig.legacy_query_decided[s] = true;
+            continue;
+        }
+        {
+            let Some(run) = rig.legacy_queries[s].as_mut() else { continue };
+            if !run.query.probe_complete(work[s].next_pos) {
+                continue;
+            }
+        }
+        let mut run = match rig.legacy_queries[s].take() {
+            Some(run) => run,
+            None => continue,
+        };
+        let decision = plan_legacy_query_replay(rig, &mut run)?;
+        match decision {
+            LegacyQueryDecision::Skip { reason, scores } => {
+                if let Some(scores) = scores {
+                    let ctl = rig
+                        .model
+                        .kvmem
+                        .as_mut()
+                        .ok_or("kvmem: Query commit without controller")?;
+                    ctl.commit_legacy_query(s, &scores)?;
+                }
+                eprintln!("[kvmem-legacy] QuerySkip slot={s} reason={reason} first_pass_preserved=true");
+                rig.legacy_query_decided[s] = true;
+            }
+            LegacyQueryDecision::Replay { selected, scores, plan } => {
+                let prompt_end = run.query.prompt_end();
+                if let Err(e) = run.query.start_replay(&plan) {
+                    // Nothing destructive ran: the first pass stays authoritative.
+                    // Latch the bypass (still Probing here) so the run is retired
+                    // on the next iteration instead of silently vanishing with an
+                    // unfinished phase.
+                    let reason = format!("start_replay: {e}");
+                    run.query.bypass(&reason)?;
+                    rig.legacy_queries[s] = Some(run);
+                    eprintln!("[kvmem-legacy] QuerySkip slot={s} reason={reason} first_pass_preserved=true");
+                    continue;
+                }
+                run.scores = Some(scores);
+                let session = slots[s]
+                    .as_ref()
+                    .map(|f| f.session)
+                    .ok_or("kvmem: Query replay without an active flight")?;
+                let source = run
+                    .source
+                    .as_ref()
+                    .ok_or("kvmem: Query replay without checkpoint")?;
+                let restore_bytes = match restore_legacy_native_image(
+                    rig, s, session.0, source, &selected, run.kind,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        rig.legacy_queries[s] = None;
+                        rig.legacy_query_decided[s] = true;
+                        return Err(format!("kvmem: Query replay restore failed: {e}"));
+                    }
+                };
+                let tokens = rig
+                    .sessions
+                    .get(session)
+                    .map(|sess| sess.tokens.clone())
+                    .unwrap_or_default();
+                if tokens.len() < prompt_end {
+                    rig.legacy_queries[s] = None;
+                    rig.legacy_query_decided[s] = true;
+                    return Err(format!(
+                        "kvmem: Query replay suffix needs {prompt_end} tokens, session holds {}",
+                        tokens.len()
+                    ));
+                }
+                let begin = plan.begin as usize;
+                work[s].next_pos = begin;
+                work[s].decoding = false;
+                work[s].remaining_prompt = tokens[begin..prompt_end].to_vec();
+                rewound[s] = true;
+                rig.legacy_queries[s] = Some(run);
+                eprintln!(
+                    "[kvmem-legacy] QueryReplay slot={s} from={begin} prompt_end={prompt_end} selected={} restore_bytes={restore_bytes}",
+                    selected.len()
+                );
+            }
+        }
+    }
+    Ok(())
+}
 struct Rig {
     gpu: Gpu,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -908,6 +1618,20 @@ struct Rig {
     /// the only paged-compatible mode).
     vl_sequential: bool,
     sessions: SessionTable,
+    #[cfg(feature = "kvmem")]
+    legacy_history: Option<crate::legacy_catalog::LegacyHistoryCatalog<std::rc::Rc<LegacyNativeImage>>>, 
+    #[cfg(feature = "kvmem")]
+    legacy_queries: Vec<Option<LegacyQueryRun>>,
+    /// This request's Query decision is final: either a run was built, or
+    /// there is no recall to attempt. Cleared with `legacy_queries` at every
+    /// request/session lifecycle boundary.
+    #[cfg(feature = "kvmem")]
+    legacy_query_decided: Vec<bool>,
+    /// Spec kind the slot's last admitted request actually ran with. Parking a
+    /// history image uses it so MTP/DFlash draft state is captured too; a
+    /// draft-less image can only be reused by a draft-less request.
+    #[cfg(feature = "kvmem")]
+    legacy_spec_kind: Vec<SpecKind>,
     adm: AdmissionController,
     swap: SwapManager,
     stamp: SnapshotStamp,
@@ -1359,6 +2083,18 @@ impl Rig {
             .and_then(|v| v.parse::<usize>().ok())
             .map(|v| v.max(1).min(cfg.cap_tokens.max(1)))
             .unwrap_or(prefill_chunk);
+        let prefill_chunk = if let Some(kvmem) = cfg.kvmem.as_ref().filter(|c| c.enabled) {
+            let effective = prefill_chunk.min(kvmem.gen_reserve_tokens as usize);
+            if effective == 0 {
+                return Err("kvmem: normalized prefill and reserve must allow a native row".into());
+            }
+            if effective != prefill_chunk {
+                eprintln!("[kvmem-config] prefill requested={prefill_chunk} effective={effective} reason=reserve_limit");
+            }
+            effective
+        } else {
+            prefill_chunk
+        };
         // DFlash2 draft config pre-parse: the runtime block size B sets
         // `spec_rows` (verify rows per spec slot), which `max_batch` and the
         // verify tape are sized by — both allocated before the GPU-side
@@ -1408,7 +2144,14 @@ impl Rig {
         // the batched VL path (the legacy sequential path writes through a
         // flat slab view that paged mode cannot honour, and its single-token
         // forwards bypass the step batch the statistics taps follow).
-        let kvmem_on = kvmem_requested()?;
+        let kvmem_on = match cfg.kvmem.as_ref() {
+            Some(config) => config.enabled,
+            None => kvmem_requested()?,
+        };
+        #[cfg(not(feature = "kvmem"))]
+        if kvmem_on {
+            return Err("KVMem was requested but this worker was built without feature kvmem".into());
+        }
         // 期4: KVMem + DFlash2 validation matrix (KVMem/nInfer integration
         // pattern). Unsupported combinations are rejected at load — never a
         // silent degrade — mirroring the backend's parse/normalize checks.
@@ -1538,7 +2281,7 @@ impl Rig {
             None
         };
         #[cfg(not(feature = "kvmem"))]
-        let kvmem_checkpoint_policy = None;
+        let kvmem_checkpoint_policy: Option<(u64, u64)> = None;
         if kvmem_checkpoint_policy.is_some() {
             eprintln!(
                 "  [hipfire] KVMem checkpoint policy: spread (interval {} tokens, min_gap {})",
@@ -1563,11 +2306,29 @@ impl Rig {
         // so every slot's resident working set fits with selection headroom.
         #[cfg(feature = "kvmem")]
         let kvmem_plan = if kvmem_on {
-            Some(crate::kvmem_ctl::resolve_plan(
-                cfg.n_slots,
-                cfg.cap_tokens,
-                prefill_chunk.max(spec_rows),
-            )?)
+            Some(if let Some(config) = &cfg.kvmem {
+                let explicit_pages = hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
+                    .ok().map(|value| {
+                        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                            return Err("kvmem: HIPFIRE_SLOTS_PAGED_PAGES requires a positive decimal integer".to_string());
+                        }
+                        let pages = value.parse::<usize>()
+                            .map_err(|_| "kvmem: physical page count overflow".to_string())?;
+                        if pages == 0 || pages > i32::MAX as usize {
+                            return Err("kvmem: physical page count must be in 1..=2147483647".to_string());
+                        }
+                        Ok(pages)
+                    }).transpose()?;
+                crate::kvmem_ctl::resolve_legacy_plan(
+                    cfg.n_slots, cfg.cap_tokens, prefill_chunk.max(spec_rows),
+                    config.budget_tokens as usize, config.gen_reserve_tokens as usize,
+                    explicit_pages,
+                )?
+            } else {
+                crate::kvmem_ctl::resolve_plan(
+                    cfg.n_slots, cfg.cap_tokens, prefill_chunk.max(spec_rows),
+                )?
+            })
         } else {
             None
         };
@@ -2210,6 +2971,24 @@ impl Rig {
                 .unwrap()
                 .enable_kvmem_taps(g.gpu.as_mut().unwrap(), &config, cfg.n_slots)
                 .map_err(|e| format!("kvmem taps: {e}"))?;
+            #[cfg(feature = "kvmem")]
+            if let Some(legacy) = cfg.kvmem.as_ref().filter(|c| c.enabled) {
+                let query_rows = (legacy.query_max_tokens as usize)
+                    .checked_mul(cfg.n_slots).ok_or("kvmem: Query row capacity overflow")?
+                    .min(max_batch);
+                let taps = g.pbs.as_mut().unwrap().kvmem_taps.as_mut()
+                    .ok_or("kvmem: missing native Query taps")?;
+                let needed = taps.query_capture_capacity_bytes(query_rows)
+                    .map_err(|e| format!("kvmem Query workspace: {e}"))?;
+                let gpu = g.gpu.as_mut().unwrap();
+                let (free, _) = gpu.device_mem_info().map_err(|e| format!("kvmem Query workspace: {e}"))?;
+                if needed > free {
+                    return Err(format!("kvmem: Query workspace requires {needed} bytes, only {free} free; no fallback"));
+                }
+                taps.enable_query_capture(gpu, query_rows)
+                    .map_err(|e| format!("kvmem Query capture allocation: {e}"))?;
+                eprintln!("[kvmem-config] query_capture_rows={query_rows} query_workspace_bytes={}", taps.query_capacity_bytes());
+            }
         }
         let scratch =
             Qwen35Scratch::new_with_kv_max(g.gpu.as_mut().unwrap(), &config, 64, cfg.cap_tokens)
@@ -2364,7 +3143,47 @@ impl Rig {
         // this model's FullAttention geometry.
         #[cfg(feature = "kvmem")]
         let kvmem = match kvmem_plan {
-            Some(plan) => Some(crate::kvmem_ctl::KvMemCtl::new(
+            Some(plan) => {
+                // Consolidated effective-policy record: the operator-facing
+                // parameters are only meaningful if the engine states the
+                // values it actually built the pool and policy with (E01
+                // evidence: requested vs applied, no silent clamping).
+                if let Some(config) = cfg.kvmem.as_ref() {
+                    eprintln!(
+                        "[kvmem-config] contract={} budget_tokens={} gen_reserve_tokens={} \
+                         sink_tokens={} recent_tokens={} sessions={} host_bytes={} \
+                         disk_bytes={} disk_path={:?} query_max_tokens={} \
+                         query_replay_max_tokens={} query_scorer={:?} score_agg={:?} \
+                         lrfu={} lrfu_lambda={} lrfu_top_fraction={} slopes=native \
+                         pages_total={} budget_blocks={} grow_blocks={} interval={} \
+                         slots={} spec_rows={} prefill_chunk={} cap_tokens={}",
+                        hipfire_config::kvmem::CONTRACT_VERSION,
+                        config.budget_tokens,
+                        config.gen_reserve_tokens,
+                        config.sink_tokens,
+                        config.recent_tokens,
+                        config.sessions,
+                        config.host_bytes,
+                        config.disk_bytes,
+                        config.disk_path.as_deref(),
+                        config.query_max_tokens,
+                        config.query_replay_max_tokens,
+                        config.query_scorer,
+                        config.score_agg,
+                        config.lrfu,
+                        config.lrfu_lambda,
+                        config.lrfu_top_fraction,
+                        plan.pages_total,
+                        plan.budget_blocks,
+                        plan.grow_blocks,
+                        plan.interval,
+                        cfg.n_slots,
+                        spec_rows,
+                        prefill_chunk,
+                        cfg.cap_tokens,
+                    );
+                }
+                Some(crate::kvmem_ctl::KvMemCtl::new_with_config(
                 cfg.n_slots,
                 &plan,
                 &crate::kvmem_ctl::KvMemGeometry {
@@ -2383,7 +3202,9 @@ impl Rig {
                     // Legacy carries it unread (byte-neutral).
                     mtp_head: mtp_head.is_some() && mtp_k > 0,
                 },
-            )?),
+                cfg.kvmem.as_ref(),
+                )?)
+            }
             None => None,
         };
         // MTP head-KV prefill scratch, sized for one scheduler prompt chunk.
@@ -2649,6 +3470,25 @@ impl Rig {
             repeat_windows,
             vl_sequential,
             sessions: SessionTable::default(),
+            #[cfg(feature = "kvmem")]
+            legacy_history: cfg.kvmem.as_ref().filter(|c| c.enabled).map(|c| {
+                // Inactive-history host ceiling for non-KV image bytes
+                // (recurrent/conv payload + draft row images). The KV payload
+                // itself is charged against `host_bytes`; this ceiling keeps a
+                // DFlash/MTP draft image per session from crowding every
+                // version out of the catalog at the default 512 MiB.
+                let ceiling = usize::try_from(c.host_bytes / 2)
+                    .unwrap_or(usize::MAX)
+                    .max(512 * 1024 * 1024);
+                crate::legacy_catalog::LegacyHistoryCatalog::new(c.sessions as usize, ceiling)
+                    .map_err(|e| format!("kvmem history directory: {e}"))
+            }).transpose()?,
+            #[cfg(feature = "kvmem")]
+            legacy_queries: (0..cfg.n_slots).map(|_| None).collect(),
+            #[cfg(feature = "kvmem")]
+            legacy_query_decided: vec![false; cfg.n_slots],
+            #[cfg(feature = "kvmem")]
+            legacy_spec_kind: vec![SpecKind::None; cfg.n_slots],
             adm,
             swap,
             stamp,
@@ -3294,6 +4134,9 @@ impl ModelRig {
                 )
                 .map_err(|e| format!("mtp prev_hidden capture: {e:?}"))
         });
+        if hidden_outcome.is_ok() {
+            state.prev_hidden_pos = Some(chunk_positions[m - 1] as usize);
+        }
         // P4.1② f2 (B+E): the head archive bootstrap. Under Layerwise+MTP,
         // co-archive this chunk's head K/V into the composite aux plane (ordinal
         // `n_fa`) so every prompt token's head payload survives for drop-evict +
@@ -3784,6 +4627,15 @@ impl ModelRig {
             work.next_pos = new_pos;
             pool.set_seq_len(slot, new_pos)
                 .map_err(|e| format!("mtp set_seq_len: {e}"))?;
+            // Native recovery identity: after the DN repair above, `prev_hidden`
+            // holds the trunk hidden of the last committed verify row, whose
+            // absolute position is `new_pos - 1`. A backend recovery image must
+            // not infer this from shapes.
+            state.prev_hidden_pos = Some(
+                new_pos
+                    .checked_sub(1)
+                    .ok_or_else(|| "mtp verify: empty accepted advance".to_string())?,
+            );
             // KVMem statistics: only the committed prefix of the verify rows
             // survives (`advance` rows starting at `pos`); rejected draft rows
             // are overwritten by later writes and never enter the host store.
@@ -4691,6 +5543,14 @@ fn commit_sampled_token(
         // the fairness budget (spec §5.3 S3). Idempotent (NotFound ignored).
         let _ = rig.fair_queue.remove(session.0);
         clear_work_slot(&mut work[s]);
+        // A terminal request owns no Query lifecycle: any unfinished
+        // checkpoint source is dropped with it (never carried into the next
+        // request on this slot).
+        #[cfg(feature = "kvmem")]
+        if let Some(run) = rig.legacy_queries.get_mut(s) {
+            *run = None;
+            rig.legacy_query_decided[s] = false;
+        }
         rig.model.clear_slot_vl_state(&mut rig.gpu, s);
         if matches!(reason, DoneReason::ClientGone) {
             // Nobody will follow up on a vanished client, so hand the slot
@@ -4714,6 +5574,70 @@ fn commit_sampled_token(
         }
         rig.sessions.touch(session);
     }
+}
+
+/// End a slot's current generation pass early WITHOUT closing its session.
+///
+/// Think-recovery control plane: the daemon asks for the pass to end between
+/// tokens (closed-think continuation / reasoning-loop recovery), then starts a
+/// follow-up pass whose prompt extends the accepted token stream. The mirror of
+/// `commit_sampled_token`'s terminal block, with three deliberate differences:
+///
+/// * No token is being committed (the pass ends at a boundary), so nothing is
+///   retained into the session and no `Token` event is sent.
+/// * `Done` is reported with `DoneReason::MaxTokens` and `generated =
+///   produced` — the daemon treats it as a pass boundary, not a budget stop.
+/// * The session is ALWAYS touched (never closed, even on a vanished client —
+///   that case is handled by the daemon cancelling the whole request via
+///   `Close`, not by an interrupt).
+fn finish_interrupted_pass(
+    rig: &mut Rig,
+    slots: &mut [Option<InFlight>],
+    work: &mut [PendingWork],
+    stats: &Mutex<EngineStats>,
+    s: usize,
+) {
+    let Some(f) = slots[s].as_mut() else { return };
+    let session = f.session;
+    let generated = f.produced;
+    lock_stats(stats).note_slot_released();
+    // 期4 counters: pass work is real work — fold it now. The next pass
+    // re-initialises the per-slot counters at admit.
+    {
+        let spec = std::mem::take(&mut rig.spec_counters[s]);
+        if spec.requested {
+            let mut st = lock_stats(stats);
+            st.speculative.requests += 1;
+            st.speculative.rounds += spec.rounds;
+            st.speculative.drafted_tokens += spec.drafted;
+            st.speculative.accepted_tokens += spec.accepted;
+            st.speculative.generated_tokens += spec.generated;
+            st.speculative.fallback_steps += spec.fallback;
+        }
+    }
+    let _ = send_event(&f.reply, Event::Done {
+        reason: DoneReason::MaxTokens,
+        generated,
+    });
+    // Publish generated-prefix pages at the pass boundary, exactly as the
+    // terminal path does: every sampled token of this pass is materialized.
+    let mut pin_ticket = std::mem::take(&mut f.pin_ticket);
+    if rig.prefix_cache {
+        publish_generated_prefix(rig, slots, s, work[s].next_pos);
+    }
+    release_pin_ticket(rig, &mut pin_ticket);
+    slots[s] = None;
+    let _ = rig.fair_queue.remove(session.0);
+    clear_work_slot(&mut work[s]);
+    #[cfg(feature = "kvmem")]
+    if let Some(run) = rig.legacy_queries.get_mut(s) {
+        *run = None;
+        rig.legacy_query_decided[s] = false;
+    }
+    rig.model.clear_slot_vl_state(&mut rig.gpu, s);
+    // Keep the session resident (and its KV/MTP head/DeltaNet state valid):
+    // the continuation pass extends exactly this session.
+    rig.sessions.touch(session);
 }
 
 /// Lock the shared stats counter, tolerating a poisoned mutex.
@@ -5116,6 +6040,11 @@ fn run_loop(
 ) -> Result<(), String> {
     let n = rig.n_slots;
     let mut slots: Vec<Option<InFlight>> = (0..n).map(|_| None).collect();
+    // Per-slot cooperative pass-interrupt flags (EngineCommand::Interrupt).
+    // Deliberately engine-local rather than a PendingWork field: the flag is
+    // transient control-plane state, and PendingWork literals are constructed
+    // in ~20 places (tests included) that must not churn for it.
+    let mut interrupts: Vec<bool> = vec![false; n];
     let mut work: Vec<PendingWork> = (0..n)
         .map(|s| PendingWork {
             slot: SlotId(s),
@@ -5157,6 +6086,13 @@ fn run_loop(
                 rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
                 let _ = rig.fair_queue.remove(sid.0);
                 clear_work_slot(&mut work[s]);
+                // A dead session's Query checkpoint/source must not survive
+                // into the slot's next occupant (its store is being closed).
+                #[cfg(feature = "kvmem")]
+                if let Some(run) = rig.legacy_queries.get_mut(s) {
+                    *run = None;
+                    rig.legacy_query_decided[s] = false;
+                }
                 rig.model.clear_slot_vl_state(&mut rig.gpu, s);
             }
         }
@@ -5185,7 +6121,7 @@ fn run_loop(
                         .max(std::time::Duration::from_secs(1))
                 }) {
                     Some(wait) => match rx.recv_timeout(wait) {
-                        Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
+                        Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, &mut interrupts, cmd),
                         Err(RecvTimeoutError::Timeout) => {
                             sweep_sessions(&mut rig);
                             let mut st = stats.lock().expect("stats");
@@ -5196,14 +6132,14 @@ fn run_loop(
                         Err(RecvTimeoutError::Disconnected) => break 'serve,
                     },
                     None => match rx.recv() {
-                        Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
+                        Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, &mut interrupts, cmd),
                         Err(_) => break 'serve, // all senders gone: shut down after drain
                     },
                 }
             }
             loop {
                 match rx.try_recv() {
-                    Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
+                    Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, &mut interrupts, cmd),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         if slots.iter().all(|s| s.is_none()) {
@@ -5322,11 +6258,31 @@ fn run_loop(
                     .min()
                     .unwrap_or(std::time::Duration::from_millis(50));
                 match rx.recv_timeout(sleep_for) {
-                    Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
+                    Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, &mut interrupts, cmd),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'serve,
                 }
                 continue;
+            }
+            // ── Cooperative pass interrupts (think-recovery) ──
+            // A pending Interrupt must land BEFORE this step materializes any
+            // token: end the pass at the current boundary, report it as a
+            // MaxTokens done, and keep the session KV resident so the daemon's
+            // continuation pass finds it reusable. Placed after admission (so
+            // a freshly admitted request cannot be interrupted before its
+            // first step) and before every per-slot section below.
+            for s in 0..n {
+                if interrupts[s] {
+                    interrupts[s] = false;
+                    if slots[s].is_some() {
+                        finish_interrupted_pass(&mut rig, &mut slots, &mut work, &stats, s);
+                    }
+                }
+            }
+            if slots.iter().all(|s| s.is_none()) && rig.wait_queue.queued_count() == 0 {
+                // The last busy slot was interrupted and nothing else is
+                // ready: skip the (all-empty) scheduling sections this step.
+                continue 'serve;
             }
             // Slot occupancy for this step, after admission. Each terminal
             // below releases its slot in the stats BEFORE posting its event,
@@ -5701,39 +6657,65 @@ fn run_loop(
                     eligible[s] = granted_ids.contains(&f.session.0);
                 }
             }
-            // KVMem: a prompt that spills must hand its LAST token to the next
-            // step. The prompt-completing step is the one whose logits seed
-            // the answer, and its residency pass scores the host store against
-            // the Q tap of the previous row. Draining the prompt in one round
-            // makes that tap the previous chunk's last row — up to a page of
-            // filler before the question — so a needle at 50% of a long
-            // document is selected against the wrong query and never restored.
-            // Holding one token puts the tap immediately before it, on the
-            // question itself. Only spilling prompts are split: a prompt that
-            // fits the resident budget keeps the upstream single-round shape
-            // and its bit-exact kernel sequence.
+            // KVMem Legacy Query: a pre-Query step must stop exactly at the
+            // query's native recovery point so the complete pre-Query image
+            // can be captured there. The formal contract never uses the old
+            // last-token hold hack: its Query is the real bounded user span,
+            // and recall replays from the captured boundary instead of
+            // guessing from the previous chunk's Q tap. env-only Layerwise
+            // keeps the old shape untouched.
             #[cfg(feature = "kvmem")]
-            let hold_tail: Vec<bool> = match rig.model.kvmem.as_ref() {
-                Some(ctl) => {
-                    let budget = ctl.budget_blocks();
-                    work.iter()
-                        .map(|w| {
-                            let left = w.remaining_prompt.len();
-                            !w.decoding
-                                && left > 1
-                                && (w.next_pos + left).div_ceil(PAGE_TOKENS) > budget
-                        })
-                        .collect()
+            let legacy_query_caps =
+                match prepare_legacy_query_checkpoints(&mut rig, &slots, &work) {
+                    Ok(caps) => caps,
+                    Err(e) => {
+                        fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                        poison = Some(e);
+                        break 'serve;
+                    }
+                };
+            #[cfg(feature = "kvmem")]
+            let legacy_contract = rig
+                .model
+                .kvmem
+                .as_ref()
+                .is_some_and(|ctl| ctl.legacy_config().is_some());
+            // KVMem: a prompt that spills must hand its LAST token to the next
+            // step. The legacy-tap path's residency pass scores the host store
+            // against the Q tap of the previous row; draining the prompt in one
+            // round makes that tap the previous chunk's last row — up to a page
+            // of filler before the question — so a needle at 50% of a long
+            // document is selected against the wrong query and never restored.
+            // Holding one token puts the tap immediately before it. Only
+            // spilling prompts are split. The formal Legacy contract never
+            // takes this path (its real Query replaces the tap heuristic).
+            #[cfg(feature = "kvmem")]
+            let hold_tail: Vec<bool> = if legacy_contract {
+                vec![false; n]
+            } else {
+                match rig.model.kvmem.as_ref() {
+                    Some(ctl) => {
+                        let budget = ctl.budget_blocks();
+                        work.iter()
+                            .map(|w| {
+                                let left = w.remaining_prompt.len();
+                                !w.decoding
+                                    && left > 1
+                                    && (w.next_pos + left).div_ceil(PAGE_TOKENS) > budget
+                            })
+                            .collect()
+                    }
+                    None => Vec::new(),
                 }
-                None => Vec::new(),
             };
             #[cfg(feature = "kvmem")]
-            let sched_batch = sched.next_batch_eligible_hold(
+            let sched_batch = sched.next_batch_eligible_capped(
                 &mut work,
                 remaining_for_sched,
                 prefill_min_tokens,
                 &eligible,
                 &hold_tail,
+                &legacy_query_caps,
             );
             #[cfg(not(feature = "kvmem"))]
             let sched_batch = sched.next_batch_eligible(
@@ -5851,6 +6833,47 @@ fn run_loop(
             if batch.is_empty() {
                 continue;
             }
+            // ── KVMem Legacy Query row capture ─────────────────────────────
+            // The tap kernel copies exactly the batch rows this step forwards
+            // for the real user Query span; every other row is untouched. The
+            // mask is re-set on EVERY step (empty when nothing probes) so a
+            // later step can never read a stale row set. Verify rows are never
+            // captured: they exist only while a slot is decoding, and a
+            // Probing Query owns the prompt prefill.
+            #[cfg(feature = "kvmem")]
+            let mut legacy_query_reads: Vec<(usize, usize, usize, usize)> = Vec::new();
+            #[cfg(feature = "kvmem")]
+            if let Some(taps) = rig.model.pbs.kvmem_taps.as_mut() {
+                let mut rows: Vec<u32> = Vec::new();
+                let mut row = 0usize;
+                for s in 0..n {
+                    let m = batch.m_per_slot.get(s).copied().unwrap_or(0);
+                    if m == 0 {
+                        continue;
+                    }
+                    let pos0 = batch.positions[row] as usize;
+                    row += m;
+                    let Some(run) = rig.legacy_queries[s].as_ref() else {
+                        continue;
+                    };
+                    if run.source.is_none() {
+                        continue;
+                    }
+                    let Some((off, count)) = run.query.capture_span(pos0, m) else {
+                        continue;
+                    };
+                    let compact = rows.len();
+                    let base = row - m + off;
+                    rows.extend((base..base + count).map(|r| r as u32));
+                    legacy_query_reads.push((s, compact, count, pos0 + off));
+                }
+                if let Err(e) = taps.set_query_rows(&mut rig.gpu, &rows) {
+                    let reason = format!("kvmem: Query row mask: {e}");
+                    fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                    poison = Some(reason);
+                    break 'serve;
+                }
+            }
             // P4.3: batch-time prefill snapshot for the end-of-iteration
             // canonical freeze. The spec/emit sections flip `work[s].decoding`
             // and advance `next_pos` mid-iteration; the freeze must see the
@@ -5890,7 +6913,43 @@ fn run_loop(
                 let prefill_final: Vec<bool> = (0..n)
                     .map(|s| !work[s].decoding && work[s].remaining_prompt.is_empty())
                     .collect();
-                let step = {
+                let legacy_pressure = rig
+                    .model
+                    .kvmem
+                    .as_ref()
+                    .is_some_and(|ctl| ctl.legacy_config().is_some());
+                let step = if legacy_pressure {
+                    // Legacy Pressure candidates are accepted resident pages
+                    // only (never spilled pages, never full-history retrieval),
+                    // and no Pressure is legal inside an admitted Query replay.
+                    let incoming: Vec<usize> = (0..n)
+                        .map(|s| batch.m_per_slot.get(s).copied().unwrap_or(0))
+                        .collect();
+                    let decoding: Vec<bool> = (0..n).map(|s| work[s].decoding).collect();
+                    let replaying: Vec<bool> = (0..n)
+                        .map(|s| {
+                            rig.legacy_queries
+                                .get(s)
+                                .and_then(|run| run.as_ref())
+                                .is_some_and(|run| {
+                                    run.query.phase()
+                                        == crate::legacy_query::LegacyQueryPhase::Replaying
+                                })
+                        })
+                        .collect();
+                    let ctl = rig.model.kvmem.as_mut().unwrap();
+                    ctl.prepare_legacy_step(
+                        &mut rig.gpu,
+                        &mut rig.pool,
+                        &active,
+                        &resident,
+                        &incoming,
+                        &decoding,
+                        &replaying,
+                        &rig.model.k_arenas,
+                        &rig.model.v_arenas,
+                    )
+                } else {
                     let ctl = rig.model.kvmem.as_mut().unwrap();
                     let taps = rig
                         .model
@@ -6501,8 +7560,9 @@ fn run_loop(
                                 rig.model.kvmem = kvmem;
                                 fwd
                             }
-                            // No sealed history page yet (fed < 128): restore the
-                            // controller + owner and run Legacy; no transaction.
+                            // Before the fixed-block floor (see
+                            // `layerwise_floor_tokens`): restore the controller +
+                            // owner and run Legacy; no transaction.
                             Ok(None) => {
                                 if let Some(p) = output_owner {
                                     if let Some(k) = kvmem.as_mut() {
@@ -6782,9 +7842,10 @@ fn run_loop(
                                     rig.model.kvmem = kvmem;
                                     fwd
                                 }
-                                // No sealed history page yet (fed < 128): restore
-                                // the owner + controller and run Legacy; the verify
-                                // still commits via `feed_rows`, no output publish.
+                                // Before the fixed-block floor (see
+                                // `layerwise_floor_tokens`): restore the owner +
+                                // controller and run Legacy; the verify still
+                                // commits via `feed_rows`, no output publish.
                                 Ok(None) => {
                                     if let Some(p) = output_owner {
                                         if let Some(k) = kvmem.as_mut() {
@@ -7049,6 +8110,66 @@ fn run_loop(
                     t_forward.elapsed().as_secs_f64() * 1e3,
                 );
             }
+            // ── KVMem Legacy Query readback ────────────────────────────────
+            // Post-sync the capture holds post-norm/pre-RoPE Q for exactly the
+            // rows masked above. Every FullAttention layer appends its rows
+            // contiguously to the slot's Query accumulation. A failure is a
+            // clean bypass (the intact first pass stays authoritative), never a
+            // partially recorded probe.
+            #[cfg(feature = "kvmem")]
+            if !legacy_query_reads.is_empty() {
+                let mut failure: Option<String> = None;
+                let taps = rig.model.pbs.kvmem_taps.as_ref();
+                if let Some(taps) = taps {
+                    let total_rows: usize = legacy_query_reads.iter().map(|e| e.2).sum();
+                    let q_width = taps.q_width;
+                    let mut values: Vec<f32> = Vec::new();
+                    'layers: for layer in 0..taps.n_fa_layers {
+                        if let Err(e) =
+                            taps.read_query_rows(&rig.gpu, layer, 0, total_rows, &mut values)
+                        {
+                            failure = Some(format!("Query readback layer {layer}: {e}"));
+                            break 'layers;
+                        }
+                        if values.len() != total_rows * q_width {
+                            failure = Some(format!(
+                                "Query readback layer {layer} returned {} values, expected {}",
+                                values.len(),
+                                total_rows * q_width
+                            ));
+                            break 'layers;
+                        }
+                        for &(s, compact, count, abs_begin) in &legacy_query_reads {
+                            let Some(run) = rig.legacy_queries[s].as_mut() else {
+                                continue;
+                            };
+                            let slice = &values[compact * q_width..(compact + count) * q_width];
+                            if let Err(e) = run.query.record_layer_rows(layer, abs_begin, slice) {
+                                failure = Some(format!("Query row record layer {layer}: {e}"));
+                                break 'layers;
+                            }
+                        }
+                    }
+                } else {
+                    failure = Some("Query capture is not enabled".into());
+                }
+                if let Some(reason) = failure {
+                    let mut seen: Vec<usize> = Vec::new();
+                    for &(s, _, _, _) in &legacy_query_reads {
+                        if seen.contains(&s) {
+                            continue;
+                        }
+                        seen.push(s);
+                        let Some(run) = rig.legacy_queries[s].as_mut() else {
+                            continue;
+                        };
+                        if run.query.phase() == crate::legacy_query::LegacyQueryPhase::Probing {
+                            let _ = run.query.bypass(&reason);
+                            eprintln!("[kvmem-legacy] QueryBypass slot={s} reason={reason} first_pass_preserved=true");
+                        }
+                    }
+                }
+            }
             // ── KVMem statistics feed (HIPFIRE_KVMEM) ───────────────────────
             // Every KV row this step wrote (prefill chunk or plain decode row)
             // is summarized into the slot's host store now, from the taps the
@@ -7173,6 +8294,33 @@ fn run_loop(
             // The walk is over a short pending list — cheap per step.
             if let Some(pp) = rig.pool.page_pool_mut() {
                 pp.drain_completed();
+            }
+            // ── KVMem Legacy Query replay transaction ──────────────────────
+            // After this step's accepted rows are fed, a Query whose probe is
+            // complete either publishes its score round once (no useful replay)
+            // or rewinds the slot to the pre-Query checkpoint and replays the
+            // exact client prompt suffix. Rewind is destructive from the first
+            // `start_replay`: a later failure poisons the engine instead of
+            // claiming the first pass still stands.
+            #[cfg(feature = "kvmem")]
+            let mut legacy_rewound = vec![false; n];
+            #[cfg(feature = "kvmem")]
+            if rig
+                .model
+                .kvmem
+                .as_ref()
+                .is_some_and(|ctl| ctl.legacy_config().is_some())
+            {
+                if let Err(e) = advance_legacy_query_replay(
+                    &mut rig,
+                    &slots,
+                    &mut work,
+                    &mut legacy_rewound,
+                ) {
+                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                    poison = Some(e);
+                    break 'serve;
+                }
             }
             // Penalty windows: for each slot whose request carries non-neutral
             // token penalties, clamp the requested window to what the session
@@ -7439,6 +8587,17 @@ fn run_loop(
             let t_emit = std::time::Instant::now();
 
             for s in 0..n {
+                // A slot rewound by an admitted Query replay produced first-pass
+                // logits this iteration; they are stale. Free any drafted rows
+                // and skip ALL per-slot emission for it — the replayed prefix is
+                // the only authority from here on.
+                #[cfg(feature = "kvmem")]
+                if legacy_rewound[s] {
+                    if let Some(draft) = spec_drafts[s].take() {
+                        draft.free_gpu(&mut rig.gpu);
+                    }
+                    continue;
+                }
                 // Spec verify/accept: process slots that produced draft outputs.
                 if let Some(draft) = spec_drafts[s].take() {
                     if slots[s].is_none() {
@@ -7493,18 +8652,28 @@ fn run_loop(
                         Ok(tokens) => {
                             // 期4 speculative statistics: committed outputs
                             // include the bonus row; accepted candidates
-                            // exclude it (speculative.hpp semantics).
-                            rig.spec_counters[s].generated += tokens.len() as u64;
-                            rig.spec_counters[s].accepted +=
-                                tokens.len().saturating_sub(1) as u64;
-                            for tok in &tokens {
-                                commit_sampled_token(
-                                    &mut rig, &mut slots, &mut work, &stats, s, *tok,
-                                );
+                            // exclude it (speculative.hpp semantics). Count
+                            // only tokens the request actually consumed — a
+                            // terminal token (EOS / cancel / cap) ends the
+                            // batch, and the rows behind it were never
+                            // delivered, so charging them would overstate
+                            // accepted/generated for the rest of the run.
+                            let mut committed = 0u64;
+                            let mut accepted = 0u64;
+                            for (row, tok) in tokens.iter().enumerate() {
                                 if slots[s].is_none() {
                                     break;
                                 }
+                                commit_sampled_token(
+                                    &mut rig, &mut slots, &mut work, &stats, s, *tok,
+                                );
+                                committed += 1;
+                                if row + 1 < tokens.len() {
+                                    accepted += 1;
+                                }
                             }
+                            rig.spec_counters[s].generated += committed;
+                            rig.spec_counters[s].accepted += accepted;
                             // Adaptive retire (shared `SpecRetire`, the same
                             // policy the sequential drafter uses): a head that
                             // cannot sustain the break-even advance loses
@@ -7792,6 +8961,17 @@ fn run_loop(
                     slots[s] = None;
                     let _ = rig.fair_queue.remove(session.0);
                     clear_work_slot(&mut work[s]);
+                    // Speculative/terminal path: drop any unfinished Query
+                    // lifecycle with the request. The plain-AR terminal path
+                    // does the same in `commit_sampled_token`; without this
+                    // reset a completed short request latched
+                    // `legacy_query_decided` and suppressed the Query for the
+                    // slot's next request.
+                    #[cfg(feature = "kvmem")]
+                    if let Some(run) = rig.legacy_queries.get_mut(s) {
+                        *run = None;
+                        rig.legacy_query_decided[s] = false;
+                    }
                     rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                     if matches!(reason, DoneReason::ClientGone) {
                         // Nobody will follow up on a vanished client, so hand the
@@ -8501,6 +9681,7 @@ fn handle_command(
     slots: &mut [Option<InFlight>],
     work: &mut [PendingWork],
     stats: &Arc<Mutex<EngineStats>>,
+    interrupts: &mut [bool],
     cmd: EngineCommand,
 ) {
     match cmd {
@@ -8580,12 +9761,33 @@ fn handle_command(
                     drop(inflight.reply);
                 }
                 clear_work_slot(&mut work[idx]);
+                #[cfg(feature = "kvmem")]
+                if let Some(run) = rig.legacy_queries.get_mut(idx) {
+                    *run = None;
+                    rig.legacy_query_decided[idx] = false;
+                }
                 rig.model.clear_slot_vl_state(&mut rig.gpu, idx);
                 let _ = rig.fair_queue.remove(session);
             }
             rig.swap.forget(session);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
             let _ = reply.send(Ok(()));
+        }
+        EngineCommand::Interrupt { session } => {
+            // Set the transient per-slot flag; the serve loop drains it at the
+            // top of the next scheduler step (before any per-slot work), so
+            // the pass ends at a token boundary with the session's KV intact.
+            // Unknown/parked sessions are a no-op: the daemon only interrupts
+            // after it has been told the session was accepted.
+            if let Some(idx) = slots.iter().position(|s| {
+                s.as_ref()
+                    .map(|f| f.session == SessionId(session))
+                    .unwrap_or(false)
+            }) {
+                if let Some(flag) = interrupts.get_mut(idx) {
+                    *flag = true;
+                }
+            }
         }
         EngineCommand::Reset { reply } => {
             if slots.iter().any(|s| s.is_some()) {
@@ -8603,6 +9805,27 @@ fn handle_command(
                 rig.swap.forget(id);
                 rig.sessions
                     .close(&mut rig.pool, &mut rig.adm, SessionId(id));
+            }
+            // Reset returns the engine to a cold empty table: parked
+            // inactive histories and any half-finished Query checkpoint go
+            // with it (their host stores belong to sessions that no longer
+            // exist).
+            #[cfg(feature = "kvmem")]
+            {
+                for run in rig.legacy_queries.iter_mut() {
+                    *run = None;
+                }
+                for decided in rig.legacy_query_decided.iter_mut() {
+                    *decided = false;
+                }
+                if let Some(catalog) = rig.legacy_history.as_mut() {
+                    if let Ok(dropped) = catalog.clear() {
+                        eprintln!(
+                            "[kvmem-legacy] HistoryReset dropped_entries={}",
+                            dropped.len()
+                        );
+                    }
+                }
             }
             // Drop prefix cache state so subsequent lookups miss (spec §4.6).
             // The radix index owns cache leases taken at publication: it
@@ -8822,6 +10045,44 @@ fn admit(
                     .confirm_reentry(SessionId(*session), &req.convo, &busy)
             }
         };
+        let matched = if kvmem_legacy_enabled(rig) {
+            match matched {
+                Some(existing)
+                    if !rig.sessions.get(existing).is_some_and(|session| {
+                        legacy_continuation_matches(&session.tokens, &req.prompt_tokens)
+                            && media_continuation_matches(session, req.visual_data.as_ref())
+                    }) =>
+                {
+                    // The client's history does not extend the accepted
+                    // stream (most commonly a replayed assistant turn that
+                    // omits the reasoning it was streamed with, so the
+                    // template renders an empty think block). The claim is
+                    // consumed before submit, so a rejection here would
+                    // strand the conversation — no retry could re-claim.
+                    // Degrade to the cold path below instead: it prefills
+                    // the complete rendered prompt (tool results included)
+                    // and re-anchors the session on that canonical render.
+                    if rig.gpu.slot_trace() {
+                        if let Some(session) = rig.sessions.get(existing) {
+                            trace_continuation_divergence(
+                                &rig.tokenizer,
+                                "tool continuation mismatch",
+                                &session.tokens,
+                                &req.prompt_tokens,
+                            );
+                        }
+                        eprintln!(
+                            "[kvmem-prefix] session {} full rendered prefix mismatch; cold recompute",
+                            existing.0
+                        );
+                    }
+                    None
+                }
+                candidate => candidate,
+            }
+        } else {
+            matched
+        };
         // KVMem: a finished session is kept resident precisely so its next
         // turn extends it in place — the trunk KV (resident pages plus
         // spilled payloads and row statistics in the host store), the
@@ -8893,8 +10154,17 @@ fn admit(
                 }
             }
             if let Some(slot) = slot {
-                let mut extended = base;
-                extended.extend_from_slice(req.continuation.tokens());
+                let extended = if kvmem_legacy_enabled(rig) {
+                    // This is the same full rendered input that proved the
+                    // prefix above and supplied req.query. Reconstructing a
+                    // suffix by hand would invalidate both token provenance
+                    // and the absolute Query coordinates.
+                    req.prompt_tokens.clone()
+                } else {
+                    let mut extended = base;
+                    extended.extend_from_slice(req.continuation.tokens());
+                    extended
+                };
                 // Prefill-side context-cap guard (mirrors decode hit_ctx_cap).
                 // A prompt/extension already at the KV cap overflows set_seq_len
                 // during prefill before any decode step can stop it.
@@ -9342,6 +10612,10 @@ fn admit(
                         } else {
                             SpecKind::None
                         };
+                        #[cfg(feature = "kvmem")]
+                        {
+                            rig.legacy_spec_kind[slot.0] = work[slot.0].spec;
+                        }
                         rig.spec_counters[slot.0] = SpecCounters {
                             requested: work[slot.0].spec.active(),
                             ..Default::default()
@@ -9513,6 +10787,17 @@ fn admit(
             break;
         };
         if kvmem_enabled(rig) {
+            // Park the victim's native state as an inactive history before
+            // its slot goes away (Sessions = non-active histories). A failed
+            // park must not block the reclaim: the close still returns the
+            // slot and grant, and the next turn simply cold-prefills.
+            #[cfg(feature = "kvmem")]
+            if let Err(e) = park_legacy_history(rig, victim) {
+                eprintln!(
+                    "[kvmem-legacy] HistoryPark session={} failed: {e}",
+                    victim.0
+                );
+            }
             rig.swap.forget(victim.0);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, victim);
         } else if !evict(rig, victim, stats) {
@@ -10594,6 +11879,28 @@ fn admit(
     }
     let grammar_constrained = grammar_constraint.is_some();
     if let Some(vd) = req.visual_data {
+        // E14: Legacy KVMem does not support vision + speculative decoding.
+        // The image branch below would force `SpecKind::None`, silently
+        // disabling the draft the user asked for. Refuse explicitly instead
+        // of faking an AR pass.
+        #[cfg(feature = "kvmem")]
+        if kvmem_legacy_enabled(rig)
+            && (rig.model.mtp_head.is_some() || rig.model.dflash.is_some())
+        {
+            let _ = send_event(
+                &req.reply,
+                Event::Rejected {
+                    class: RejectClass::Validation,
+                    reason: "kvmem: vision + speculative decoding is UNSUPPORTED; \
+                             run image requests with --spec off"
+                        .to_string(),
+                },
+            );
+            release_pin_ticket(rig, &mut pin_ticket);
+            rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+            lock_stats(stats).note_rejected();
+            return;
+        }
         // G7: a converted prefix hit prefills only the suffix. The M-RoPE
         // table stays absolute (`base = 0`, indexed by the absolute `pos`),
         // and visual_idx skips the image pads that already live in the
@@ -10718,6 +12025,10 @@ fn admit(
         } else {
             SpecKind::None
         };
+        #[cfg(feature = "kvmem")]
+        {
+            rig.legacy_spec_kind[slot.0] = work[slot.0].spec;
+        }
         rig.spec_counters[slot.0] = SpecCounters {
             requested: work[slot.0].spec.active(),
             ..Default::default()
@@ -10742,6 +12053,101 @@ fn admit(
                 reused,
                 req.prompt_tokens.len()
             );
+        }
+        // ── Legacy inactive-history restore (Sessions = non-active) ─────────
+        // A parked native image is content-addressed by its complete accepted
+        // token prefix, and the request's rendered tokens extend that prefix.
+        // Restoring reinstates target KV, the recurrent state and the parked
+        // working set, so only the suffix is prefilled — the full accepted
+        // prefix (assistant/tool turns included) proves the reuse, never the
+        // conversation hash. Only exact draft provenance is reused; a
+        // draft-less image retires speculation for this request instead of
+        // inheriting another request's draft rows.
+        #[cfg(feature = "kvmem")]
+        if kvmem_legacy_enabled(rig) && reused == 0 && req.prompt_tokens.len() > 1 {
+            let prompt = &req.prompt_tokens;
+            // A restored frontier must leave at least the last prompt token to
+            // prefill: that step produces the logits the first output token is
+            // sampled from. A parked image whose frontier already covers the
+            // whole rendered prompt cannot seed a decode (there is no KV op to
+            // re-open the tail), so it is not a candidate here.
+            let max_frontier = prompt.len() - 1;
+            let media = req
+                .visual_data
+                .as_ref()
+                .map(|vd| vd.media_digest())
+                .or_else(|| rig.sessions.get(id).and_then(|s| s.media_digest));
+            let candidate = rig.legacy_history.as_ref().and_then(|catalog| {
+                catalog
+                    .lookup(prompt, media, max_frontier, true)
+                    .ok()
+                    .and_then(|ids| ids.into_iter().next())
+                    .and_then(|entry_id| {
+                        catalog
+                            .get(entry_id)
+                            .map(|entry| (entry_id, entry.source_session, std::rc::Rc::clone(&entry.value)))
+                    })
+            });
+            if let Some((entry_id, source_session, image)) = candidate {
+                // A parked image carries no native draft state (parking captures
+                // the target store only). Restoring it under MTP/DFlash would
+                // silently degrade the admitted execution model to AR, which the
+                // acceptance contract forbids. Treat that as a cache miss and
+                // cold-prefill with the requested spec instead — nothing has been
+                // reset at this point.
+                if !image.supports(work[slot.0].spec) {
+                    eprintln!(
+                        "[kvmem-legacy] HistorySkip slot={} entry={entry_id} reason=spec_mismatch requested={:?} frontier={}",
+                        slot.0, work[slot.0].spec, image.store.frontier,
+                    );
+                } else {
+                let kind = work[slot.0].spec;
+                let selected = image.store.resident_pages.clone();
+                match restore_legacy_native_image(rig, slot.0, id.0, &image, &selected, kind) {
+                    Ok(bytes) => {
+                        let frontier = image.store.frontier as usize;
+                        work[slot.0].spec = kind;
+                        rig.spec_counters[slot.0] = SpecCounters {
+                            requested: kind.active(),
+                            ..Default::default()
+                        };
+                        if !kind.active() {
+                            rig.model.spec_req_sampling[slot.0] = None;
+                        }
+                        work[slot.0].next_pos = frontier;
+                        work[slot.0].remaining_prompt = prompt[frontier..].to_vec();
+                        if let Some(sess) = rig.sessions.get_mut(id) {
+                            sess.next_pos = frontier;
+                        }
+                        if let Some(catalog) = rig.legacy_history.as_mut() {
+                            let _ = catalog.touch(entry_id);
+                        }
+                        eprintln!(
+                            "[kvmem-legacy] HistoryRestore slot={} session={} entry={entry_id} source_session={source_session} frontier={frontier} suffix={} restore_bytes={bytes} spec={kind:?}",
+                            slot.0,
+                            id.0,
+                            prompt.len() - frontier,
+                        );
+                    }
+                    Err(e) => {
+                        // The store was reset before the failure: this slot
+                        // must not serve on a torn frontier. Fail the request
+                        // (never fall through into a cold prefill the store
+                        // cannot back).
+                        let _ = send_event(
+                            &req.reply,
+                            Event::Rejected {
+                                class: RejectClass::Internal,
+                                reason: format!("kvmem: history restore failed: {e}"),
+                            },
+                        );
+                        rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+                        lock_stats(stats).note_rejected();
+                        return;
+                    }
+                }
+                }
+            }
         }
     }
     rig.sample_params[slot.0] = sample_params;
@@ -11021,6 +12427,18 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_continuation_requires_the_complete_accepted_prefix() {
+        // Stand-ins for system/user/assistant/tool/pending-token positions.
+        let accepted = [10, 20, 30, 40, 50];
+        assert!(legacy_continuation_matches(&accepted, &[10, 20, 30, 40, 50, 60]));
+        assert!(!legacy_continuation_matches(&accepted, &[10, 20, 31, 40, 50, 60]));
+        assert!(!legacy_continuation_matches(&accepted, &[10, 20, 30, 41, 50, 60]));
+        assert!(!legacy_continuation_matches(&accepted, &[10, 20, 30, 40, 51, 60]));
+        assert!(!legacy_continuation_matches(&accepted, &[10, 20, 30, 40]));
+        assert!(!legacy_continuation_matches(&[], &[10, 20]));
+    }
 
     #[test]
     fn slot_snapshot_kv_tags_are_stable_and_unique() {

@@ -50,6 +50,19 @@ use std::collections::HashMap;
 
 use crate::mtp_head::HeadPagedKv;
 
+/// Tokens that must be fed before the first Layerwise Query. Every selection
+/// is charged the fixed sink + recent allocation
+/// (`HIPFIRE_KVMEM_SINK_BLOCKS` / `HIPFIRE_KVMEM_RECENT_BLOCKS`), so a query
+/// admitted with fewer sealed pages than `sink + recent` would hand
+/// `set_runtime_select_budget` a sub-fixed budget and the host store rejects it
+/// ("KVMem request semantic budget is smaller than the configured sink +
+/// recent allocation"). Clamped to one page: the bootstrap needs at least one
+/// sealed page, and a 0/0 fixed allocation keeps the historical 128-token
+/// floor.
+pub fn layerwise_floor_tokens(sink_blocks: usize, recent_blocks: usize) -> u64 {
+    (sink_blocks + recent_blocks).max(1) as u64 * LAYERWISE_BLOCK_TOKENS as u64
+}
+
 /// Map a core `NativeQueryScalar` ordinal (`native_layer_query.hpp`) to the
 /// launcher's `PageQueryScalar`. The ordinals are identical (F32=0, F16=1,
 /// BF16=2); an unknown ordinal fails closed rather than guessing a width.
@@ -2297,7 +2310,8 @@ pub fn layerwise_capabilities(max_position: u32) -> MemoryCapabilities {
 /// `accept_output_pressure`. `prefill` seeds the `output.select` conjunction
 /// (positive decayed output scores override the prefill snapshot fallback);
 /// `None` ⇒ no Pressure refinement (scorer Query only). Returns `Ok(None)` under
-/// Legacy, before the first sealed page (`fed < 128`), or `width == 0`.
+/// Legacy, before the fixed-block floor (`layerwise_floor_tokens`), or
+/// `width == 0`.
 #[allow(clippy::too_many_arguments)]
 pub fn engine_carrier_rows<'a>(
     gpu: &mut Gpu,
@@ -2334,8 +2348,9 @@ pub fn engine_carrier_rows<'a>(
         (Some(fed), Some((incarnation, seq)), Some(stores)) => (fed, incarnation, seq, stores),
         _ => return Ok(None),
     };
-    // No sealed full page yet ⇒ nothing to recall; the step stays Legacy.
-    if fed < LAYERWISE_BLOCK_TOKENS {
+    // Fewer sealed pages than the fixed sink + recent allocation ⇒ the
+    // selection budget cannot admit them yet; the step stays Legacy.
+    if (fed as u64) < layerwise_floor_tokens(ctl.sink_blocks(), ctl.recent_blocks()) {
         return Ok(None);
     }
     let (keys, _slot_policy) = stores;
@@ -2552,7 +2567,7 @@ pub fn engine_carrier_rows<'a>(
 /// on this carrier, then consumes [`LayerwiseDriver::head_layer_views`] /
 /// [`LayerwiseDriver::head_arena_views`] through `HeadPagedKv` for the K draft
 /// forwards. `width` is the single draft row (1). Returns `Ok(None)` under Legacy /
-/// AR-only / head-plane-inactive / before the first sealed page (byte-neutral — the
+/// AR-only / head-plane-inactive / before the fixed-block floor (byte-neutral — the
 /// draft keeps the full-resident head `KvCache`). The trunk arena built here is the
 /// composite-record restore source; only the attached head arena is attended.
 #[allow(clippy::too_many_arguments)]
@@ -2582,8 +2597,9 @@ pub fn engine_carrier_head<'a>(
         (Some(fed), Some((incarnation, seq)), Some(stores)) => (fed, incarnation, seq, stores),
         _ => return Ok(None),
     };
-    // No sealed full page yet ⇒ nothing to recall; the draft stays full-resident.
-    if fed < LAYERWISE_BLOCK_TOKENS {
+    // Fewer sealed pages than the fixed sink + recent allocation ⇒ the
+    // selection budget cannot admit them yet; the draft stays full-resident.
+    if (fed as u64) < layerwise_floor_tokens(ctl.sink_blocks(), ctl.recent_blocks()) {
         return Ok(None);
     }
     let (keys, _slot_policy) = stores;
@@ -4205,6 +4221,22 @@ mod tests {
         Storage,
     };
     use rdna_compute::DType;
+
+    /// The Legacy gate opens exactly when the sealed history covers the fixed
+    /// sink + recent allocation (and never before one sealed page, even at a
+    /// 0/0 fixed allocation).
+    #[test]
+    fn layerwise_floor_follows_fixed_blocks() {
+        assert_eq!(layerwise_floor_tokens(0, 0), 128);
+        assert_eq!(layerwise_floor_tokens(1, 0), 128);
+        assert_eq!(layerwise_floor_tokens(1, 1), 256);
+        assert_eq!(layerwise_floor_tokens(2, 1), 384);
+        let floor = layerwise_floor_tokens(1, 1);
+        assert!((127u64) < floor);
+        assert!((128u64) < floor);
+        assert!((255u64) < floor);
+        assert!((256u64) >= floor);
+    }
 
     /// Q8-ish geometry: 2 KV heads × head_dim 64 → kw = 128; 4 query heads →
     /// GQA group 2, qw = 256.
