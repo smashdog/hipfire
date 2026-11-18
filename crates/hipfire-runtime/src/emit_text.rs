@@ -222,6 +222,13 @@ impl ThinkOutputRouter {
         self.in_think
     }
 
+    /// Whether any bytes are held back awaiting more input (a trailing prefix
+    /// of an opener/closer marker). False ⇒ the router sits on a clean
+    /// boundary between tokens.
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// Route one UTF-8-safe text chunk into out without allocating an
     /// intermediate event vector. Existing entries in out are preserved.
     pub fn push_into(&mut self, text: &str, out: &mut Vec<ThinkRouteEvent>) {
