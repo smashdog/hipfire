@@ -380,6 +380,11 @@ enum RouteState {
 /// at end-of-generation. Holds marker prefixes across chunk boundaries, emits
 /// ordered prose and complete calls, and latches fail-closed on malformed or
 /// truncated protocol.
+///
+/// [`Self::with_recover`] selects the PolyStrata-style fallback for serving:
+/// malformed spans are released as ordinary assistant text (markers included)
+/// instead of failing the turn, so a degenerate call can never kill a request.
+/// The strict default stays available for tests and internal verification.
 pub struct ToolOutputRouter {
     /// Whether this request declared at least one executable tool. Tool-like
     /// text is ordinary assistant content when no tool contract exists.
@@ -397,6 +402,12 @@ pub struct ToolOutputRouter {
     completed: Vec<crate::prompt_frame::ToolCall>,
     /// Latched fail-closed error; once set, further push/finish return it.
     malformed: Option<ToolRouteError>,
+    /// Release malformed spans as ordinary text instead of failing closed.
+    recover: bool,
+    /// Raw bytes of the open span that were consumed by earlier decisions
+    /// (stacked `<tool_call>` openers). Only tracked in recover mode; non-empty
+    /// means the span is already unparseable and must be released as text.
+    span_raw: String,
 }
 
 impl Default for ToolOutputRouter {
@@ -435,6 +446,8 @@ impl ToolOutputRouter {
             seen: 0,
             completed: Vec::new(),
             malformed: None,
+            recover: false,
+            span_raw: String::new(),
         }
     }
 
@@ -447,6 +460,16 @@ impl ToolOutputRouter {
         }
     }
 
+    /// Release malformed spans as ordinary assistant text (PolyStrata-style
+    /// fallback) instead of latching fail-closed.
+    ///
+    /// Structured calls that do parse strictly are still emitted as calls;
+    /// only unparseable, nested, stray-closer, or unclosed spans become text.
+    pub fn with_recover(mut self, recover: bool) -> Self {
+        self.recover = recover;
+        self
+    }
+
     /// Structured calls completed so far (not yet terminal-gated by consumers).
     pub fn tool_calls(&self) -> &[crate::prompt_frame::ToolCall] {
         &self.completed
@@ -455,6 +478,16 @@ impl ToolOutputRouter {
     /// Whether a fail-closed malformed verdict has already latched.
     pub fn is_malformed(&self) -> bool {
         self.malformed.is_some()
+    }
+
+    /// Latched fail-closed detail, when a malformed verdict is present.
+    pub fn malformed_detail(&self) -> Option<String> {
+        self.malformed.as_ref().map(|err| err.detail().to_string())
+    }
+
+    /// Unconsumed body bytes (debug tracing only).
+    pub fn debug_buffer(&self) -> &str {
+        &self.buf
     }
 
     /// True while this request's tool protocol is inside an unclosed `<tool_call>`.
@@ -519,6 +552,18 @@ impl ToolOutputRouter {
                 Ok(events)
             }
             RouteState::InToolCall => {
+                if self.recover {
+                    // Fallback: release the open span as ordinary text so the
+                    // turn still ends with usable assistant content.
+                    let mut text = String::new();
+                    text.push_str(TOOL_CALL_OPEN);
+                    text.push_str(&std::mem::take(&mut self.span_raw));
+                    text.push_str(&std::mem::take(&mut self.buf));
+                    self.note_recover("released unclosed span at finish as text", &text);
+                    events.push(visible_event(text));
+                    self.state = RouteState::Normal;
+                    return Ok(events);
+                }
                 // Strict: unclosed tool span at finish is always fail-closed.
                 // Do not fabricate calls from partial bodies (even brace-complete).
                 let err = ToolRouteError::malformed("unclosed <tool_call> span at end of output");
@@ -532,6 +577,24 @@ impl ToolOutputRouter {
         let err = ToolRouteError::malformed(detail);
         self.malformed = Some(err.clone());
         err
+    }
+
+    /// Serving fallback visibility: with `HIPFIRE_SLOT_TRACE=1` each released
+    /// malformed span is logged so operators can confirm the recovery fired.
+    fn note_recover(&self, what: &str, span: &str) {
+        if hipfire_config::developer_var("HIPFIRE_SLOT_TRACE").is_err() {
+            return;
+        }
+        let mut cut = 0;
+        let mut taken = 0;
+        for (i, _) in span.char_indices().rev() {
+            if taken == 160 {
+                cut = i;
+                break;
+            }
+            taken += 1;
+        }
+        eprintln!("[tool-router] recover: {what} | tail={:?}", &span[cut..]);
     }
 
     /// Advance as far as the current buffer allows without waiting on more input.
@@ -589,6 +652,19 @@ impl ToolOutputRouter {
             }
             Some((DelimHit::Close, start, end)) => {
                 // Stray closer (no preceding opener in the unsettled buffer).
+                if self.recover {
+                    // Fallback: keep head and closer as ordinary text.
+                    let mut text = if start > 0 {
+                        self.buf[..start].to_string()
+                    } else {
+                        String::new()
+                    };
+                    text.push_str(&self.buf[start..end]);
+                    self.consume_through(end);
+                    self.note_recover("released stray </tool_call> as text", &text);
+                    events.push(visible_event(text));
+                    return Ok(true);
+                }
                 if start > 0 {
                     let head: String = self.buf[..start].to_string();
                     if !head.is_empty() {
@@ -606,6 +682,7 @@ impl ToolOutputRouter {
                     }
                 }
                 self.consume_through(end);
+                self.span_raw.clear();
                 self.state = RouteState::InToolCall;
                 // Remainder (if any) is a fresh InToolCall segment; catch_up will
                 // feed those bytes once under the new state.
@@ -624,14 +701,35 @@ impl ToolOutputRouter {
                 // buffered; cursor already holds partial match state for the tip.
                 Ok(false)
             }
-            Some((DelimHit::Open, _start, _end)) => {
+            Some((DelimHit::Open, start, end)) => {
+                if self.recover {
+                    // Stacked/nested opener (MQ4 attractor shape): absorb it into
+                    // the span so the whole span is released as text at close.
+                    self.span_raw.push_str(&self.buf[..end]);
+                    self.consume_through(end);
+                    self.note_recover("absorbed nested <tool_call> opener", &self.span_raw);
+                    return Ok(true);
+                }
                 // Nested/stacked reserved opener inside an open span — fail closed.
                 Err(self.latch_malformed("nested <tool_call> opener inside an open tool-call span"))
             }
             Some((DelimHit::Close, start, end)) => {
                 let body = self.buf[..start].to_string();
+                let span_raw = std::mem::take(&mut self.span_raw);
                 self.consume_through(end);
                 self.state = RouteState::Normal;
+                if self.recover && !span_raw.is_empty() {
+                    // The span already contained a stacked opener: release the
+                    // whole span as ordinary text, never execute it.
+                    let mut text = String::new();
+                    text.push_str(TOOL_CALL_OPEN);
+                    text.push_str(&span_raw);
+                    text.push_str(&body);
+                    text.push_str(TOOL_CALL_CLOSE);
+                    self.note_recover("released stacked span as text", &text);
+                    events.push(visible_event(text));
+                    return Ok(true);
+                }
                 // Parse body once at close with the strict grammar only.
                 match parse_strict_tool_call_body(&body) {
                     Some(call) => {
@@ -639,9 +737,21 @@ impl ToolOutputRouter {
                         events.push(ToolRouteEvent::ToolCall(call));
                         Ok(true)
                     }
-                    None => Err(self.latch_malformed(
-                        "tool_call body is empty, truncated, or not fully valid JSON/Qwen XML",
-                    )),
+                    None => {
+                        if self.recover {
+                            // Fallback: a single unparseable span becomes text.
+                            let mut text = String::new();
+                            text.push_str(TOOL_CALL_OPEN);
+                            text.push_str(&body);
+                            text.push_str(TOOL_CALL_CLOSE);
+                            self.note_recover("released unparseable span as text", &text);
+                            events.push(visible_event(text));
+                            return Ok(true);
+                        }
+                        Err(self.latch_malformed(
+                            "tool_call body is empty, truncated, or not fully valid JSON/Qwen XML",
+                        ))
+                    }
                 }
             }
         }
@@ -1658,6 +1768,38 @@ mod tests {
         );
     }
 
+    /// Drive a recovery-mode router with chunks; same collection as [`feed`].
+    fn feed_recover(chunks: &[&str]) -> (String, Vec<ToolCall>, Terminal) {
+        let mut router = ToolOutputRouter::new().with_recover(true);
+        let mut visible = String::new();
+        let mut calls = Vec::new();
+        let mut collect = |evs: Vec<ToolRouteEvent>| {
+            for ev in evs {
+                match ev {
+                    ToolRouteEvent::VisibleText(v) => visible.push_str(v.as_str()),
+                    ToolRouteEvent::ToolCall(c) => calls.push(c),
+                }
+            }
+        };
+        for chunk in chunks {
+            match router.push(chunk) {
+                Ok(evs) => collect(evs),
+                Err(ToolRouteError::MalformedToolProtocol { .. }) => {
+                    return (visible, calls, Terminal::Malformed);
+                }
+            }
+        }
+        match router.finish() {
+            Ok(evs) => {
+                collect(evs);
+                (visible, calls, Terminal::Ok)
+            }
+            Err(ToolRouteError::MalformedToolProtocol { .. }) => {
+                (visible, calls, Terminal::Malformed)
+            }
+        }
+    }
+
     fn call_eq(a: &ToolCall, b: &ToolCall) {
         assert_eq!(a.name, b.name);
         assert_eq!(a.arguments, b.arguments);
@@ -2327,6 +2469,62 @@ mod tests {
             assert!(calls.is_empty(), "k={k}");
             assert_no_protocol_leak(&vis);
         }
+    }
+
+    #[test]
+    fn router_recover_releases_nested_span_as_text() {
+        // The strict router fails closed here (MQ4 #111 stacked-opener shape);
+        // serving recovery must instead release the whole span as plain text
+        // and never execute either call.
+        let nested = "<tool_call>{\"name\":\"a\",\"arguments\":{}}<tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>";
+        let (vis, calls, term) = feed_recover(&[nested]);
+        assert_eq!(term, Terminal::Ok);
+        assert!(calls.is_empty(), "a stacked span must never execute");
+        assert_eq!(vis, nested);
+
+        // Chunk-boundary independence: per-byte feed matches the whole feed.
+        let byte_chunks: Vec<String> = nested.bytes().map(|b| (b as char).to_string()).collect();
+        let refs: Vec<&str> = byte_chunks.iter().map(|s| s.as_str()).collect();
+        let (v, c, t) = feed_recover(&refs);
+        assert_eq!(t, Terminal::Ok);
+        assert!(c.is_empty());
+        assert_eq!(v, vis);
+    }
+
+    #[test]
+    fn router_recover_unclosed_span_at_finish_becomes_text() {
+        let text = "<tool_call>{\"name\":\"a\",\"arguments\":{\"i\":1}}";
+        let (vis, calls, term) = feed_recover(&[text]);
+        assert_eq!(term, Terminal::Ok, "recovery must not fail the turn");
+        assert!(calls.is_empty());
+        assert_eq!(vis, text);
+
+        // Held partial closer at the tail is restored, not dropped.
+        let with_prefix = "<tool_call>{\"name\":\"a</tool";
+        let (vis2, calls2, term2) = feed_recover(&[with_prefix]);
+        assert_eq!(term2, Terminal::Ok);
+        assert!(calls2.is_empty());
+        assert_eq!(vis2, with_prefix);
+    }
+
+    #[test]
+    fn router_recover_stray_closer_becomes_text() {
+        let (vis, calls, term) = feed_recover(&["before</tool_call>after"]);
+        assert_eq!(term, Terminal::Ok);
+        assert!(calls.is_empty());
+        assert_eq!(vis, "before</tool_call>after");
+    }
+
+    #[test]
+    fn router_recover_keeps_valid_calls_and_releases_bad_spans() {
+        // A valid call still executes; only the later malformed span degrades.
+        let (vis, calls, term) = feed_recover(&[
+            "x<tool_call>{\"name\":\"a\",\"arguments\":{\"i\":1}}</tool_call>y<tool_call>oops",
+        ]);
+        assert_eq!(term, Terminal::Ok);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "a");
+        assert_eq!(vis, "xy<tool_call>oops");
     }
 
     #[test]
