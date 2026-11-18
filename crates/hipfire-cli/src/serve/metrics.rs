@@ -744,6 +744,51 @@ impl Metrics {
                     s.kvmem.cold_pack_misses,
                 );
             }
+            counter(
+                &mut out,
+                "hipfire_think_close_injections_total",
+                "#1053: think-close injections that continued the turn in place.",
+                s.think_recovery.close_injections as u64,
+            );
+            counter(
+                &mut out,
+                "hipfire_repeat_run_stops_total",
+                "#606: same-token runs that ended the pass as `length`.",
+                s.think_recovery.repeat_run_stops as u64,
+            );
+            out.push_str(
+                "# HELP hipfire_think_loop_recoveries_total #728 reasoning-loop endings, by mode.\n\
+                 # TYPE hipfire_think_loop_recoveries_total counter\n",
+            );
+            for (mode, value) in [
+                ("recover", s.think_recovery.loop_recoveries),
+                ("stop", s.think_recovery.loop_stops),
+            ] {
+                out.push_str(&format!(
+                    "hipfire_think_loop_recoveries_total{{mode=\"{}\"}} {value}\n",
+                    escape_label(mode)
+                ));
+            }
+            out.push_str(
+                "# HELP hipfire_think_loop_skips_total Periodic #728 loop checks that declined, by reason.\n\
+                 # TYPE hipfire_think_loop_skips_total counter\n",
+            );
+            for (reason, value) in [
+                (
+                    "already_recovered",
+                    s.think_recovery.loop_skips_already_recovered,
+                ),
+                ("vision", s.think_recovery.loop_skips_vision),
+                (
+                    "budget_exhausted",
+                    s.think_recovery.loop_skips_budget_exhausted,
+                ),
+            ] {
+                out.push_str(&format!(
+                    "hipfire_think_loop_skips_total{{reason=\"{}\"}} {value}\n",
+                    escape_label(reason)
+                ));
+            }
         }
 
         // Multi-slot swap tier, from the last daemon `done` (or the CLI seed
@@ -1235,6 +1280,43 @@ mod tests {
         let out = m.render(&unpaged, 0, 16);
         assert!(out.contains("hipfire_slots_total 2\n"), "{out}");
         assert!(!out.contains("hipfire_kv_pages"), "{out}");
+    }
+
+    #[test]
+    fn think_recovery_counters_export_with_engine_stats() {
+        use hipfire_runtime::serve::{EngineStats, ThinkRecoveryStats};
+        let m = Metrics::default();
+        let meta = ServeMeta {
+            engine_stats: Some(EngineStats {
+                think_recovery: ThinkRecoveryStats {
+                    close_injections: 2,
+                    loop_recoveries: 1,
+                    loop_stops: 3,
+                    repeat_run_stops: 4,
+                    loop_skips_already_recovered: 5,
+                    loop_skips_vision: 6,
+                    loop_skips_budget_exhausted: 7,
+                },
+                ..EngineStats::default()
+            }),
+            ..ServeMeta::new("t".to_owned())
+        };
+        let out = m.render(&meta, 0, 16);
+        for sample in [
+            "hipfire_think_close_injections_total 2\n",
+            "hipfire_repeat_run_stops_total 4\n",
+            "hipfire_think_loop_recoveries_total{mode=\"recover\"} 1\n",
+            "hipfire_think_loop_recoveries_total{mode=\"stop\"} 3\n",
+            "hipfire_think_loop_skips_total{reason=\"already_recovered\"} 5\n",
+            "hipfire_think_loop_skips_total{reason=\"vision\"} 6\n",
+            "hipfire_think_loop_skips_total{reason=\"budget_exhausted\"} 7\n",
+        ] {
+            assert!(out.contains(sample), "{sample}: {out}");
+        }
+        // Standard route: no daemon snapshot, no think-recovery series.
+        let standard = m.render(&ServeMeta::new("t".to_owned()), 0, 16);
+        assert!(!standard.contains("hipfire_think_"), "{standard}");
+        assert!(!standard.contains("hipfire_repeat_run"), "{standard}");
     }
 
     #[test]

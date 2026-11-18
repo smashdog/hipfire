@@ -347,6 +347,28 @@ pub fn speculative_algorithm_name(algorithm: u32) -> &'static str {
     }
 }
 
+/// Think-recovery counters (#1053 / #728 / #606) folded into the multi-slot
+/// `done.engine_stats` snapshot; the serve gateway exports them on `/metrics`.
+/// Cumulative since daemon start. A daemon built without the pass loop always
+/// reports zeros.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ThinkRecoveryStats {
+    /// #1053: `\n` + think-close injections that continued the turn in-place.
+    pub close_injections: usize,
+    /// #728 recover mode: passes restarted with the low-effort sentence.
+    pub loop_recoveries: usize,
+    /// #728 stop mode: reasoning loops ended as `length`.
+    pub loop_stops: usize,
+    /// #606: same-token runs that ended the pass as `length`.
+    pub repeat_run_stops: usize,
+    /// Periodic #728 checks that declined, by reason. "below threshold" is
+    /// the normal case and is not counted.
+    pub loop_skips_already_recovered: usize,
+    pub loop_skips_vision: usize,
+    pub loop_skips_budget_exhausted: usize,
+}
+
 /// Serialized as the `engine_stats` object of every multi-slot `done` event;
 /// the serve gateway exports it on `/metrics`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -389,6 +411,8 @@ pub struct EngineStats {
     pub kvmem: KvMemStats,
     /// Speculative-decoding contract snapshot (期4; zeroed when off).
     pub speculative: SpeculativeStats,
+    /// Think-recovery counters, patched in by the daemon (zeroed elsewhere).
+    pub think_recovery: ThinkRecoveryStats,
 }
 
 impl EngineStats {
@@ -626,6 +650,14 @@ pub trait SlotEngineHandle: Send + Sync {
     fn submit(&self, req: SubmitRequest) -> Result<(), String>;
     /// Cancel a QUEUED request by submitter tag. Idempotent; tag 0 is a no-op.
     fn cancel_waiting(&self, request_tag: u64);
+    /// Ask the engine to end the CURRENT generation pass of `session` at the
+    /// next token boundary while keeping the session's KV resident, so a
+    /// follow-up request can continue the accepted token stream without a
+    /// cold prefill (think-recovery pass loop, both #1053 continuation and
+    /// #728 loop recovery). Fire-and-forget: the pass end is observed through
+    /// the request's `Done { reason: MaxTokens }` event. Default is a no-op
+    /// for engines without pass semantics (the embedding engines).
+    fn interrupt(&self, _session: u64) {}
     /// Close a session synchronously, cancelling any in-flight request and
     /// releasing its session/pool/swap state. Never silently ignored.
     fn close(&self, session: u64) -> Result<(), String>;

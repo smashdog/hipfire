@@ -50,10 +50,16 @@ use hipfire_runtime::prompt_frame::{
     JinjaChatFrame, Message, Role, ThinkMode, ToolCall,
 };
 use hipfire_runtime::serve::{
-    Continuation, DoneReason, Event, SlotEngineConfig, SubmitRequest, VisualData,
+    Continuation, DoneReason, Event, SlotEngineConfig, SubmitRequest, ThinkRecoveryStats,
+    VisualData,
 };
 use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx};
 use hipfire_runtime::tokenizer::Tokenizer;
+
+use crate::think_recovery::{
+    close_retry_skip_reason, focused_recovery_prompt, injection_text, CloseRetryInputs, GateAction,
+    GateCtx, LoopMode, StreamGates, REPEAT_STOP_TOKENS,
+};
 
 fn emit_qwen_ar_slot_error<W: std::io::Write>(
     stdout: &mut W,
@@ -264,6 +270,9 @@ pub struct SlotBackend {
     active: AtomicUsize,
     tool_grammar: bool,
     pending_tools: Mutex<PendingToolBroker>,
+    /// Cumulative think-recovery counters (#1053 / #728 / #606), patched into
+    /// the `done.engine_stats` snapshot the gateway exports on `/metrics`.
+    think_recovery: Mutex<ThinkRecoveryStats>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -739,11 +748,28 @@ impl SlotBackend {
             active: AtomicUsize::new(0),
             tool_grammar,
             pending_tools: Mutex::new(PendingToolBroker::default()),
+            think_recovery: Mutex::new(ThinkRecoveryStats::default()),
         })
     }
 
     pub fn arch_str(&self) -> &str {
         &self.arch_str
+    }
+
+    /// Fold one think-recovery event into the cumulative `/metrics` counters.
+    fn note_think_recovery(&self, apply: impl FnOnce(&mut ThinkRecoveryStats)) {
+        let mut st = self
+            .think_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        apply(&mut st);
+    }
+
+    fn think_recovery_snapshot(&self) -> ThinkRecoveryStats {
+        *self
+            .think_recovery
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
     /// The MTP mode this slot engine serves after the producer-capability gate.
     pub fn mtp_mode_effective(&self) -> &'static str {
@@ -1589,10 +1615,10 @@ impl SlotBackend {
         }
         // Transition queued (stdin reader announced). Bind will happen after Accepted.
         let _ = batch_transition_to_queued(id, attempt_id, admission);
-        let (tx, rx) = mpsc::channel::<Event>();
         // Cancellation identity (spec §4.6 C6): a request parked in the
         // engine's waiting room has no session id yet, so the abort path
         // cancels it by this tag. (id, attempt_id) is unique per attempt.
+        // Every think-recovery pass reuses the same tag.
         let request_tag = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1600,53 +1626,63 @@ impl SlotBackend {
             attempt_id.hash(&mut h);
             h.finish()
         };
-        let req = SubmitRequest {
-            query: request_query,
-            prompt_tokens,
-            convo: convo.clone(),
-            continuation,
-            max_tokens,
-            temperature,
-            top_p,
-            top_k: top_k as i32,
-            seed,
-            repeat_window,
-            repeat_penalty,
-            presence_penalty,
-            frequency_penalty,
-            min_p,
-            visual_data,
-            json_schema,
-            started_in_think,
-            // Enforced thinking budget: absent/0 = uncapped; the 1-sentinel
-            // never enters a think span so the budget cannot engage.
-            think_budget: max_think_tokens
-                .filter(|&n| n >= 2)
-                .map(|n| n as usize)
-                .unwrap_or(usize::MAX),
-            // Canonical pending-input bytes (spec §5.3): the engine's wait
-            // queue charges its byte cap against this, so daemon-side
-            // waiters must carry the real prompt weight — a hardcoded 0
-            // (floored to 1 downstream) made the byte cap unbindable.
-            queue_bytes: canonical_prompt_bytes(msg),
-            request_tag,
-            reply: tx,
+        // ── Think-recovery pass loop (hipfire-think-recovery-design.md) ──
+        // #1053 (inject a think-close and continue), #728 (detect reasoning
+        // loops and stop/recover) and #606 (same-token run guard) all extend
+        // ONE request across several engine passes. A pass whose repair must
+        // be invisible to the client ends through `EngineCommand::Interrupt`;
+        // the session KV stays resident for the continuation pass.
+        // Served default is ON (design Q1); HIPFIRE_REASONING_CLOSE_RETRY=0/off
+        // disables. Unknown values keep the served default.
+        let close_retry_enabled = hipfire_config::developer_var("HIPFIRE_REASONING_CLOSE_RETRY")
+            .map(|v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
+            .unwrap_or(true);
+        // Served default is `recover` (design Q1); an explicit valid value
+        // overrides, and an invalid value falls back to `off` rather than
+        // guessing at the operator's intent.
+        let loop_mode = hipfire_config::developer_var("HIPFIRE_REASONING_LOOP_RECOVERY")
+            .map(|v| LoopMode::from_config_value(&v).unwrap_or(LoopMode::Off))
+            .unwrap_or(LoopMode::Recover);
+        let repeat_stop = hipfire_config::developer_var("HIPFIRE_REPEAT_STOP_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(REPEAT_STOP_TOKENS);
+        // Only thinking turns are repaired. Vision and structured-output
+        // requests keep single-pass semantics: an injected token would
+        // desync the schema cursor, and the multi-slot vision path owns its
+        // own per-token pipeline.
+        let has_vision = visual_data.is_some();
+        let recovery_allowed = !has_vision && json_schema.is_none();
+        let close_retry_enabled = close_retry_enabled && recovery_allowed;
+        let loop_mode = if recovery_allowed {
+            loop_mode
+        } else {
+            LoopMode::Off
         };
-        if let Err(e) = self.engine.submit(req) {
-            if let Some(session) = claimed_session {
-                self.close_session(session);
+        let trace_think = |line: String| {
+            if hipfire_config::developer_var("HIPFIRE_SLOT_TRACE").is_ok() {
+                eprintln!("[think-recover] {line}");
             }
-            emit_qwen_ar_slot_error(
-                stdout,
-                id,
-                &format!("multi_slot submit: {e}"),
-                "internal",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return Ok(());
-        }
+        };
+        let original_prompt = prompt_tokens.clone();
+        // raw_ids: every sampled token of the request, rendered or not (a
+        // gate may drop a token from the client stream, but it is still part
+        // of the sampled history).
+        let mut gen_ids: Vec<u32> = Vec::new();
+        // Client-visible completion tokens (delivered + injected).
+        let mut tokens_total: usize = 0;
+        let mut injected_once = false;
+        // The reference's per-token gate state: sampled count, repeat run,
+        // loop schedule, reasoning text, sticky answered flag.
+        let mut gates = StreamGates::new(repeat_stop);
+        let mut repeat_stopped = false;
+        let mut loop_stopped = false;
+        let mut pass_prompt = prompt_tokens;
+        let mut pass_continuation = continuation;
+        let mut pass_max_tokens = max_tokens;
+        let mut pass_temperature = temperature;
+        let mut pass_presence = presence_penalty;
+        let mut pass_index: usize = 0;
 
         // Stream loop with keyed terminal binding
         let mut accepted_session: Option<u64> = None;
@@ -1704,146 +1740,440 @@ impl SlotBackend {
         // a normal stop: the client would see a clean-looking truncated
         // answer while the session leaks resident on its slot.
         let mut engine_died = false;
+        // The previous pass's terminal, kept so a REJECTED continuation can
+        // fall back to the stream the client actually saw.
+        let mut saved_stop: Option<(DoneReason, usize)> = None;
+        // #1053: tokens to feed the emitter once the continuation pass is
+        // ADMITTED (a rejected continuation must leave no trace for the
+        // client). Survives the pass boundary on purpose.
+        let mut pending_injection: Option<Vec<u32>> = None;
 
-        loop {
-            if batch_check_abort(id, attempt_id, admission) {
-                drop(rx);
-                // A request parked in the engine's waiting room has no
-                // session to close — cancel it by tag so it leaves the queue
-                // (and its queue-byte charge) immediately instead of being
-                // admitted against a dead receiver later (spec §4.6 C6/A11).
-                self.engine.cancel_waiting(request_tag);
+        'pass: loop {
+            pass_index += 1;
+            done_reason = None;
+            rejected = None;
+            engine_died = false;
+            repeat_stopped = false;
+            loop_stopped = false;
+            let mut pass_ending = false;
+            let mut gate_trip_len: usize = 0;
+            let mut recover_requested = false;
+            let (tx, rx) = mpsc::channel::<Event>();
+            let req = SubmitRequest {
+                query: if pass_index == 1 { request_query } else { None },
+                prompt_tokens: std::mem::take(&mut pass_prompt),
+                convo: convo.clone(),
+                continuation: std::mem::replace(&mut pass_continuation, Continuation::Cold),
+                max_tokens: pass_max_tokens,
+                temperature: pass_temperature,
+                top_p,
+                top_k: top_k as i32,
+                seed,
+                repeat_window,
+                repeat_penalty,
+                presence_penalty: pass_presence,
+                frequency_penalty,
+                min_p,
+                visual_data: if pass_index == 1 {
+                    visual_data.take()
+                } else {
+                    None
+                },
+                json_schema: if pass_index == 1 {
+                    json_schema.clone()
+                } else {
+                    None
+                },
+                started_in_think,
+                // Enforced thinking budget: absent/0 = uncapped; the 1-sentinel
+                // never enters a think span so the budget cannot engage.
+                think_budget: max_think_tokens
+                    .filter(|&n| n >= 2)
+                    .map(|n| n as usize)
+                    .unwrap_or(usize::MAX),
+                // Canonical pending-input bytes (spec §5.3): the engine's wait
+                // queue charges its byte cap against this, so daemon-side
+                // waiters must carry the real prompt weight — a hardcoded 0
+                // (floored to 1 downstream) made the byte cap unbindable.
+                queue_bytes: canonical_prompt_bytes(msg),
+                request_tag,
+                reply: tx,
+            };
+            if let Err(e) = self.engine.submit(req) {
+                if let Some(session) = claimed_session {
+                    self.close_session(session);
+                }
+                emit_qwen_ar_slot_error(
+                    stdout,
+                    id,
+                    &format!("multi_slot submit: {e}"),
+                    "internal",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return Ok(());
+            }
+
+            loop {
+                if batch_check_abort(id, attempt_id, admission) {
+                    drop(rx);
+                    // A request parked in the engine's waiting room has no
+                    // session to close — cancel it by tag so it leaves the queue
+                    // (and its queue-byte charge) immediately instead of being
+                    // admitted against a dead receiver later (spec §4.6 C6/A11).
+                    self.engine.cancel_waiting(request_tag);
+                    if let Some(sess) = accepted_session.take() {
+                        self.close_session(sess);
+                    } else if let Some(session) = claimed_session {
+                        self.close_session(session);
+                    }
+                    emit_active_route_cancel(stdout, id, produced);
+                    return Ok(());
+                }
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(ev) => match ev {
+                        Event::Accepted {
+                            session,
+                            reused,
+                            prefill,
+                        } => {
+                            // An admit may have swept parked sessions; prune their
+                            // broker state before this request can name one.
+                            self.reap_closed_sessions();
+                            if pass_index == 1 {
+                                if let Some(expected) =
+                                    claimed_session.filter(|expected| *expected != session)
+                                {
+                                    // The claimed session was swept between emitting the
+                                    // calls and answering them (an idle park for another
+                                    // admit), and the engine re-admitted this exact
+                                    // conversation: either its parked history was
+                                    // restored (only the tool-result suffix prefills) or
+                                    // the prompt cold-prefilled with the results already
+                                    // in it. The claim is already consumed, so a retry
+                                    // could never re-claim — failing here would strand
+                                    // the conversation. Adopt the accepted session; the
+                                    // next pending turn registers under it.
+                                    eprintln!(
+                                        "[tool-reentry] claimed session {expected} was swept; \
+                                         adopted accepted session {session} (reused={reused} \
+                                         prefill={prefill})"
+                                    );
+                                    self.close_session(expected);
+                                }
+                            }
+                            accepted_session = Some(session);
+                            if pass_index == 1 {
+                                // The client-facing prompt accounting is the
+                                // FIRST pass's; later passes extend it
+                                // engine-side only.
+                                cached_tokens = reused;
+                                prefill_tokens = prefill;
+                            }
+                            let ticket = LaneTicket {
+                                lane: (session % 1024) as usize,
+                                generation: session,
+                                admission,
+                            };
+                            accepted_ticket = Some(ticket);
+                            let _ = batch_bind_active(id, attempt_id, admission, ticket);
+                            // #1053: the injected close renders only once the
+                            // continuation pass is ADMITTED — a rejected
+                            // continuation must leave the client stream
+                            // without it.
+                            if let Some(ids) = pending_injection.take() {
+                                for tok_id in ids {
+                                    let evs = emitter.observe_injected(tok_id);
+                                    for ev in &evs {
+                                        match ev {
+                                            ClientEvent::Reasoning(text) => {
+                                                gates.push_reasoning(text)
+                                            }
+                                            ClientEvent::Token(_) | ClientEvent::ToolCalls(_) => {
+                                                gates.mark_answered()
+                                            }
+                                            ClientEvent::Committed { .. } => {}
+                                        }
+                                    }
+                                    render_events(evs, stdout, &mut terminal_tool_calls);
+                                    tokens_total += 1;
+                                }
+                            }
+                        }
+                        Event::Token { id: tok_id } => {
+                            // Every sampled token joins the history, rendered
+                            // or not: the later continuation prompts reproduce
+                            // this exact stream.
+                            gen_ids.push(tok_id);
+                            if pass_ending {
+                                // The gate ended this pass AT the trip token;
+                                // anything the engine emits before the
+                                // interrupt lands was never part of the
+                                // sampled request: keep it out of the history
+                                // the recovery prompt reproduces and out of n.
+                                gen_ids.truncate(gate_trip_len);
+                                continue;
+                            }
+                            // #606 → #728 in the reference's order; both read
+                            // the state as of the previous token.
+                            let mut splice_ok = || {
+                                focused_recovery_prompt(
+                                    &self.tokenizer,
+                                    &original_prompt,
+                                    &gen_ids,
+                                )
+                                .is_some()
+                            };
+                            let gate = gates.note_token(
+                                tok_id,
+                                &GateCtx {
+                                    loop_mode,
+                                    open_think: emitter.open_think_now(),
+                                    clean_boundary: emitter.at_clean_boundary(),
+                                    has_images: has_vision,
+                                    max_new: max_tokens,
+                                },
+                                &mut splice_ok,
+                            );
+                            if let Some(line) = gate.trace {
+                                trace_think(line);
+                            }
+                            if let Some(reason) = gate.skip {
+                                self.note_think_recovery(|st| match reason {
+                                    "already recovered" => st.loop_skips_already_recovered += 1,
+                                    "vision" => st.loop_skips_vision += 1,
+                                    "budget exhausted" => st.loop_skips_budget_exhausted += 1,
+                                    _ => {}
+                                });
+                            }
+                            match gate.action {
+                                GateAction::Deliver => {}
+                                GateAction::RepeatStop
+                                | GateAction::LoopStop
+                                | GateAction::Recover => {
+                                    match gate.action {
+                                        GateAction::RepeatStop => {
+                                            repeat_stopped = true;
+                                            self.note_think_recovery(|st| {
+                                                st.repeat_run_stops += 1
+                                            });
+                                        }
+                                        GateAction::LoopStop => {
+                                            loop_stopped = true;
+                                            self.note_think_recovery(|st| st.loop_stops += 1);
+                                        }
+                                        _ => {
+                                            recover_requested = true;
+                                            self.note_think_recovery(|st| {
+                                                st.loop_recoveries += 1
+                                            });
+                                        }
+                                    }
+                                    pass_ending = true;
+                                    gate_trip_len = gen_ids.len();
+                                    if let Some(sess) = accepted_session {
+                                        self.engine.interrupt(sess);
+                                    }
+                                    continue;
+                                }
+                            }
+                            let outcome = if first_token {
+                                first_token = false;
+                                emitter.begin(tok_id)
+                            } else {
+                                emitter.observe(tok_id)
+                            };
+                            for ev in &outcome.events {
+                                match ev {
+                                    ClientEvent::Reasoning(text) => gates.push_reasoning(text),
+                                    ClientEvent::Token(_) | ClientEvent::ToolCalls(_) => {
+                                        gates.mark_answered()
+                                    }
+                                    ClientEvent::Committed { .. } => {}
+                                }
+                            }
+                            render_events(outcome.events, stdout, &mut terminal_tool_calls);
+                            produced += 1;
+                            tokens_total += 1;
+                        }
+                        Event::Done { reason, generated } => {
+                            done_reason = Some((reason, generated));
+                            break;
+                        }
+                        Event::Rejected { class, reason } => {
+                            rejected = Some((class, reason));
+                            break;
+                        }
+                    },
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        engine_died = true;
+                        break;
+                    }
+                }
+            }
+
+            // ── per-pass conclusion ──
+            if engine_died {
+                if let Some(sess) = accepted_session.take() {
+                    let _ = self.engine.close(sess);
+                }
+                hipfire_engine::emit::emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &format!(
+                        "multi_slot engine terminated without completing request {} \
+                         (engine thread exited; {produced} tokens were produced)",
+                        attempt_id
+                    ),
+                    "internal",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return Ok(());
+            }
+            if let Some((class, reason)) = rejected {
+                // A continuation pass that never produced a terminal of its
+                // own falls back to the pass whose stream the client saw.
+                if let Some((prev_reason, prev_generated)) = saved_stop.take() {
+                    trace_think(format!(
+                        "continuation rejected ({reason}); keeping the previous pass terminal"
+                    ));
+                    done_reason = Some((prev_reason, prev_generated));
+                    break 'pass;
+                }
                 if let Some(sess) = accepted_session.take() {
                     self.close_session(sess);
                 } else if let Some(session) = claimed_session {
                     self.close_session(session);
                 }
-                emit_active_route_cancel(stdout, id, produced);
+                let kind = match class {
+                    hipfire_runtime::serve::RejectClass::Overload => "overload",
+                    hipfire_runtime::serve::RejectClass::Validation => "validation",
+                    hipfire_runtime::serve::RejectClass::Internal => "internal",
+                    hipfire_runtime::serve::RejectClass::Cancel => "cancel",
+                };
+                hipfire_engine::emit::emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &format!("multi_slot rejected: {reason}"),
+                    kind,
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
                 return Ok(());
             }
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(ev) => match ev {
-                    Event::Accepted {
-                        session,
-                        reused,
-                        prefill,
-                    } => {
-                        // An admit may have swept parked sessions; prune their
-                        // broker state before this request can name one.
-                        self.reap_closed_sessions();
-                        if let Some(expected) =
-                            claimed_session.filter(|expected| *expected != session)
-                        {
-                            self.close_session(expected);
-                            accepted_session = Some(session);
-                            rejected = Some((
-                                hipfire_runtime::serve::RejectClass::Internal,
-                                "tool-result reentry was admitted on the wrong slot session"
-                                    .to_string(),
-                            ));
-                            break;
-                        }
-                        accepted_session = Some(session);
-                        cached_tokens = reused;
-                        prefill_tokens = prefill;
-                        let ticket = LaneTicket {
-                            lane: (session % 1024) as usize,
-                            generation: session,
-                            admission,
-                        };
-                        accepted_ticket = Some(ticket);
-                        let _ = batch_bind_active(id, attempt_id, admission, ticket);
+            let Some((reason, generated)) = done_reason else {
+                // Channel closed without any terminal event: treat like the
+                // engine died (never a normal stop).
+                if let Some(sess) = accepted_session.take() {
+                    let _ = self.engine.close(sess);
+                }
+                emit_qwen_ar_slot_error(
+                    stdout,
+                    id,
+                    "multi_slot stream ended before session acceptance",
+                    "internal",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return Ok(());
+            };
+            let natural_stop = matches!(reason, DoneReason::Eos);
+            if natural_stop {
+                // n counts the sampled terminator: the reference appends it
+                // to its sampled stream before breaking.
+                gates.note_eos();
+            }
+            saved_stop = Some((reason, generated));
+
+            // ── #728 recover: the loop gate ended this pass ──
+            if recover_requested {
+                gates.mark_recovered();
+                if let Some(sess) = accepted_session.take() {
+                    // The recovered prompt rewrites the head effort sentence:
+                    // no prefix of it can be reused, so hand pass one's
+                    // session back before the cold restart.
+                    self.close_session(sess);
+                }
+                match focused_recovery_prompt(&self.tokenizer, &original_prompt, &gen_ids) {
+                    Some(prompt) => {
+                        pass_prompt = prompt;
+                        pass_continuation = Continuation::Cold;
+                        pass_temperature = temperature.max(1.0);
+                        pass_presence = presence_penalty.max(1.5);
+                        pass_max_tokens = max_tokens.saturating_sub(gates.n()).max(1);
+                        trace_think(format!(
+                            "recover pass: temperature {} presence {} max_tokens {}",
+                            pass_temperature, pass_presence, pass_max_tokens
+                        ));
+                        continue 'pass;
                     }
-                    Event::Token { id: tok_id } => {
-                        let outcome = if first_token {
-                            first_token = false;
-                            emitter.begin(tok_id)
-                        } else {
-                            emitter.observe(tok_id)
-                        };
-                        render_events(outcome.events, stdout, &mut terminal_tool_calls);
-                        produced += 1;
+                    None => {
+                        trace_think(format!(
+                            "recovery prompt unavailable after the pass (effort sentence \
+                             absent; request effort={jinja_effort:?}); ending as length"
+                        ));
+                        break 'pass;
                     }
-                    Event::Done { reason, generated } => {
-                        done_reason = Some((reason, generated));
-                        break;
-                    }
-                    Event::Rejected { class, reason } => {
-                        rejected = Some((class, reason));
-                        break;
-                    }
-                },
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => {
-                    engine_died = true;
-                    break;
                 }
             }
+            if repeat_stopped || loop_stopped {
+                break 'pass;
+            }
+
+            // ── #1053: a natural stop landed with thinking still open ──
+            if let Some(close) = emitter.think_close_text().map(str::to_string) {
+                let extra = self.tokenizer.encode(&injection_text(&close));
+                let skip = close_retry_skip_reason(&CloseRetryInputs {
+                    enabled: close_retry_enabled,
+                    // The open-think gate below is the operative filter; the
+                    // reference's separate `thinking` flag only reorders the
+                    // skip reason for requests that never opened a span.
+                    thinking: true,
+                    natural_stop,
+                    answered: gates.answered(),
+                    cancelled: false,
+                    open_think: emitter.open_think_now(),
+                    already_injected: injected_once,
+                    budget_left: max_tokens.saturating_sub(gates.n()),
+                    extra_len: extra.len(),
+                });
+                if skip.is_none() && !extra.is_empty() {
+                    if let Some(session) = accepted_session {
+                        injected_once = true;
+                        self.note_think_recovery(|st| st.close_injections += 1);
+                        gates.note_injected(extra.len());
+                        pass_max_tokens = max_tokens.saturating_sub(gates.n()).max(1);
+                        let mut full = original_prompt.clone();
+                        full.extend_from_slice(&gen_ids);
+                        full.extend_from_slice(&extra);
+                        pass_prompt = full;
+                        pass_continuation = Continuation::ToolResults {
+                            tokens: extra.clone(),
+                            session,
+                        };
+                        pending_injection = Some(extra.clone());
+                        trace_think(format!(
+                            "close-retry: injected {} close tokens at n={}; continuing in-turn",
+                            extra.len(),
+                            gates.n()
+                        ));
+                        continue 'pass;
+                    }
+                } else if let Some(reason) = skip {
+                    trace_think(format!(
+                        "close-retry skipped: {reason} (request effort={jinja_effort:?})"
+                    ));
+                }
+            }
+            break 'pass;
         }
 
-        if engine_died {
-            // The engine thread dropped its end without Done/Rejected. Close
-            // the session (its resident state is untrustworthy) and fail
-            // loudly — never a normal "stop" with partial tokens.
-            drop(rx);
-            if let Some(sess) = accepted_session.take() {
-                let _ = self.engine.close(sess);
-            }
-            hipfire_engine::emit::emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!(
-                    "multi_slot engine terminated without completing request {} \
-                     (engine thread exited; {produced} tokens were produced)",
-                    attempt_id
-                ),
-                "internal",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return Ok(());
-        }
-
-        if let Some((class, reason)) = rejected {
-            drop(rx);
-            if let Some(sess) = accepted_session.take() {
-                self.close_session(sess);
-            } else if let Some(session) = claimed_session {
-                self.close_session(session);
-            }
-            let kind = match class {
-                hipfire_runtime::serve::RejectClass::Overload => "overload",
-                hipfire_runtime::serve::RejectClass::Validation => "validation",
-                hipfire_runtime::serve::RejectClass::Internal => "internal",
-                hipfire_runtime::serve::RejectClass::Cancel => "cancel",
-            };
-            hipfire_engine::emit::emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("multi_slot rejected: {reason}"),
-                kind,
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return Ok(());
-        }
-        if accepted_session.is_none() {
-            if let Some(session) = claimed_session {
-                self.close_session(session);
-            }
-            emit_qwen_ar_slot_error(
-                stdout,
-                id,
-                "multi_slot stream ended before session acceptance",
-                "internal",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return Ok(());
-        }
         let summary = emitter.finish();
         render_events(summary.events, stdout, &mut terminal_tool_calls);
         // Multi-slot keeps failing closed on an unfinished tool call at any
@@ -1875,7 +2205,7 @@ impl SlotBackend {
             return Ok(());
         }
 
-        let (reason, generated) = done_reason.unwrap_or((DoneReason::Eos, produced));
+        let (reason, _generated) = done_reason.unwrap_or((DoneReason::Eos, produced));
         if matches!(reason, DoneReason::ClientGone) {
             if let Some(sess) = accepted_session.take() {
                 self.close_session(sess);
@@ -1922,7 +2252,10 @@ impl SlotBackend {
             "id": id,
             "attempt_id": attempt_id,
             "finish_reason": finish_reason,
-            "tokens": generated,
+            // Completion tokens include every delivered token across the
+            // recovery passes plus the injected think-close, like the
+            // reference's usage accounting.
+            "tokens": tokens_total,
             "prompt_tokens": cached_tokens + prefill_tokens,
             "cached_tokens": cached_tokens,
             "prefill_tokens": prefill_tokens,
@@ -1935,6 +2268,18 @@ impl SlotBackend {
         // Live swap-tier counters for /health. The engine refreshes its stats
         // each step, so this is the state as of (at worst) the current step.
         pending_done["swap"] = swap_stats_json(&self.engine.stats());
+        // Think-recovery totals ride the same snapshot so the gateway's
+        // `/metrics` sees them without a second channel (Q8).
+        if let Some(engine_stats) = pending_done
+            .get_mut("engine_stats")
+            .and_then(|value| value.as_object_mut())
+        {
+            engine_stats.insert(
+                "think_recovery".to_string(),
+                serde_json::to_value(self.think_recovery_snapshot())
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
 
         // Mark ready with exact pending done, publish commit_ready, poll keyed Commit/Abort with normal timeout
         let Some(ticket) = accepted_ticket else {
@@ -1967,7 +2312,11 @@ impl SlotBackend {
         match decision {
             hipfire_engine::terminal::ClientTerminalDecision::Commit => {
                 if let Some(session) = accepted_session {
-                    if open_think {
+                    // A gate-ended pass (repeat run / reasoning loop) leaves
+                    // the engine stream holding at least one sampled token the
+                    // client never saw: the session no longer reproduces the
+                    // rendered history, so it is not reusable either.
+                    if open_think || repeat_stopped || loop_stopped {
                         self.close_session(session);
                     } else {
                         self.pending_tools

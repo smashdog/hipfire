@@ -96,6 +96,7 @@ mod npu_route;
 mod process_init;
 mod request_guards;
 mod slots;
+mod think_recovery;
 mod vision_ladder;
 mod weight_host_tenant;
 use vision_ladder::{apply_vision_mode_gate, resolve_vision_ladder};
