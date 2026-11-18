@@ -89,17 +89,29 @@ impl<'a> Qwen35Emit<'a> {
     /// `tool_schemas_dflash` builder. A spent think budget splices
     /// `HIPFIRE_THINK_CONTINUATION` (default `</think>\n\n`).
     pub fn from_ctx(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
-        Self::with_think_close(ctx, think_continuation_text())
+        Self::with_think_close(ctx, think_continuation_text(), false)
+    }
+
+    /// [`Self::from_ctx`] for serving: malformed tool spans are released as
+    /// ordinary assistant text (PolyStrata-style fallback) instead of ending
+    /// the turn with `malformed_protocol`, so a degenerate call degrades the
+    /// answer instead of failing the request.
+    pub fn from_ctx_recover(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
+        Self::with_think_close(ctx, think_continuation_text(), true)
     }
 
     /// [`Self::from_ctx`] for Qwen4, whose AR producer splices the template's
     /// own close ([`QWEN_TEMPLATE_THINK_CLOSE`]) when the think budget runs
     /// out; MTP must splice the same tokens to produce the same text.
     pub fn from_ctx_template_think_close(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
-        Self::with_think_close(ctx, QWEN_TEMPLATE_THINK_CLOSE.to_string())
+        Self::with_think_close(ctx, QWEN_TEMPLATE_THINK_CLOSE.to_string(), false)
     }
 
-    fn with_think_close(ctx: SpecEmitCtx<'a>, think_close: String) -> Box<dyn SpecEmit + 'a> {
+    fn with_think_close(
+        ctx: SpecEmitCtx<'a>,
+        think_close: String,
+        tool_recover: bool,
+    ) -> Box<dyn SpecEmit + 'a> {
         let tool_protocol_enabled = ctx.tools.is_some();
         let tool_schemas: Vec<grammar::ToolSchema> = ctx
             .tools
@@ -139,7 +151,7 @@ impl<'a> Qwen35Emit<'a> {
             stream_bytes: Vec::new(),
             streamed_tokens: Vec::new(),
             router: if tool_protocol_enabled {
-                ToolOutputRouter::new()
+                ToolOutputRouter::new().with_recover(tool_recover)
             } else {
                 ToolOutputRouter::disabled()
             },
@@ -187,7 +199,14 @@ impl<'a> Qwen35Emit<'a> {
                     }
                 }
             }
-            Err(_) => {
+            Err(err) => {
+                if hipfire_config::developer_var("HIPFIRE_SLOT_TRACE").is_ok() {
+                    eprintln!(
+                        "[tool-router] malformed at gen={}: {err} | body tail={:?}",
+                        self.generated_hint,
+                        self.router.debug_buffer(),
+                    );
+                }
                 self.router_malformed = true;
             }
         }
@@ -474,6 +493,13 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
         }
 
         if self.router_malformed || self.router.is_malformed() {
+            if hipfire_config::developer_var("HIPFIRE_SLOT_TRACE").is_ok() {
+                eprintln!(
+                    "[tool-router] finish malformed: {:?} | body tail={:?}",
+                    self.router.malformed_detail(),
+                    self.router.debug_buffer(),
+                );
+            }
             let _ = self.router.finish();
             return FinishSummary {
                 events,
@@ -502,14 +528,22 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
             // reason: the wrapper lets a pure length exit win (AR's rule in
             // `qwen_ar_finish_route`) and fails closed only when the model
             // ended the turn there. A mid-stream latch stays `malformed_protocol`.
-            Err(_) => FinishSummary {
-                events,
-                finish_reason: "truncated_tool_call",
-                tool_calls: 0,
-                visible_text: std::mem::take(&mut self.visible_acc),
-                decoded_eot,
-                open_think: false,
-            },
+            Err(err) => {
+                if hipfire_config::developer_var("HIPFIRE_SLOT_TRACE").is_ok() {
+                    eprintln!(
+                        "[tool-router] finish truncated: {err} | stop_matched={}",
+                        self.stop.matched(),
+                    );
+                }
+                FinishSummary {
+                    events,
+                    finish_reason: "truncated_tool_call",
+                    tool_calls: 0,
+                    visible_text: std::mem::take(&mut self.visible_acc),
+                    decoded_eot,
+                    open_think: false,
+                }
+            }
             Ok(evs) => {
                 let mut finished_calls = buffered_before;
                 for ev in evs {
@@ -686,13 +720,41 @@ mod tests {
         })
     }
 
+    fn make_emit_recover<'a>(tok: &'a Tokenizer) -> Box<dyn SpecEmit + 'a> {
+        Qwen35Emit::from_ctx_recover(SpecEmitCtx {
+            tokenizer: tok,
+            eos: 9,
+            im_end: Some(1),
+            tools: Some(&[]),
+            enable_grammar: true,
+            stop: Vec::new(),
+            min_tokens: 0,
+            max_think: 0,
+            max_tokens: 256,
+            assistant_prefix: AssistantPrefix::Plain,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            decoded_vocab: None,
+        })
+    }
+
     /// Drive the production emitter with whole-string encodes (one observe per
     /// encoded token). Returns (stream events, finish, streamed_tokens).
     fn drive_text(text: &str) -> (Vec<ClientEvent>, FinishSummary, Vec<u32>) {
+        drive_text_with(text, make_emit)
+    }
+
+    fn drive_text_recover(text: &str) -> (Vec<ClientEvent>, FinishSummary, Vec<u32>) {
+        drive_text_with(text, make_emit_recover)
+    }
+
+    fn drive_text_with(
+        text: &str,
+        build: for<'a> fn(&'a Tokenizer) -> Box<dyn SpecEmit + 'a>,
+    ) -> (Vec<ClientEvent>, FinishSummary, Vec<u32>) {
         let tok = test_tokenizer();
         let ids = tok.encode(text);
         assert!(!ids.is_empty(), "encode produced no tokens for {text:?}");
-        let mut emit = make_emit(&tok);
+        let mut emit = build(&tok);
         let mut stream = Vec::new();
         let mut first = true;
         for id in &ids {
@@ -867,6 +929,29 @@ mod tests {
         assert!(!tokens_text(&stream).contains("<tool_call>"));
         assert_eq!(finish.finish_reason, "malformed_protocol");
         assert_eq!(finish.tool_calls, 0);
+    }
+
+    #[test]
+    fn recover_mode_releases_malformed_spans_as_answer_text() {
+        // Strict mode fails these turns closed (`malformed_protocol` /
+        // `truncated_tool_call`); the serving constructor must instead end
+        // them normally with the degenerate span as assistant content.
+        let stacked = "<tool_call>{\"name\":\"a\",\"arguments\":{}}<tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>";
+        let (stream, finish, _) = drive_text_recover(stacked);
+        assert_eq!(finish.finish_reason, "stop");
+        assert_eq!(finish.tool_calls, 0);
+        assert!(held_calls(&finish).is_empty());
+        let mut visible = tokens_text(&stream);
+        visible.push_str(&tokens_text(&finish.events));
+        assert_eq!(visible, stacked);
+
+        let unclosed = "pre<tool_call>{\"name\":\"x\"";
+        let (stream2, finish2, _) = drive_text_recover(unclosed);
+        assert_eq!(finish2.finish_reason, "stop");
+        assert_eq!(finish2.tool_calls, 0);
+        let mut visible2 = tokens_text(&stream2);
+        visible2.push_str(&tokens_text(&finish2.events));
+        assert_eq!(visible2, unclosed);
     }
 
     #[test]

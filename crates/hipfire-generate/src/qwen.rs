@@ -949,7 +949,8 @@ pub fn ep_serve_qwen35_dense_tp(
 
     let t_decode = Instant::now();
     let mut semantic =
-        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, tools_enabled);
+        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, tools_enabled)
+            .with_tool_recover();
     let mut streamed_tokens: Vec<u32> = Vec::new();
     let mut bytes_fed_to_filter = 0usize;
     let mut generated = 0usize;
@@ -1298,7 +1299,8 @@ pub fn ep_serve_qwen35_moe(
 
     let t_decode = Instant::now();
     let mut semantic =
-        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, tools_enabled);
+        crate::ar::QwenArSemanticProducer::new_with_tool_protocol(id, primed_think, tools_enabled)
+            .with_tool_recover();
     let mut streamed_tokens: Vec<u32> = Vec::new();
     let mut bytes_fed_to_filter = 0usize;
     let mut generated = 0usize;

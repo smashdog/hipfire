@@ -524,6 +524,14 @@ impl QwenArSemanticProducer {
         Self::new_with_tool_protocol(id, started_in_think, true)
     }
 
+    /// Serving fallback: release malformed tool spans as ordinary assistant
+    /// text instead of ending the turn with a malformed-protocol error.
+    pub fn with_tool_recover(mut self) -> Self {
+        let router = std::mem::take(&mut self.router);
+        self.router = router.with_recover(true);
+        self
+    }
+
     pub fn new_with_tool_protocol(
         id: impl Into<String>,
         started_in_think: bool,
