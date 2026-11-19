@@ -14,32 +14,27 @@
 //! the #728 detect gate (:4999-5011) and the recovery action (:5072-5091). No engine, tokenizer or I/O here; S2
 //! wires these decisions into `slots.rs` and the runtime's `SpecEmit` state.
 
-use std::collections::{HashMap, HashSet};
-
-/// Output tokens between two looks at the reasoning (`LOOP_CHECK_EVERY`).
-pub const LOOP_CHECK_EVERY: usize = 512;
-/// Share of the recent window inside 12-word passages seen three times that reads as a loop (`LOOP_COVERAGE`).
-pub const LOOP_COVERAGE: f64 = 0.25;
-/// How far back the passages are counted (`LOOP_HISTORY_WORDS`).
-pub const LOOP_HISTORY_WORDS: usize = 30_000;
-/// Characters at the end of the reasoning also checked for a short period (`LOOP_TAIL_CHARS`, #1753).
-pub const LOOP_TAIL_CHARS: usize = 2048;
-/// A period at most this long in that tail reads as a fully repeated window (`LOOP_TAIL_PERIOD`).
-pub const LOOP_TAIL_PERIOD: usize = 64;
-/// Passage width in words for the coverage count.
-pub const LOOP_WIDTH: usize = 12;
-/// Recent window in words for the coverage count.
-pub const LOOP_WINDOW_WORDS: usize = 2000;
+// Loop detection primitives live in `hipfire-runtime` so the sequential AR decode
+// loop (`hipfire-generate`) shares them without depending on this crate; re-exported
+// here under the names the multi-slot gates and tests already use.
+pub use hipfire_runtime::reasoning_loop::{
+    reasoning_repeat_coverage, LoopCheck, LoopMode, HIGH_EFFORT_INSTRUCTION, LOOP_CHECK_EVERY,
+    LOOP_COVERAGE, LOOP_HISTORY_WORDS, LOOP_TAIL_CHARS, LOOP_TAIL_PERIOD, LOOP_WIDTH,
+    LOOP_WINDOW_WORDS, LOW_EFFORT_INSTRUCTION,
+};
 /// One token repeated this many times in a row ends the reply as "length" (`REPEAT_STOP_TOKENS`).
 pub const REPEAT_STOP_TOKENS: usize = 256;
+/// From this `max_tokens` on, a thinking reply without an explicit budget is closed early enough to leave the
+/// answer its room (`ANSWER_ROOM_MIN_CAP`, #1053's answer room).
+pub const ANSWER_ROOM_MIN_CAP: usize = 1024;
+/// The answer never gets less than this many tokens of the cap (`ANSWER_RESERVE_MIN`).
+pub const ANSWER_RESERVE_MIN: usize = 512;
+/// Margin the reference keeps between prompt + answer and the context (`CTX_SLACK`).
+pub const CTX_SLACK: usize = 8;
 
-/// The template's own xhigh sentence, which the recovery pass swaps for the low one (`EFFORT_TEXT["xhigh"]`).
-pub const HIGH_EFFORT_INSTRUCTION: &str = "Reasoning effort is set to xhigh. Please think carefully through the \
-task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and \
-clarity in the final answer.";
-/// The low sentence spliced in by the recovery pass (`EFFORT_TEXT["low"]`).
-pub const LOW_EFFORT_INSTRUCTION: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, \
-moving directly to the conclusion without unnecessary elaboration.";
+/// The wrap-up sentence a budget-capped thinking span ends with (`REASONING_WRAP_UP` minus its close).
+pub const WRAP_UP_SENTENCE: &str =
+    "\n\nI have thought about this long enough; time to give my answer.";
 
 /// The chat template's turn-end token, which closes the first (system) message in a rendered prompt.
 pub const IM_END: &str = "<|im_end|>";
@@ -58,106 +53,64 @@ pub fn injection_text(think_close: &str) -> String {
     s
 }
 
-/// The reasoning-loop knob's three states. The reference has off/True("recover")/"stop"; served defaults to
-/// recover, library and test callers default to off (design §4).
+/// `closed_with(REASONING_WRAP_UP, think_end)`: the reference's wrap-up is `REASONING_WRAP_UP =
+/// "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"` with the model's own close
+/// tag substituted. `injection_text` already carries that substitution, so sentence + it is exact for Qwen and
+/// the Gemma form for `<channel|>`.
+pub fn wrap_up_text(think_close: &str) -> String {
+    format!("{WRAP_UP_SENTENCE}{}", injection_text(think_close))
+}
+
+/// Why the answer room moved the thinking budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LoopMode {
-    Off,
-    Stop,
-    Recover,
+pub enum AnswerRoomWhy {
+    /// No budget was asked for and `max_tokens >= ANSWER_ROOM_MIN_CAP`.
+    Derived,
+    /// No budget was asked for but the cap is whatever the context has left.
+    ByContext,
+    /// An explicit budget would have spent the answer's room (#984).
+    Clamped,
 }
 
-impl LoopMode {
-    /// Parses a configured value. Unknown strings return `None` so the caller applies its own default.
-    pub fn from_config_value(v: &str) -> Option<LoopMode> {
-        match v.trim().to_ascii_lowercase().as_str() {
-            "off" | "0" | "false" | "no" => Some(LoopMode::Off),
-            "stop" => Some(LoopMode::Stop),
-            "recover" | "1" | "true" | "on" | "yes" => Some(LoopMode::Recover),
-            _ => None,
+/// The answer room (`answer_room`): `max_new` tokens count the thinking, so a long-thinking reply could otherwise
+/// be cut off inside the span with no answer. Mirrors the reference exactly:
+///
+/// * reserve = `min(max(ANSWER_RESERVE_MIN, max_new / 4), max_new / 2)`;
+/// * with no explicit budget, derive one at `max_new - reserve` when `max_new >= ANSWER_ROOM_MIN_CAP` (or the cap
+///   is all the context has left, `max_new >= cap - CTX_SLACK - prompt_len`);
+/// * with an explicit budget above `max_new - reserve`, clamp it down to that (#984).
+///
+/// Returns `None` when the request is left as it was (explicit budget that already leaves room, or a cap below
+/// the minimum that is not context-bound).
+pub fn answer_room_budget(
+    max_new: usize,
+    cap: usize,
+    prompt_len: usize,
+    explicit: Option<usize>,
+) -> Option<(usize, AnswerRoomWhy)> {
+    if max_new == 0 {
+        return None;
+    }
+    let reserve = ANSWER_RESERVE_MIN.max(max_new / 4).min(max_new / 2);
+    // The engine's `think_budget` uses 1 as its never-enter-the-span sentinel, so a derived budget below 2 would
+    // change meaning; such degenerate caps are left alone (they cannot fit a wrap-up either).
+    let usable = |budget: usize| (budget >= 2).then_some(budget);
+    match explicit {
+        None => {
+            let by_context = cap > 0 && max_new >= cap.saturating_sub(CTX_SLACK + prompt_len);
+            if max_new >= ANSWER_ROOM_MIN_CAP {
+                usable((max_new - reserve).max(1)).map(|b| (b, AnswerRoomWhy::Derived))
+            } else if by_context {
+                usable((max_new - reserve).max(1)).map(|b| (b, AnswerRoomWhy::ByContext))
+            } else {
+                None
+            }
+        }
+        Some(budget) => {
+            let room = max_new.saturating_sub(reserve).max(1);
+            (budget > room).then(|| usable(room)).flatten().map(|b| (b, AnswerRoomWhy::Clamped))
         }
     }
-}
-
-/// Python's `\w` for a `str` pattern: letters, digits and underscore (plus whatever `is_alphanumeric` covers in
-/// the numeric categories Nd/Nl/No). Combining marks are not word characters in either implementation.
-fn is_word_char(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_'
-}
-
-/// `re.findall(r"\w+|[^\w\s]", lower)`: runs of word characters, and every other non-space character alone.
-fn split_words(lower: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut run_start: Option<usize> = None;
-    for (idx, ch) in lower.char_indices() {
-        if is_word_char(ch) {
-            run_start.get_or_insert(idx);
-            continue;
-        }
-        if let Some(s) = run_start.take() {
-            out.push(&lower[s..idx]);
-        }
-        if !ch.is_whitespace() {
-            out.push(&lower[idx..idx + ch.len_utf8()]);
-        }
-    }
-    if let Some(s) = run_start {
-        out.push(&lower[s..]);
-    }
-    out
-}
-
-/// `reasoning_repeat_coverage` (server.py:188-212), verbatim semantics:
-/// 1. `tail = text[-2048:].lower()`; exactly 2048 chars and some period `p` in `1..=64` with `tail[p:] == tail[:-p]`
-///    reads as 1.0 (a short cycle, e.g. one long number repeating a block).
-/// 2. Otherwise words of the lowercased text, last 30,000 of them; fewer than 2,000 words reads as 0.0.
-/// 3. Count every 12-word passage; a passage seen at least three times covers the word positions it occupies when
-///    its start lies in the last 2,000 words. Coverage = covered positions / (len(words) - start).
-pub fn reasoning_repeat_coverage(text: &str) -> f64 {
-    let orig: Vec<char> = text.chars().collect();
-    if orig.len() >= LOOP_TAIL_CHARS {
-        let tail: String = orig[orig.len() - LOOP_TAIL_CHARS..].iter().collect();
-        let tail: Vec<char> = tail.to_lowercase().chars().collect();
-        if tail.len() == LOOP_TAIL_CHARS
-            && (1..=LOOP_TAIL_PERIOD).any(|p| tail[p..] == tail[..LOOP_TAIL_CHARS - p])
-        {
-            return 1.0;
-        }
-    }
-    let lower = text.to_lowercase();
-    let words = split_words(&lower);
-    let words = if words.len() > LOOP_HISTORY_WORDS {
-        &words[words.len() - LOOP_HISTORY_WORDS..]
-    } else {
-        &words[..]
-    };
-    if words.len() < LOOP_WINDOW_WORDS {
-        return 0.0;
-    }
-    // Intern the words to ids so a 12-gram key is a plain array (the reference keys tuples; this is the same
-    // equality, without per-gram allocation).
-    let mut ids: HashMap<&str, u32> = HashMap::new();
-    let mut seq: Vec<u32> = Vec::with_capacity(words.len());
-    for w in words {
-        let next = ids.len() as u32;
-        seq.push(*ids.entry(*w).or_insert(next));
-    }
-    let mut counts: HashMap<[u32; LOOP_WIDTH], u32> = HashMap::new();
-    for i in 0..=seq.len() - LOOP_WIDTH {
-        let mut gram = [0u32; LOOP_WIDTH];
-        gram.copy_from_slice(&seq[i..i + LOOP_WIDTH]);
-        *counts.entry(gram).or_insert(0) += 1;
-    }
-    let start = seq.len() - LOOP_WINDOW_WORDS;
-    let mut covered: HashSet<usize> = HashSet::new();
-    for i in start..=seq.len() - LOOP_WIDTH {
-        let mut gram = [0u32; LOOP_WIDTH];
-        gram.copy_from_slice(&seq[i..i + LOOP_WIDTH]);
-        if counts[&gram] >= 3 {
-            covered.extend(i..i + LOOP_WIDTH);
-        }
-    }
-    covered.len() as f64 / (seq.len() - start) as f64
 }
 
 /// #606: the current run of one repeated token. `observe` returns true when this token makes the run reach the
@@ -189,37 +142,6 @@ impl RepeatRunGuard {
 
     pub fn limit(&self) -> usize {
         self.limit
-    }
-}
-
-/// #728's check cadence: a look is due when the request has produced `n >= next_at` output tokens (counted across
-/// passes, injections included). The reference re-arms to `n + 512` each time a look runs at a clean boundary.
-#[derive(Clone, Debug)]
-pub struct LoopCheck {
-    next_at: usize,
-}
-
-impl LoopCheck {
-    pub fn new() -> Self {
-        Self { next_at: LOOP_CHECK_EVERY }
-    }
-
-    pub fn due(&self, n: usize) -> bool {
-        n >= self.next_at
-    }
-
-    pub fn advance(&mut self, n: usize) {
-        self.next_at = n + LOOP_CHECK_EVERY;
-    }
-
-    pub fn next_at(&self) -> usize {
-        self.next_at
-    }
-}
-
-impl Default for LoopCheck {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -550,10 +472,6 @@ impl StreamGates {
 mod tests {
     use super::*;
 
-    fn words_text(n: usize, prefix: &str) -> String {
-        (0..n).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>().join(" ")
-    }
-
     #[test]
     fn injection_matches_reference_strings() {
         assert_eq!(injection_text("</think>\n\n"), "\n</think>\n\n");
@@ -561,52 +479,41 @@ mod tests {
     }
 
     #[test]
-    fn loop_mode_parsing() {
-        assert_eq!(LoopMode::from_config_value("off"), Some(LoopMode::Off));
-        assert_eq!(LoopMode::from_config_value("STOP"), Some(LoopMode::Stop));
-        assert_eq!(LoopMode::from_config_value("recover"), Some(LoopMode::Recover));
-        assert_eq!(LoopMode::from_config_value("true"), Some(LoopMode::Recover));
-        assert_eq!(LoopMode::from_config_value(""), None);
-        assert_eq!(LoopMode::from_config_value("sometimes"), None);
+    fn wrap_up_matches_reference_string() {
+        assert_eq!(
+            wrap_up_text("</think>\n\n"),
+            "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+        );
+        assert_eq!(
+            wrap_up_text("<channel|>"),
+            "\n\nI have thought about this long enough; time to give my answer.\n<channel|>"
+        );
     }
 
     #[test]
-    fn coverage_needs_two_thousand_words() {
-        assert_eq!(reasoning_repeat_coverage(""), 0.0);
-        assert_eq!(reasoning_repeat_coverage(&words_text(1999, "w")), 0.0);
+    fn answer_room_derives_reserve_from_the_cap() {
+        // 8192-cap agent harness: a quarter kept for the answer.
+        assert_eq!(answer_room_budget(8192, 32768, 100, None), Some((6144, AnswerRoomWhy::Derived)));
+        // Floor and half-cap bounds.
+        assert_eq!(answer_room_budget(1024, 32768, 100, None), Some((512, AnswerRoomWhy::Derived)));
+        assert_eq!(answer_room_budget(32768, 131072, 100, None), Some((24576, AnswerRoomWhy::Derived)));
+        // Below the minimum cap with context to spare: untouched.
+        assert_eq!(answer_room_budget(1000, 32768, 100, None), None);
+        // Below the minimum but the cap is all the context has left (#16).
+        assert_eq!(
+            answer_room_budget(900, 1000, 92, None),
+            Some((450, AnswerRoomWhy::ByContext))
+        );
+        assert_eq!(answer_room_budget(0, 1000, 92, None), None);
     }
 
     #[test]
-    fn coverage_periodic_tail_reads_full() {
-        let mut text = words_text(100, "w");
-        text.push(' ');
-        // 205 full copies of a 10-char cycle: the last 2048 chars are periodic with p=10.
-        text.push_str(&"0123456789".repeat(205));
-        assert_eq!(reasoning_repeat_coverage(&text), 1.0);
-    }
-
-    #[test]
-    fn coverage_repeated_passage_crosses_threshold() {
-        // A 200-word passage four times, then 1200 unique words: 2000 words, ~800 covered.
-        let passage = words_text(200, "p");
-        let mut text = Vec::new();
-        for _ in 0..4 {
-            text.push(passage.clone());
-        }
-        text.push(words_text(1200, "u"));
-        let cov = reasoning_repeat_coverage(&text.join(" "));
-        assert!(cov >= LOOP_COVERAGE, "coverage {cov}");
-        assert!(cov < 0.5, "coverage {cov}");
-    }
-
-    #[test]
-    fn coverage_unique_words_read_zero() {
-        assert_eq!(reasoning_repeat_coverage(&words_text(2500, "u")), 0.0);
-    }
-
-    #[test]
-    fn words_split_like_python() {
-        assert_eq!(split_words("ab, cd!_x9\n"), vec!["ab", ",", "cd", "!", "_x9"]);
+    fn answer_room_clamps_an_explicit_budget_that_eats_the_answer() {
+        assert_eq!(answer_room_budget(8192, 32768, 100, Some(8192)), Some((6144, AnswerRoomWhy::Clamped)));
+        assert_eq!(answer_room_budget(1024, 32768, 100, Some(512)), None);
+        assert_eq!(answer_room_budget(8192, 32768, 100, Some(6144)), None);
+        // A degenerate cap leaves the sentinel-adjacent budgets alone.
+        assert_eq!(answer_room_budget(2, 32768, 0, Some(2)), None);
     }
 
     #[test]
@@ -628,16 +535,6 @@ mod tests {
         for _ in 0..1000 {
             assert!(!g.observe(1));
         }
-    }
-
-    #[test]
-    fn loop_check_cadence() {
-        let mut c = LoopCheck::new();
-        assert!(!c.due(LOOP_CHECK_EVERY - 1));
-        assert!(c.due(LOOP_CHECK_EVERY));
-        c.advance(LOOP_CHECK_EVERY);
-        assert_eq!(c.next_at(), LOOP_CHECK_EVERY * 2);
-        assert!(!c.due(LOOP_CHECK_EVERY + 1));
     }
 
     fn close_inputs() -> CloseRetryInputs {
