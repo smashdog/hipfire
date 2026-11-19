@@ -852,6 +852,13 @@ and JSON-Schema AR all reuse ≥256 tokens; `reset` forces a cold miss.
 Vision+prefix reuse stays off. Non-empty stop sequences, logprobs, and the images+tools combination stay refused on slots; tools alone are supported.
 This is not a registry admission.
 
+`max_think_tokens` is enforced on the multi-slot route too: structured-output
+turns keep the engine's grammar-mask cap, every other thinking turn arms the
+daemon's `ThinkBudget`, and a budget exhaustion splices the family think-close
+(the same text `HIPFIRE_THINK_CONTINUATION` names) and continues the turn as a
+cold pass, exactly like the `#1053` close retry. A span re-opened after the
+splice ends the turn as `length` instead of splicing twice.
+
 ### Capability advertisement
 
 `/health` carries a `capabilities` object built once at startup from the
