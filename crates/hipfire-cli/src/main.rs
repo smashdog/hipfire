@@ -6713,6 +6713,17 @@ pub(crate) fn config_value<'a>(
         .ok_or_else(|| anyhow!("missing resolved configuration key {key}"))
 }
 
+/// Render a resolved value for a JSON wire field.
+pub(crate) fn config_value_json(value: &hipfire_config::ConfigValue) -> serde_json::Value {
+    match value {
+        hipfire_config::ConfigValue::Bool(value) => serde_json::json!(value),
+        hipfire_config::ConfigValue::Integer(value) => serde_json::json!(value),
+        hipfire_config::ConfigValue::Float(value) => serde_json::json!(value),
+        hipfire_config::ConfigValue::String(value) => serde_json::json!(value),
+        hipfire_config::ConfigValue::Null => serde_json::Value::Null,
+    }
+}
+
 pub(crate) fn config_string(
     resolved: &hipfire_config::ResolvedConfig,
     key: &str,

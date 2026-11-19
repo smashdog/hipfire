@@ -53,12 +53,12 @@ use hipfire_runtime::serve::{
     Continuation, DoneReason, Event, SlotEngineConfig, SubmitRequest, ThinkRecoveryStats,
     VisualData,
 };
-use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx};
+use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx, StopReason};
 use hipfire_runtime::tokenizer::Tokenizer;
 
 use crate::think_recovery::{
-    close_retry_skip_reason, focused_recovery_prompt, injection_text, CloseRetryInputs, GateAction,
-    GateCtx, LoopMode, StreamGates, REPEAT_STOP_TOKENS,
+    answer_room_budget, close_retry_skip_reason, focused_recovery_prompt, injection_text, wrap_up_text,
+    AnswerRoomWhy, CloseRetryInputs, GateAction, GateCtx, LoopMode, StreamGates, REPEAT_STOP_TOKENS,
 };
 
 fn emit_qwen_ar_slot_error<W: std::io::Write>(
@@ -1113,12 +1113,95 @@ impl SlotBackend {
                     .and_then(|v| v.as_u64())
             });
 
-        // Finite caps (max_think_tokens >= 2) are ENFORCED on this route:
-        // once the cursor consumes the budget inside a think span, the
-        // grammar mask allows only the think close, forcing the span to end
-        // through the normal commit path (vLLM thinking_token_budget
-        // parity). Enforcement requires the tokenizer's special close id;
-        // engines without one fall back to uncapped thinking (documented).
+        // Per-model think-recovery knobs (`thinking.close_retry`,
+        // `thinking.loop_recovery`, `thinking.repeat_stop_tokens` in
+        // config.toml / models.toml, forwarded by the gateway as these
+        // request fields). A present field overrides the matching
+        // HIPFIRE_REASONING_* developer knob for this request; an absent
+        // field falls back to the env/default exactly as before, so direct
+        // daemon clients and existing deployments keep the old surface.
+        let request_close_retry = match msg.get("think_close_retry") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => match v.as_bool() {
+                Some(value) => Some(value),
+                None => {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        "think_close_retry must be a boolean",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return Ok(());
+                }
+            },
+        };
+        let request_loop_recovery = match msg.get("think_loop_recovery") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => match v.as_str().map(LoopMode::from_config_value) {
+                Some(Some(mode)) => Some(mode),
+                _ => {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        "think_loop_recovery must be one of off|stop|recover",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return Ok(());
+                }
+            },
+        };
+        let request_repeat_stop = match msg.get("think_repeat_stop_tokens") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => match v.as_u64() {
+                Some(value) => Some(value as usize),
+                None => {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        "think_repeat_stop_tokens must be a non-negative integer",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return Ok(());
+                }
+            },
+        };
+        let request_answer_room = match msg.get("think_answer_room") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => match v.as_bool() {
+                Some(value) => Some(value),
+                None => {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        "think_answer_room must be a boolean",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return Ok(());
+                }
+            },
+        };
+
+        // Finite caps (max_think_tokens >= 2) are ENFORCED on this route by
+        // two separate mechanisms: structured-output requests hand the budget
+        // to the engine, whose grammar mask then allows only the think close
+        // once the budget is spent (vLLM thinking_token_budget parity); every
+        // other thinking turn arms the daemon's emitter (`max_think`), whose
+        // force-close queues the family close text and makes the pass loop
+        // splice it and continue cold. Both require the tokenizer's special
+        // close id; engines without one fall back to uncapped thinking
+        // (documented), and vision requests keep single-pass semantics.
 
         // --- Projected reasoning authority ---
         let has_think = self.tokenizer.special_token_id("<think>").is_some();
@@ -1632,21 +1715,30 @@ impl SlotBackend {
         // ONE request across several engine passes. A pass whose repair must
         // be invisible to the client ends through `EngineCommand::Interrupt`;
         // the session KV stays resident for the continuation pass.
-        // Served default is ON (design Q1); HIPFIRE_REASONING_CLOSE_RETRY=0/off
-        // disables. Unknown values keep the served default.
-        let close_retry_enabled = hipfire_config::developer_var("HIPFIRE_REASONING_CLOSE_RETRY")
-            .map(|v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
-            .unwrap_or(true);
-        // Served default is `recover` (design Q1); an explicit valid value
-        // overrides, and an invalid value falls back to `off` rather than
-        // guessing at the operator's intent.
-        let loop_mode = hipfire_config::developer_var("HIPFIRE_REASONING_LOOP_RECOVERY")
-            .map(|v| LoopMode::from_config_value(&v).unwrap_or(LoopMode::Off))
-            .unwrap_or(LoopMode::Recover);
-        let repeat_stop = hipfire_config::developer_var("HIPFIRE_REPEAT_STOP_TOKENS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(REPEAT_STOP_TOKENS);
+        // Served default is ON (design Q1); a request/config-layer value
+        // (`thinking.close_retry`, gateway-forwarded) wins, then
+        // HIPFIRE_REASONING_CLOSE_RETRY=0/off disables. Unknown values keep
+        // the served default.
+        let close_retry_enabled = request_close_retry.unwrap_or_else(|| {
+            hipfire_config::developer_var("HIPFIRE_REASONING_CLOSE_RETRY")
+                .map(|v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
+                .unwrap_or(true)
+        });
+        // Served default is `recover` (design Q1); the request/config-layer
+        // value wins, then an explicit valid env value overrides, and an
+        // invalid env value falls back to `off` rather than guessing at the
+        // operator's intent.
+        let loop_mode = request_loop_recovery.unwrap_or_else(|| {
+            hipfire_config::developer_var("HIPFIRE_REASONING_LOOP_RECOVERY")
+                .map(|v| LoopMode::from_config_value(&v).unwrap_or(LoopMode::Off))
+                .unwrap_or(LoopMode::Recover)
+        });
+        let repeat_stop = request_repeat_stop.unwrap_or_else(|| {
+            hipfire_config::developer_var("HIPFIRE_REPEAT_STOP_TOKENS")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(REPEAT_STOP_TOKENS)
+        });
         // Only thinking turns are repaired. Vision and structured-output
         // requests keep single-pass semantics: an injected token would
         // desync the schema cursor, and the multi-slot vision path owns its
@@ -1664,6 +1756,35 @@ impl SlotBackend {
                 eprintln!("[think-recover] {line}");
             }
         };
+        // ── answer room (PolyStrata #123/#984/#16) ──
+        // max_tokens counts the thinking, so a long-thinking reply can be cut
+        // inside the span with no answer. With thinking on and no explicit
+        // budget, derive one that leaves the answer its room; an explicit
+        // budget that eats the room is clamped down. Vision and
+        // structured-output requests keep their single-pass semantics: their
+        // budget-close path cannot splice a wrap-up.
+        let answer_room_enabled = request_answer_room.unwrap_or_else(|| {
+            hipfire_config::developer_var("HIPFIRE_THINKING_ANSWER_ROOM")
+                .map(|v| !matches!(v.trim(), "0" | "false" | "off" | "no"))
+                .unwrap_or(true)
+        });
+        let explicit_think_budget = max_think_tokens.filter(|&n| n >= 2).map(|n| n as usize);
+        let mut think_budget_effective = explicit_think_budget;
+        if enable_thinking && answer_room_enabled && recovery_allowed {
+            if let Some((budget, why)) =
+                answer_room_budget(max_tokens, self.cap_tokens, prompt_len, explicit_think_budget)
+            {
+                let why = match why {
+                    AnswerRoomWhy::Derived => "a quarter of the cap reserved for the answer",
+                    AnswerRoomWhy::ByContext => "the cap is all the context has left",
+                    AnswerRoomWhy::Clamped => "an explicit budget would have spent the answer's room",
+                };
+                trace_think(format!(
+                    "answer-room: thinking limited to {budget} of max_tokens {max_tokens} ({why})"
+                ));
+                think_budget_effective = Some(budget);
+            }
+        }
         let original_prompt = prompt_tokens.clone();
         // raw_ids: every sampled token of the request, rendered or not (a
         // gate may drop a token from the client stream, but it is still part
@@ -1713,7 +1834,15 @@ impl SlotBackend {
             enable_grammar: self.tool_grammar,
             stop: Vec::new(),
             min_tokens: 0,
-            max_think: 0,
+            // Non-schema thinking turns enforce `max_think_tokens` on this
+            // emitter (the multi-slot budget close); schema turns keep the
+            // engine's grammar-mask constraint (`SubmitRequest::think_budget`)
+            // and vision keeps single-pass semantics.
+            max_think: if recovery_allowed {
+                think_budget_effective.unwrap_or(0)
+            } else {
+                0
+            },
             max_tokens,
             assistant_prefix: prefix,
             think_mode,
@@ -1758,6 +1887,12 @@ impl SlotBackend {
             let mut pass_ending = false;
             let mut gate_trip_len: usize = 0;
             let mut recover_requested = false;
+            // max_think_tokens: the emitter queued the family close at the
+            // trip token. The conclusion splices it and continues cold.
+            let mut budget_close_requested = false;
+            // A span re-opened after the splice spent the budget again: the
+            // emitter turned that into a hard stop instead of a second splice.
+            let mut think_capped = false;
             let (tx, rx) = mpsc::channel::<Event>();
             let req = SubmitRequest {
                 query: if pass_index == 1 { request_query } else { None },
@@ -1786,11 +1921,9 @@ impl SlotBackend {
                 },
                 started_in_think,
                 // Enforced thinking budget: absent/0 = uncapped; the 1-sentinel
-                // never enters a think span so the budget cannot engage.
-                think_budget: max_think_tokens
-                    .filter(|&n| n >= 2)
-                    .map(|n| n as usize)
-                    .unwrap_or(usize::MAX),
+                // never enters a think span so the budget cannot engage. The
+                // answer room may have derived or clamped this value above.
+                think_budget: think_budget_effective.unwrap_or(usize::MAX),
                 // Canonical pending-input bytes (spec §5.3): the engine's wait
                 // queue charges its byte cap against this, so daemon-side
                 // waiters must carry the real prompt weight — a hardcoded 0
@@ -1996,6 +2129,41 @@ impl SlotBackend {
                             render_events(outcome.events, stdout, &mut terminal_tool_calls);
                             produced += 1;
                             tokens_total += 1;
+                            // ── max_think_tokens: the emitter reached the
+                            // budget inside the span and queued the family
+                            // close ──
+                            let forced = emitter.take_forced();
+                            if !forced.is_empty() && !pass_ending {
+                                trace_think(format!(
+                                    "budget-close: emitter queued {} close tokens at n={}",
+                                    forced.len(),
+                                    gates.n()
+                                ));
+                                budget_close_requested = true;
+                                pending_injection = Some(forced);
+                                pass_ending = true;
+                                gate_trip_len = gen_ids.len();
+                                if let Some(sess) = accepted_session {
+                                    self.engine.interrupt(sess);
+                                }
+                                continue;
+                            }
+                            // A span re-opened after the splice spent the
+                            // budget again: end the pass, never splice twice.
+                            if outcome.stop == Some(StopReason::ThinkCap) && !pass_ending {
+                                trace_think(format!(
+                                    "budget-close: a re-opened span exhausted the budget \
+                                     at n={}; ending as length",
+                                    gates.n()
+                                ));
+                                think_capped = true;
+                                pass_ending = true;
+                                gate_trip_len = gen_ids.len();
+                                if let Some(sess) = accepted_session {
+                                    self.engine.interrupt(sess);
+                                }
+                                continue;
+                            }
                         }
                         Event::Done { reason, generated } => {
                             done_reason = Some((reason, generated));
@@ -2126,6 +2294,56 @@ impl SlotBackend {
                 break 'pass;
             }
 
+            // ── max_think_tokens: wrap up the span and continue ──
+            if budget_close_requested {
+                // The emitter queued the bare family close when the budget
+                // tripped; the reference wraps up instead (#123): a short
+                // closing sentence, then the close. The queued tokens belong
+                // to the pass being abandoned, so they are dropped.
+                let _queued = pending_injection.take().unwrap_or_default();
+                let forced = emitter
+                    .think_close_text()
+                    .map(|close| self.tokenizer.encode(&wrap_up_text(close)))
+                    .unwrap_or_default();
+                let budget_left = max_tokens.saturating_sub(gates.n());
+                if think_capped || forced.is_empty() || budget_left <= forced.len() {
+                    // The re-opened span already ended the pass, or the
+                    // splice and its continuation would not fit: end as
+                    // `length` (the interrupt reported MaxTokens) without
+                    // touching the stream.
+                    trace_think(format!(
+                        "budget-close skipped: {}",
+                        if think_capped {
+                            "a re-opened span exhausted the budget again"
+                        } else {
+                            "no headroom for the splice"
+                        }
+                    ));
+                    break 'pass;
+                }
+                if let Some(sess) = accepted_session.take() {
+                    // The splice rewrites the stream the session witnessed:
+                    // hand it back and let the continuation cold-prefill the
+                    // exact prompt the client's history reproduces.
+                    self.close_session(sess);
+                }
+                gates.note_injected(forced.len());
+                let mut full = original_prompt.clone();
+                full.extend_from_slice(&gen_ids);
+                full.extend_from_slice(&forced);
+                pass_prompt = full;
+                pass_continuation = Continuation::Cold;
+                pass_max_tokens = max_tokens.saturating_sub(gates.n()).max(1);
+                pending_injection = Some(forced.clone());
+                self.note_think_recovery(|st| st.budget_closes += 1);
+                trace_think(format!(
+                    "budget-close: injected {} wrap-up tokens at n={}; continuing cold",
+                    forced.len(),
+                    gates.n()
+                ));
+                continue 'pass;
+            }
+
             // ── #1053: a natural stop landed with thinking still open ──
             if let Some(close) = emitter.think_close_text().map(str::to_string) {
                 let extra = self.tokenizer.encode(&injection_text(&close));
@@ -2218,6 +2436,10 @@ impl SlotBackend {
 
         // Stage normal done payload and await commit via keyed registry.
         let finish_reason = match reason {
+            // #606 / #728-stop semantics: a gate-ended pass reports `length`
+            // even when the engine's extra step before the interrupt landed
+            // on EOS (`decoded_eot`): the client never saw that tail.
+            _ if repeat_stopped || loop_stopped => "length",
             DoneReason::MaxTokens if !summary.decoded_eot => "length",
             _ if open_think => "stop",
             _ => summary.finish_reason,

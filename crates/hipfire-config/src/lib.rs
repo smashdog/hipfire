@@ -655,6 +655,11 @@ const THINKING_BUDGETS: &[&str] = &["off", "low", "med", "high", "xhigh", "max",
 // non-Qwen3.8 parents still validate. Values pass through as request strings;
 // model-specific mapping lives downstream of config validation.
 pub const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high", "xhigh", "max"];
+// What the multi-slot route does when it detects a reasoning loop: `off`
+// keeps generating, `stop` ends the request as length, `recover` restarts the
+// pass once with the low-effort system sentence. Mirrors
+// `HIPFIRE_REASONING_LOOP_RECOVERY` (`thinking.loop_recovery`).
+pub const LOOP_RECOVERY_MODES: &[&str] = &["off", "stop", "recover"];
 // Which engine executes a spilled layer's weight-reading GEMVs. Exported for the
 // same reason as `REASONING_EFFORTS`: the TUI's option list must be this list, or
 // a value the schema accepts becomes unselectable (and an unselectable value
@@ -1279,6 +1284,57 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_MAX_TOTAL_THINK_TOKENS"),
         "Cross-reopen reasoning budget; zero disables it."
+    ),
+    field!(
+        "thinking.close_retry",
+        "thinking_close_retry",
+        Reasoning,
+        Request,
+        DefaultValue::Bool(true),
+        ValueRule::Bool,
+        false,
+        true,
+        None,
+        "Think-close retry: when a thinking turn stops with the span still open, inject the close and keep generating (per-model override of HIPFIRE_REASONING_CLOSE_RETRY for the multi-slot route)."
+    ),
+    field!(
+        "thinking.loop_recovery",
+        "thinking_loop_recovery",
+        Reasoning,
+        Request,
+        DefaultValue::String("recover"),
+        ValueRule::Enum(LOOP_RECOVERY_MODES),
+        false,
+        true,
+        None,
+        "Reasoning-loop action: off, stop, or recover (per-model override of HIPFIRE_REASONING_LOOP_RECOVERY for the multi-slot route)."
+    ),
+    field!(
+        "thinking.repeat_stop_tokens",
+        "thinking_repeat_stop_tokens",
+        Reasoning,
+        Request,
+        DefaultValue::Integer(256),
+        ValueRule::Integer {
+            min: 0,
+            max: 65536
+        },
+        false,
+        true,
+        None,
+        "Same-token run guard: consecutive identical tokens that end the pass as length; zero disables (per-model override of HIPFIRE_REPEAT_STOP_TOKENS for the multi-slot route)."
+    ),
+    field!(
+        "thinking.answer_room",
+        "thinking_answer_room",
+        Reasoning,
+        Request,
+        DefaultValue::Bool(true),
+        ValueRule::Bool,
+        false,
+        true,
+        None,
+        "Answer room: with thinking on and no explicit budget, cap the thinking so the answer keeps a quarter of max_tokens (from 1024 up, or when the cap is all the context has left); an explicit budget that eats the room is clamped. Per-model override of HIPFIRE_THINKING_ANSWER_ROOM for the multi-slot route."
     ),
     field!(
         "serve.host",

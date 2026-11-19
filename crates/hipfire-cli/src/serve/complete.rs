@@ -14,8 +14,9 @@ use crate::serve::{
     bail_invalid, invalid_request, Admission, AdmissionGuard, ModelOrigin, ServeMeta, ServeShared,
 };
 use crate::{
-    apply_http_reasoning_request, config_bool, config_string, config_u64, insert_optional_f64,
-    insert_optional_u64, request_f64, request_string, request_u64, unix_timestamp,
+    apply_http_reasoning_request, config_bool, config_string, config_u64, config_value_json,
+    insert_optional_f64, insert_optional_u64, request_config_value, request_f64, request_string,
+    request_u64, unix_timestamp,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::ClientError;
@@ -2360,6 +2361,20 @@ pub(crate) fn complete_request_attempt(
             };
             insert_optional_f64(&mut generate, key, value);
         }
+        // Per-model think-recovery knobs: forwarded only when a user layer
+        // (config.toml / models.toml) set them, so the daemon's
+        // HIPFIRE_REASONING_* developer knobs and served defaults keep the
+        // surface — and stay byte-identical — for everyone else.
+        for (wire, config_key) in [
+            ("think_close_retry", "thinking.close_retry"),
+            ("think_loop_recovery", "thinking.loop_recovery"),
+            ("think_repeat_stop_tokens", "thinking.repeat_stop_tokens"),
+            ("think_answer_room", "thinking.answer_room"),
+        ] {
+            if let Some(value) = request_config_value(&resolved, config_key)? {
+                generate[wire] = config_value_json(value);
+            }
+        }
         // Validate OpenAI logprobs contract before forwarding; reject rather
         // than silently clamping so callers notice a mismatch.
         validate_logprobs_request(body)?;
@@ -4266,6 +4281,47 @@ mod tests {
                 ThinkFragment::Content("tail".into()),
             ]
         );
+    }
+
+    #[test]
+    fn think_recovery_knobs_forward_only_when_a_user_layer_sets_them() {
+        use hipfire_config::{resolve, ConfigLayer, ConfigSource, ConfigValue, NamedLayer};
+        use std::path::PathBuf;
+        let builtins = resolve(Vec::<NamedLayer>::new()).unwrap();
+        for key in [
+            "thinking.close_retry",
+            "thinking.loop_recovery",
+            "thinking.repeat_stop_tokens",
+            "thinking.answer_room",
+        ] {
+            assert!(
+                request_config_value(&builtins, key).unwrap().is_none(),
+                "{key}: a built-in default must not ride the wire"
+            );
+        }
+        let mut model = ConfigLayer::default();
+        model.set_cli("thinking.close_retry", "false").unwrap();
+        model.set_cli("thinking.loop_recovery", "stop").unwrap();
+        model.set_cli("thinking.repeat_stop_tokens", "0").unwrap();
+        model.set_cli("thinking.answer_room", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::ModelUser {
+                model: "qwen3.8:27b-mq4-xts".into(),
+                path: PathBuf::from("models.toml"),
+            },
+            layer: model,
+        }])
+        .unwrap();
+        let close = request_config_value(&resolved, "thinking.close_retry").unwrap();
+        assert_eq!(close, Some(&ConfigValue::Bool(false)));
+        assert_eq!(config_value_json(close.unwrap()), serde_json::json!(false));
+        let mode = request_config_value(&resolved, "thinking.loop_recovery").unwrap();
+        assert_eq!(mode, Some(&ConfigValue::String("stop".into())));
+        let repeat = request_config_value(&resolved, "thinking.repeat_stop_tokens").unwrap();
+        assert_eq!(repeat, Some(&ConfigValue::Integer(0)));
+        let room = request_config_value(&resolved, "thinking.answer_room").unwrap();
+        assert_eq!(room, Some(&ConfigValue::Bool(false)));
+        assert_eq!(config_value_json(room.unwrap()), serde_json::json!(false));
     }
 
     #[test]

@@ -143,6 +143,7 @@ pub mod emit_text;
 pub mod eos_filter;
 pub mod prefill_progress;
 pub mod prompt_frame;
+pub mod reasoning_loop;
 pub mod semantic;
 pub mod session_table;
 pub mod stop_sequence;
