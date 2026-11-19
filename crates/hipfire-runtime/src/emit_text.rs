@@ -119,6 +119,14 @@ impl ThinkBudget {
         self.closing = tokens;
     }
 
+    /// Tokens spliced into the stream outside [`Self::observe`] (the
+    /// multi-slot budget close routes them through `observe_injected`) still
+    /// discharge the queued close. Without this the count swallows the first
+    /// `closing` tokens of the continuation and a re-opened span trips early.
+    pub fn consume_closing(&mut self, tokens: usize) {
+        self.closing = self.closing.saturating_sub(tokens);
+    }
+
     /// The most tokens the caller may commit next such that no
     /// [`Self::observe`] call within the first `n - 1` of them returns
     /// [`ThinkBudgetStep::ForceClose`] or [`ThinkBudgetStep::Exhausted`]: a
@@ -2861,6 +2869,30 @@ mod tests {
         // Back in the answer: uncapped again.
         assert_eq!(b.window_cap(false), None);
         // A second opened span ends the turn on its opening token.
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Exhausted);
+    }
+
+    /// In-turn splices (the multi-slot budget close feeds the emitter the
+    /// close tokens through `observe_injected`, never `observe`) still
+    /// discharge the queued close; otherwise the count swallows the first
+    /// continuation tokens and a re-opened span trips early.
+    #[test]
+    fn consume_closing_discharges_injected_close_tokens() {
+        let mut b = ThinkBudget::new(3);
+        for _ in 0..2 {
+            assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+        }
+        // budget_step queues the close the way the producers do.
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::ForceClose);
+        b.consume_closing(CLOSE_TOKENS);
+        assert_eq!(b.window_cap(false), None);
+        // The continuation outside the span is uncapped...
+        assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
+        // ...and a re-opened span spends a fresh budget instead of tripping
+        // on its first token.
+        for _ in 0..2 {
+            assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+        }
         assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Exhausted);
     }
 

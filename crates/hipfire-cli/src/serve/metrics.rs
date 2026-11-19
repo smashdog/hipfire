@@ -756,6 +756,12 @@ impl Metrics {
                 "#606: same-token runs that ended the pass as `length`.",
                 s.think_recovery.repeat_run_stops as u64,
             );
+            counter(
+                &mut out,
+                "hipfire_think_budget_closes_total",
+                "`max_think_tokens` budget closes spliced and continued cold.",
+                s.think_recovery.budget_closes as u64,
+            );
             out.push_str(
                 "# HELP hipfire_think_loop_recoveries_total #728 reasoning-loop endings, by mode.\n\
                  # TYPE hipfire_think_loop_recoveries_total counter\n",
@@ -1293,6 +1299,7 @@ mod tests {
                     loop_recoveries: 1,
                     loop_stops: 3,
                     repeat_run_stops: 4,
+                    budget_closes: 8,
                     loop_skips_already_recovered: 5,
                     loop_skips_vision: 6,
                     loop_skips_budget_exhausted: 7,
@@ -1305,6 +1312,7 @@ mod tests {
         for sample in [
             "hipfire_think_close_injections_total 2\n",
             "hipfire_repeat_run_stops_total 4\n",
+            "hipfire_think_budget_closes_total 8\n",
             "hipfire_think_loop_recoveries_total{mode=\"recover\"} 1\n",
             "hipfire_think_loop_recoveries_total{mode=\"stop\"} 3\n",
             "hipfire_think_loop_skips_total{reason=\"already_recovered\"} 5\n",

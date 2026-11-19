@@ -362,6 +362,9 @@ pub struct ThinkRecoveryStats {
     pub loop_stops: usize,
     /// #606: same-token runs that ended the pass as `length`.
     pub repeat_run_stops: usize,
+    /// `max_think_tokens` on a non-schema turn: budget closes spliced and
+    /// continued cold.
+    pub budget_closes: usize,
     /// Periodic #728 checks that declined, by reason. "below threshold" is
     /// the normal case and is not counted.
     pub loop_skips_already_recovered: usize,
