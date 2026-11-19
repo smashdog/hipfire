@@ -13,7 +13,7 @@
  │  Thinking                 on                      default                  │
  │> Thinking effort          ● high                  this model               │
  │  Thinking cap             med                     default                  │
- └─────────────────────────────────────────────────────────── rows 1–6 of 8 ↓ ┘
+ └────────────────────────────────────────────────────────── rows 1–6 of 12 ↓ ┘
  ┌ Thinking effort ───────────────────────────────────────────────────────────┐
  │How hard the model is told to think, in its own vocabulary.                 │
  │qwen3.8:27b: high (this model). All other models: low (you, config.toml).   │
