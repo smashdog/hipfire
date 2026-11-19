@@ -2319,9 +2319,27 @@ impl Rig {
                         }
                         Ok(pages)
                     }).transpose()?;
+                // A default budget (no explicit env/CLI/snapshot input) is
+                // clamped to C - R: the config layer cannot see the logical
+                // context, and a stock 32k deployment would otherwise fail
+                // B + R <= C at admission. Explicit budgets stay loud.
+                let budget_tokens = crate::kvmem_ctl::effective_legacy_budget(
+                    config.budget_tokens as usize,
+                    crate::kvmem_ctl::implicit_legacy_budget(config),
+                    cfg.cap_tokens,
+                    config.gen_reserve_tokens as usize,
+                );
+                if budget_tokens != config.budget_tokens as usize {
+                    eprintln!(
+                        "  [hipfire] KVMem Legacy history budget default {} clamped to {} \
+                         (context {} - reserve {})",
+                        config.budget_tokens, budget_tokens, cfg.cap_tokens,
+                        config.gen_reserve_tokens
+                    );
+                }
                 crate::kvmem_ctl::resolve_legacy_plan(
                     cfg.n_slots, cfg.cap_tokens, prefill_chunk.max(spec_rows),
-                    config.budget_tokens as usize, config.gen_reserve_tokens as usize,
+                    budget_tokens, config.gen_reserve_tokens as usize,
                     explicit_pages,
                 )?
             } else {
@@ -3142,11 +3160,37 @@ impl Rig {
         #[cfg(feature = "kvmem")]
         let kvmem = match kvmem_plan {
             Some(plan) => {
+                // Restate an implicit default budget at the clamped value the
+                // plan was admitted with: `new_with_config` cross-checks its
+                // Legacy config against `plan.budget_blocks`, and the
+                // `[kvmem-config]` record below must state the effective
+                // value, not the config layer's context-blind default.
+                let legacy_config = cfg.kvmem.as_ref().map(|config| {
+                    let budget_tokens = crate::kvmem_ctl::effective_legacy_budget(
+                        config.budget_tokens as usize,
+                        crate::kvmem_ctl::implicit_legacy_budget(config),
+                        cfg.cap_tokens,
+                        config.gen_reserve_tokens as usize,
+                    );
+                    let mut config = config.clone();
+                    if budget_tokens != config.budget_tokens as usize {
+                        config.budget_tokens = budget_tokens as u32;
+                        if let Some(report) = config.report.get_mut("budget_tokens") {
+                            report.effective = serde_json::json!(budget_tokens);
+                        }
+                        config.notes.push(format!(
+                            "budget_tokens clamped to {budget_tokens} at admission \
+                             (context {} - reserve {})",
+                            cfg.cap_tokens, config.gen_reserve_tokens
+                        ));
+                    }
+                    config
+                });
                 // Consolidated effective-policy record: the operator-facing
                 // parameters are only meaningful if the engine states the
                 // values it actually built the pool and policy with (E01
                 // evidence: requested vs applied, no silent clamping).
-                if let Some(config) = cfg.kvmem.as_ref() {
+                if let Some(config) = legacy_config.as_ref() {
                     eprintln!(
                         "[kvmem-config] contract={} budget_tokens={} gen_reserve_tokens={} \
                          sink_tokens={} recent_tokens={} sessions={} host_bytes={} \
@@ -3200,7 +3244,7 @@ impl Rig {
                     // Legacy carries it unread (byte-neutral).
                     mtp_head: mtp_head.is_some() && mtp_k > 0,
                 },
-                cfg.kvmem.as_ref(),
+                legacy_config.as_ref(),
                 )?)
             }
             None => None,

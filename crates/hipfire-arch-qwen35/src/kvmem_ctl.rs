@@ -558,6 +558,41 @@ pub fn resolve_plan(
     })
 }
 
+/// Effective Legacy history budget for the admission site. The config layer
+/// defaults `budget_tokens` to 32768 and `gen_reserve_tokens` to 1024 without
+/// knowing the logical context, so a default budget meeting C=32768 would
+/// fail `B + R <= C` on every stock 32k deployment. An *implicit* budget (no
+/// explicit env/CLI/snapshot input, `Source::Default`) is therefore clamped to
+/// `C - R` floored to whole blocks; an explicitly requested budget is never
+/// reduced — `resolve_legacy_plan` still rejects it, mirroring the
+/// "not reduced automatically" contract for explicit physical pools.
+pub fn effective_legacy_budget(
+    budget_tokens: usize,
+    implicit: bool,
+    cap_tokens: usize,
+    reserve_tokens: usize,
+) -> usize {
+    if !implicit {
+        return budget_tokens;
+    }
+    let ceiling = cap_tokens
+        .saturating_sub(reserve_tokens)
+        .saturating_div(KV_BLOCK_TOKENS)
+        .saturating_mul(KV_BLOCK_TOKENS);
+    budget_tokens.min(ceiling)
+}
+
+/// Whether `budget_tokens` is the built-in default (no env/CLI/snapshot
+/// input). Only an implicit budget is ever clamped to the logical context;
+/// one lookup shared by the admission site and the controller restatement so
+/// the two cannot drift.
+pub fn implicit_legacy_budget(config: &hipfire_config::kvmem::ResolvedConfig) -> bool {
+    config
+        .report
+        .get("budget_tokens")
+        .is_none_or(|report| report.source == hipfire_config::kvmem::Source::Default)
+}
+
 /// Admit the public Legacy contract after token normalization. Unlike the
 /// historical env-only pool planner, the physical pool never silently reduces
 /// the requested history budget. NInfer's device window is B + R: a pressure
@@ -5244,6 +5279,22 @@ mod tests {
         assert!(resolve_legacy_plan(1, 32768, 128, 8193, 1024, None).is_err());
         assert!(resolve_legacy_plan(1, 32768, 128, 8192, 127, None).is_err());
         assert!(resolve_legacy_plan(0, 32768, 256, 8192, 1024, None).is_err());
+    }
+
+    #[test]
+    fn implicit_legacy_budget_clamps_to_context_and_explicit_stays_loud() {
+        // Stock 32k deployment with no explicit budget: the default 32768
+        // would fail B + R <= C; the implicit clamp makes it admissible.
+        let implicit = effective_legacy_budget(32768, true, 32768, 1024);
+        assert_eq!(implicit, 31744);
+        assert!(resolve_legacy_plan(1, 32768, 256, implicit, 1024, None).is_ok());
+        // An explicit budget is never reduced: the operator asked for it.
+        assert_eq!(effective_legacy_budget(32768, false, 32768, 1024), 32768);
+        assert!(resolve_legacy_plan(1, 32768, 256, 32768, 1024, None).is_err());
+        // Clamping floors to whole blocks and leaves sub-minimum contexts loud.
+        assert_eq!(effective_legacy_budget(32768, true, 9216, 1025), 8064);
+        assert_eq!(effective_legacy_budget(2048, true, 32768, 1024), 2048);
+        assert_eq!(effective_legacy_budget(32768, true, 512, 1024), 0);
     }
 
     /// Small Q8 geometry: 2 fa layers, 2 KV heads, head_dim 64 →
