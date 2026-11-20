@@ -2359,8 +2359,16 @@ impl SlotBackend {
                     Some(prompt) => {
                         pass_prompt = prompt;
                         pass_continuation = Continuation::Cold;
-                        pass_temperature = temperature.max(1.0);
-                        pass_presence = presence_penalty.max(1.5);
+                        // The reference (#728) restarted at temperature>=1 /
+                        // presence>=1.5 to shake the loop. This engine serves
+                        // models whose sampling is deliberately low (0.3/0.8
+                        // baked or configured); boosting to 1.0 was observed
+                        // to corrupt the answer (`?` storms) and lose the
+                        // turn. The loop-break here is the cold restart plus
+                        // the rewritten low-effort sentence — keep the
+                        // request's own sampling.
+                        pass_temperature = temperature;
+                        pass_presence = presence_penalty;
                         pass_max_tokens = max_tokens.saturating_sub(gates.n()).max(1);
                         trace_think(format!(
                             "recover pass: temperature {} presence {} max_tokens {}",
