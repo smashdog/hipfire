@@ -307,6 +307,11 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
     # architecture unchanged (dense qwen35).
     if family == "bonsai":
         return 5
+    # DaisyRose-27B = RP finetune of the Qwen3.8-27B dense hybrid; the HFQM v1
+    # header reports arch_id 5 / architecture qwen3_5 unchanged (64 layers,
+    # 48 linear + 16 full attention), so it rides the dense qwen35 path.
+    if family == "daisyrose":
+        return 5
     if family == "qwen3.8" and ("flash-next" in tag or "flash-next" in file):
         # Qwen3.8-Flash-Next is the Qwen4 experimental arch-16 carrier,
         # not the ordinary Qwen3.8 dense arch-5 family.
