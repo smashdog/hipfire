@@ -822,6 +822,72 @@ fn batch_admission_token_reuse_rejects_stale_producer_operations() {
 }
 
 #[test]
+fn cold_continuation_requeues_the_previous_lane_owner() {
+    let _lock = begin_test();
+    batch_clear_all_terminals();
+    let id = "cold-continuation";
+    let attempt_id = 44;
+    let generation =
+        hipfire_engine::terminal::batch_announce_terminal(id, attempt_id).expect("admission");
+    assert!(hipfire_engine::terminal::batch_transition_to_queued(
+        id,
+        attempt_id,
+        generation
+    ));
+    // The first pass owns lane 0.
+    let first = LaneTicket {
+        lane: 0,
+        generation: 1,
+        admission: generation,
+    };
+    assert!(batch_bind_active(id, attempt_id, generation, first));
+    // A budget-close pass hands that session back and re-prefills cold, so the
+    // continuation accept names a different lane. Binding it directly fails —
+    // the registry still holds the previous owner.
+    let next = LaneTicket {
+        lane: 2,
+        generation: 2,
+        admission: generation,
+    };
+    assert!(!batch_bind_active(id, attempt_id, generation, next));
+    // Requeueing the previous owner lets the continuation bind and commit.
+    assert!(hipfire_engine::terminal::batch_requeue_active(
+        id,
+        attempt_id,
+        generation,
+        first
+    ));
+    assert!(batch_bind_active(id, attempt_id, generation, next));
+    let pending = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "attempt_id": attempt_id,
+    });
+    assert!(batch_mark_ready_with_pending(
+        id,
+        attempt_id,
+        generation,
+        next,
+        pending
+    ));
+    hipfire_engine::terminal::batch_apply_terminal_control(
+        "commit",
+        id,
+        attempt_id,
+    );
+    assert_eq!(
+        hipfire_engine::terminal::batch_poll_decision(
+            id,
+            attempt_id,
+            generation
+        ),
+        Some(ClientTerminalDecision::Commit)
+    );
+    batch_clear_all_terminals();
+    reset();
+}
+
+#[test]
 fn abort_helper_emits_exactly_one_correlated_aborted_terminal() {
     let _lock = begin_test();
     set_active_attempt_id(41);
