@@ -36,8 +36,9 @@ use hipfire_arch_qwen35::spec_emit::Qwen35Emit;
 use hipfire_engine::emit::{emit_reasoning_token, emit_visible_token, stage_terminal_tool_calls};
 use hipfire_engine::terminal::{
     batch_bind_active, batch_check_abort, batch_clear_terminal_at_generation,
-    batch_mark_ready_with_pending, batch_transition_to_queued, batch_wait_decision,
-    BatchAttemptScope, BatchGeneration, LaneTicket, CLIENT_TERMINAL_COMMIT_TIMEOUT,
+    batch_mark_ready_with_pending, batch_requeue_active, batch_transition_to_queued,
+    batch_wait_decision, BatchAttemptScope, BatchGeneration, LaneTicket,
+    CLIENT_TERMINAL_COMMIT_TIMEOUT,
 };
 use hipfire_generate::ar::{
     emit_active_route_cancel, emit_active_route_done, emit_generation_start, GenerationRoute,
@@ -78,6 +79,15 @@ fn emit_qwen_ar_slot_error<W: std::io::Write>(
         retryable,
         rolled_back,
     );
+}
+
+/// Opt-in slot/pending-tool trace (`HIPFIRE_SLOT_TRACE=1`). Stderr only, so a
+/// serve started with its output in a log keeps a timeline of which session
+/// owned a staged tool call and why it was or was not claimable.
+fn slot_trace(args: std::fmt::Arguments<'_>) {
+    if std::env::var_os("HIPFIRE_SLOT_TRACE").is_some() {
+        eprintln!("[slots] {args}");
+    }
 }
 
 /// The per-arch multi-slot engine behind the four-method surface
@@ -825,6 +835,7 @@ impl SlotBackend {
         if closed.is_empty() {
             return;
         }
+        slot_trace(format_args!("reap engine-closed sessions={closed:?}"));
         let mut pending = self
             .pending_tools
             .lock()
@@ -1638,6 +1649,18 @@ impl SlotBackend {
         {
             Ok(claim) => claim,
             Err(reason) => {
+                {
+                    let broker = self
+                        .pending_tools
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    slot_trace(format_args!(
+                        "claim id={id} attempt={attempt_id} failed: {reason} \
+                         (broker sessions={} calls={})",
+                        broker.by_session.len(),
+                        broker.by_call.len()
+                    ));
+                }
                 hipfire_engine::emit::emit_active_attempt_error(
                     stdout,
                     Some(id),
@@ -2009,8 +2032,41 @@ impl SlotBackend {
                                 generation: session,
                                 admission,
                             };
+                            let mut bound = batch_bind_active(id, attempt_id, admission, ticket);
+                            if !bound {
+                                // A cold continuation (budget close, loop
+                                // recovery) hands its previous session back
+                                // before re-prefilling, so this accept names a
+                                // lane the registry does not own yet. Requeue
+                                // the previous owner first: without that the
+                                // bind stays dead and the terminal can never
+                                // reach Ready, stranding the commit until the
+                                // client timeout aborts it.
+                                if let Some(prev) = accepted_ticket.filter(|prev| *prev != ticket) {
+                                    if batch_requeue_active(id, attempt_id, admission, prev) {
+                                        bound =
+                                            batch_bind_active(id, attempt_id, admission, ticket);
+                                        if !bound {
+                                            eprintln!(
+                                                "[slot-bind] id={id} attempt_id={attempt_id} \
+                                                 requeued lane {prev:?} but rebind of {ticket:?} \
+                                                 failed"
+                                            );
+                                        }
+                                    } else {
+                                        eprintln!(
+                                            "[slot-bind] id={id} attempt_id={attempt_id} \
+                                             could not requeue lane {prev:?} before binding \
+                                             {ticket:?}"
+                                        );
+                                    }
+                                }
+                            }
                             accepted_ticket = Some(ticket);
-                            let _ = batch_bind_active(id, attempt_id, admission, ticket);
+                            slot_trace(format_args!(
+                                "bind id={id} attempt={attempt_id} session={session} \
+                                 lane={ticket:?} bound={bound}"
+                            ));
                             // #1053: the injected close renders only once the
                             // continuation pass is ADMITTED — a rejected
                             // continuation must leave the client stream
@@ -2529,8 +2585,35 @@ impl SlotBackend {
             let _ = stdout.flush();
             return Ok(());
         };
-        let _ =
-            batch_mark_ready_with_pending(id, attempt_id, admission, ticket, pending_done.clone());
+        if !batch_mark_ready_with_pending(
+            id,
+            attempt_id,
+            admission,
+            ticket,
+            pending_done.clone(),
+        ) {
+            // The staged done can never be committed: the registry does not
+            // recognize this lane as the producer. Fail the request now rather
+            // than publish a terminal that the daemon will later abort.
+            if let Some(sess) = accepted_session.take() {
+                self.close_session(sess);
+            } else if let Some(session) = claimed_session {
+                self.close_session(session);
+            }
+            emit_qwen_ar_slot_error(
+                stdout,
+                id,
+                &format!(
+                    "slot terminal has no matching ready entry (lane {ticket:?}); \
+                     request {attempt_id} cannot be committed"
+                ),
+                "internal",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        }
         // commit_ready is the staged done with only `type` changed.
         pending_done["type"] = serde_json::Value::String("commit_ready".to_string());
         let _ = writeln!(stdout, "{}", pending_done);
@@ -2539,6 +2622,9 @@ impl SlotBackend {
 
         let decision =
             batch_wait_decision(id, attempt_id, admission, CLIENT_TERMINAL_COMMIT_TIMEOUT);
+        slot_trace(format_args!(
+            "terminal id={id} attempt={attempt_id} lane={ticket:?} decision={decision:?}"
+        ));
         match decision {
             hipfire_engine::terminal::ClientTerminalDecision::Commit => {
                 if let Some(session) = accepted_session {
@@ -2553,6 +2639,14 @@ impl SlotBackend {
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
                             .register(session, convo.clone(), &terminal_tool_calls);
+                        slot_trace(format_args!(
+                            "register session={session} calls={} ids={:?}",
+                            terminal_tool_calls.len(),
+                            terminal_tool_calls
+                                .iter()
+                                .filter_map(|call| call.id.as_deref())
+                                .collect::<Vec<_>>()
+                        ));
                     }
                 }
                 // Emit byte-identical done through the route adapter so the
