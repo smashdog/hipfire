@@ -475,8 +475,24 @@ fn slots_proj_admissible(dt: DType, arch: &str) -> bool {
             | DType::MQ3G256V2
             | DType::MQ3G256Lloyd
             | DType::MQ2G256V2
+            // PrismML Bonsai ternary/binary: flat (unrotated) G128 containers.
+            // They never take a fused launch (no FusedQkvza/Qkv/GateUp key
+            // exists for them) — plan_proj_group_dtypes forces them onto the
+            // per-projection plain-GEMM Mixed path, and slots_residual_proj
+            // accumulates wo/w_down with plain GEMM + add (no residual kernel).
+            | DType::TQ2G128
+            | DType::BQ1G128
     );
     member && is_batchable_la(dt, arch)
+}
+
+/// Flat lowbit Bonsai containers (ternary TQ2G128 / binary BQ1G128). Unrotated
+/// like Q8_0, but with their own tiled prefill GEMM keys and NO residual GEMM
+/// kernel — the residual role accumulates via plain GEMM + `add_inplace_f32`,
+/// exactly the Q8 non-WMMA fork. Kept separate from `slots_weight_rotated`
+/// (they read the natural-basis normed activation, never the FWHT-rotated one).
+fn slots_is_lowbit(dt: DType) -> bool {
+    matches!(dt, DType::TQ2G128 | DType::BQ1G128)
 }
 
 /// Dtypes whose stored weights are offline-FWHT-rotated over G256 groups:
@@ -522,6 +538,10 @@ fn lm_head_slots_admissible(dt: DType) -> bool {
             | DType::MQ2G256V2
             | DType::HFQ3G256
             | DType::F16
+            // Bonsai flat lowbit head: Step::Gemv + dispatch_ref resolves
+            // GemvTQ2G128 / GemvBQ1G128 (natural basis, no rotation).
+            | DType::TQ2G128
+            | DType::BQ1G128
     )
 }
 
@@ -555,6 +575,11 @@ fn slots_plain_gemm_key(dt: DType) -> Option<KernelKey> {
         DType::MQ5G256V2 => KernelKey::GemmMq5G256V2,
         DType::MQ3G256V2 => KernelKey::GemmMq3G256V2,
         DType::MQ2G256V2 => KernelKey::GemmMq2G256V2,
+        // Flat lowbit Bonsai: the tiled prefill GEMMs (same keys
+        // `plain_gemm_key_for` resolves). Explicit run_key bypasses the
+        // BatchGe(32) auto-resolve shape gate, so decode row counts work too.
+        DType::TQ2G128 => KernelKey::GemmTQ2G128Prefill,
+        DType::BQ1G128 => KernelKey::GemmBQ1G128Prefill,
         _ => return None,
     })
 }
@@ -584,6 +609,7 @@ fn slots_residual_gemm_key(dt: DType) -> Option<KernelKey> {
 fn slots_check_residual_weight(w: &WeightTensor, name: &str, arch: &str) -> HipResult<()> {
     let dt = w.gpu_dtype;
     if dt == DType::Q8_0
+        || slots_is_lowbit(dt)
         || (slots_proj_admissible(dt, arch)
             && (slots_weight_rotated(dt) || slots_residual_gemm_key(dt).is_some()))
     {
@@ -616,7 +642,13 @@ fn plan_proj_group_dtypes(members: &[(DType, bool)], arch: &str) -> Result<Group
         }
     }
     let d0 = members[0].0;
-    if members.iter().all(|(dt, _)| *dt == d0) {
+    // Flat lowbit (Bonsai TQ2/BQ1) has NO fused qkvza/qkv/gate_up kernel on any
+    // arch, so a uniform lowbit group must NOT take the Uniform fused launch
+    // (fused_*_key_for would fall through to HFQ4 and mis-read the G128 blocks).
+    // Force it onto the per-projection plain-GEMM Mixed path; the mixed logic
+    // below then yields Mixed{needs_rot:false, needs_norm:true} (every member
+    // is flat and has a plain key). Mirrors plan_q8_fused_or_plain for Q8.
+    if members.iter().all(|(dt, _)| *dt == d0) && !slots_is_lowbit(d0) {
         return Ok(GroupPlan::Uniform(d0));
     }
     // AWQ in a mixed group: a flat member's sidecar has no fused kernel to
@@ -883,6 +915,27 @@ fn slots_residual_proj(
     let dt = w.gpu_dtype;
     if dt == DType::Q8_0 {
         return q8_residual_proj(gpu, w, x, y, q8_scratch, n, q8_wmma_arch);
+    }
+    if slots_is_lowbit(dt) {
+        // No residual GEMM kernel exists for the flat lowbit containers.
+        // Mirror the Q8 non-WMMA fork: plain GEMM into the caller's dead
+        // scratch, then an explicit f32 add into the residual stream. `x` is
+        // the natural-basis (unrotated) activation — lowbit weights are not
+        // FWHT-rotated, so it must NOT read rot_scratch.
+        let s = q8_scratch.sub_offset(0, n * w.m);
+        run_plain_gemm_key(
+            gpu,
+            slots_plain_gemm_key(dt).expect("lowbit residual has a plain key"),
+            &w.buf,
+            dt,
+            x,
+            &s,
+            w.m,
+            w.k,
+            n,
+        )?;
+        let y_n = y.sub_offset(0, n * w.m);
+        return gpu.add_inplace_f32(&y_n, &s);
     }
     if slots_weight_rotated(dt) {
         return mq4_residual_proj(gpu, w, x, y, rot_scratch, n);
@@ -4973,7 +5026,6 @@ mod tests {
         // Out-of-scope containers refuse at admission.
         for dt in [
             DType::MQ4G256V2Lloyd,
-            DType::TQ2G128,
             DType::HFQ4G128,
             DType::F16,
         ] {
@@ -4982,6 +5034,29 @@ mod tests {
                 "{dt:?} must not be admitted"
             );
         }
+        // Flat lowbit Bonsai containers ARE admitted, but never as a Uniform
+        // fused group: a uniform lowbit group is forced onto the per-projection
+        // plain-GEMM Mixed path (no fused qkvza/qkv/gate_up key exists for them,
+        // and the fused_*_key_for wildcard would mis-read G128 at HFQ4 stride).
+        for dt in [DType::TQ2G128, DType::BQ1G128] {
+            assert!(slots_proj_admissible(dt, arch), "{dt:?} must be admitted");
+            assert!(slots_is_lowbit(dt), "{dt:?} must be lowbit");
+            assert!(!slots_weight_rotated(dt), "{dt:?} is flat, not rotated");
+            assert!(slots_plain_gemm_key(dt).is_some(), "{dt:?} needs a plain key");
+            assert_eq!(
+                plan_proj_group_dtypes(&[m(dt), m(dt)], arch),
+                Ok(GroupPlan::Mixed {
+                    needs_rot: false,
+                    needs_norm: true
+                }),
+                "{dt:?} uniform group must lower to plain Mixed, never Uniform fused"
+            );
+            // A lowbit residual role is admitted (plain GEMM + add, no key).
+            assert!(slots_residual_gemm_key(dt).is_none(), "{dt:?} has no residual kernel");
+        }
+        // lm_head admits the flat lowbit head (Step::Gemv -> GemvTQ2/BQ1G128).
+        assert!(lm_head_slots_admissible(DType::TQ2G128));
+        assert!(lm_head_slots_admissible(DType::BQ1G128));
     }
 
     #[test]

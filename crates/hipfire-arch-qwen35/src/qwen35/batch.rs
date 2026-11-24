@@ -71,6 +71,18 @@ pub struct PrefillBatchScratch {
     pub up_batch: GpuTensor,
     // SwiGLU output (FWHT-rotated for MQ4) feeding w_down.
     pub ffn_hidden_batch: GpuTensor,
+    /// Escha trellis scratch: the H128-rotated activations feeding one
+    /// projection's batched GEMV, `[max_batch, max(hidden_dim, dim)]`.
+    ///
+    /// Cannot share `x_rot_batch` or `ffn_hidden_batch`: each escha projection
+    /// rotates the SAME input with its OWN `rin`, and for `down_proj` the
+    /// ffn hidden state IS the input, so writing xh there would destroy it.
+    pub escha_xh_batch: GpuTensor,
+    /// Escha projection output before it is accumulated into the residual,
+    /// `[max_batch, dim]`. The fused epilogue writes straight into the
+    /// residual; the trellis GEMV has no residual variant, so out_proj and
+    /// down_proj land here first.
+    pub escha_y_batch: GpuTensor,
 
     // FWHT-rotated dn_normed [N × v_dim] feeding wo for MQ4 weights.
     // Decode path handles this via an internal mq_x_rot scratch inside
@@ -314,6 +326,10 @@ impl PrefillBatchScratch {
         let i_gate_ffn_batch = alloc!(&[max_batch * hidden_dim], DType::F32);
         let i_up_batch = alloc!(&[max_batch * hidden_dim], DType::F32);
         let i_ffn_hidden_batch = alloc!(&[fallback_rows * hidden_dim], DType::F32);
+        // Escha trellis scratch (see the struct fields): each projection rotates
+        // the same input with its own rin, so these cannot alias x_rot/ffn_hidden.
+        let i_escha_xh_batch = alloc!(&[max_batch * hidden_dim.max(dim)], DType::F32);
+        let i_escha_y_batch = alloc!(&[max_batch * dim], DType::F32);
         let i_dn_normed_rot_batch = alloc!(&[fallback_rows * v_dim], DType::F32);
         // F32 dtype = 4 bytes/element, same layout as i32. The rope /
         // attention / kv_write kernels cast the pointer to `const int*`,
@@ -559,6 +575,8 @@ impl PrefillBatchScratch {
             gate_ffn_batch: take!(i_gate_ffn_batch),
             up_batch: take!(i_up_batch),
             ffn_hidden_batch: take!(i_ffn_hidden_batch),
+            escha_xh_batch: take!(i_escha_xh_batch),
+            escha_y_batch: take!(i_escha_y_batch),
             dn_normed_rot_batch: take!(i_dn_normed_rot_batch),
             positions: take!(i_positions),
             rope_positions,
@@ -633,6 +651,8 @@ impl PrefillBatchScratch {
             self.gate_ffn_batch,
             self.up_batch,
             self.ffn_hidden_batch,
+            self.escha_xh_batch,
+            self.escha_y_batch,
             self.dn_normed_rot_batch,
             self.positions,
             self.pos3,

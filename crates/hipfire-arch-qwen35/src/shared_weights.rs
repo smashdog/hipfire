@@ -195,6 +195,9 @@ dtype_table! {
     MQ4G256V2P = 65, MQ4G128V2P = 66,
     // Qwen4 HC8 sidecar weight (qt 57; exact gfx1201, never in a shared qwen35 weight file; additive tag).
     HC8E4M3Row = 67,
+    // Escha trellis-code stores (qt42/qt43); additive wire tags, HFQ-loaded.
+    // Renumbered 65/66 -> 68/69 on the v0.4.6 rebase: upstream took 65..67.
+    Escha2T16 = 68, Escha3T16 = 69,
 }
 
 fn embd_tag(f: EmbeddingFormat) -> SwResult<u8> {

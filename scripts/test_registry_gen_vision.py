@@ -16,6 +16,11 @@ names it — so there is no "pairs with an entry file" invariant to pin here.
 Tags containing `-draft` (`qwen3.8:27b-draft` alias and
 `qwen3.8:27b-draft-mq3`..`-mq6`) are text-only DFlash controller sidecars,
 not target tiers, and carry no vision slot; `_tiers` excludes them.
+
+Escha trellis tiers (`qwen3.8:27b-escha` / `-escha-pro` / `-escha-xt`) ship
+from their own repos (`hipfire-models/qwen3.8-27b-escha`), which do not
+mirror the shared vision pack yet; they are published text-only until it is
+uploaded there, so `_tiers` exempts them from the shared-vision invariant.
 """
 import importlib.util
 import json
@@ -36,8 +41,18 @@ def _curated() -> dict:
     return json.loads((REPO_ROOT / "registry" / "models.json").read_text())
 
 
+# Escha repos do not mirror the shared vision pack; see the module docstring.
+_VISION_EXEMPT_SUFFIXES = ("-escha", "-escha-pro", "-escha-xt")
+
+
 def _tiers(models: dict) -> dict:
-    return {k: v for k, v in models.items() if k.startswith("qwen3.8:27b") and "-draft" not in k}
+    return {
+        k: v
+        for k, v in models.items()
+        if k.startswith("qwen3.8:27b")
+        and "-draft" not in k
+        and not k.endswith(_VISION_EXEMPT_SUFFIXES)
+    }
 
 
 def test_every_qwen38_27b_tier_declares_the_shared_vision_file():

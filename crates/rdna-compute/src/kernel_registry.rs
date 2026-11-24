@@ -6410,6 +6410,81 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ]
         );
     }
+    // Escha-W2 (merged nw_escha_w2): H128 transform pair, trellis decode GEMVs
+    // and the batched routed executor kernels. Multi-entry modules must list
+    // every symbol — the module name itself is not a kernel.
+    add!(
+        "router_logits_round_f16_rne",
+        kernels::ROUTER_LOGITS_ROUND_F16_RNE_SRC,
+        ["router_logits_round_f16_rne"]
+    );
+    add!(
+        "escha_decode_tiles",
+        kernels::ESCHA_DECODE_TILES_SRC,
+        ["escha_decode_tiles"]
+    );
+    add!(
+        "escha_h128",
+        kernels::ESCHA_H128_SRC,
+        [
+            "escha_h128_in",
+            "escha_h128_out",
+            "escha_h128_in_batched",
+            "escha_h128_out_batched",
+            "escha_swiglu_batched"
+        ]
+    );
+    add!(
+        "escha_bare_to_outmajor",
+        kernels::ESCHA_BARE_TO_OUTMAJOR_SRC,
+        ["escha_bare_to_q8_0", "escha_bare_to_f32", "escha_bare_to_f16"]
+    );
+    add!(
+        "escha_moe_gemv_k8_indexed",
+        kernels::ESCHA_MOE_GEMV_K8_INDEXED_SRC,
+        [
+            "escha_gemv_q8_0_moe_k8_indexed_batched",
+            "escha_gemv_q8_0_wide_moe_k8_indexed_batched",
+            "escha_round_weights_f16_rne"
+        ]
+    );
+    add!(
+        "escha_moe_gemv_native",
+        kernels::ESCHA_MOE_GEMV_NATIVE_SRC,
+        [
+            "escha_gemv_native_k2_moe_k8_indexed_batched",
+            "escha_gemv_native_k3_moe_k8_indexed_batched",
+            "escha_gemv_native_k2_wide_moe_k8_indexed_batched",
+            "escha_gemv_native_k3_wide_moe_k8_indexed_batched",
+            "escha_gemv_f16_moe_k8_indexed_batched",
+            "escha_gemv_f16_wide_moe_k8_indexed_batched"
+        ]
+    );
+    add!(
+        "escha_moe_gemm_grouped",
+        kernels::ESCHA_MOE_GEMM_GROUPED_SRC,
+        [
+            "escha_gemm_grouped_k2_r4_c2",
+            "escha_gemm_grouped_k2_r8_c2",
+            "escha_gemm_grouped_k2_r8_c4",
+            "escha_gemm_grouped_k2_r8_c8",
+            "escha_gemm_grouped_k2_r16_c2",
+            "escha_gemm_grouped_k2_r16_c4",
+            "escha_gemm_grouped_k3_r4_c2",
+            "escha_gemm_grouped_k3_r8_c2",
+            "escha_gemm_grouped_k3_r8_c4",
+            "escha_gemm_grouped_k3_r8_c8",
+            "escha_gemm_grouped_k3_r16_c2",
+            "escha_gemm_grouped_k3_r16_c4"
+        ]
+    );
+    if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") {
+        add!(
+            "escha_moe_gemm_grouped_wmma",
+            kernels::ESCHA_MOE_GEMM_GROUPED_WMMA_SRC,
+            ["escha_gemm_grouped_wmma_k2", "escha_gemm_grouped_wmma_k3"]
+        );
+    }
     Ok(entries)
 }
 
@@ -12278,6 +12353,31 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // Escha baseline (merged nw_escha_w2): H128 transform pair,
+        // trellis decode GEMVs and the batched routed executor kernels ship
+        // on every arch, so they are in the gfx1201 registry too.
+        const ESCHA_ADDED_MODULES: [&str; 8] = [
+            "router_logits_round_f16_rne",
+            "escha_decode_tiles",
+            "escha_h128",
+            "escha_bare_to_outmajor",
+            "escha_moe_gemv_k8_indexed",
+            "escha_moe_gemv_native",
+            "escha_moe_gemm_grouped",
+            "escha_moe_gemm_grouped_wmma",
+        ];
+        for module in ESCHA_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing Escha baseline module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -12325,7 +12425,8 @@ mod tests {
                 + ARGMAX_PAIR_MERGE_ADDED_MODULES.len()
                 + TRUNK_REDUCTION_PARTITION_ADDED_MODULES.len()
                 + TOPK8_ROWS_ADDED_MODULES.len()
-                + PACK_FIX_ADDED_MODULES.len(),
+                + PACK_FIX_ADDED_MODULES.len()
+                + ESCHA_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

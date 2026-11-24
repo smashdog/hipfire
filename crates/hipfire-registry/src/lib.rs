@@ -1937,6 +1937,15 @@ fn epoch_millis() -> u64 {
 mod tests {
     use super::*;
 
+    /// Escha trellis tiers ship from hipfire-models/qwen3.8-27b-escha, which
+    /// does not mirror the shared qwen3.8-27b MTP/vision sidecars yet. They
+    /// are published text-only until it does, so the qwen3.8-27b family
+    /// contracts (shared MTP head, shared vision pack, medium effort default)
+    /// exempt them — same exemption as scripts/test_registry_gen_vision.py.
+    fn is_escha_tier(tag: &str) -> bool {
+        tag.ends_with("-escha") || tag.ends_with("-escha-pro") || tag.ends_with("-escha-xt")
+    }
+
     const FLASH_NEXT_FIXTURE_TAGS: [&str; 4] = [
         "qwen3.8:flash-next",
         "qwen3.8:flash-next-mq4",
@@ -4083,6 +4092,9 @@ mod tests {
                     entry.mtp.is_none(),
                     "{tag}: a DFlash draft carries no MTP head"
                 );
+            } else if is_escha_tier(tag) {
+                // Escha repos do not mirror qwen3.8-27b.mtp yet.
+                continue;
             } else {
                 assert_eq!(entry.mtp.as_ref(), Some(&expected_mtp), "{tag} MTP head");
                 trunk_tiers += 1;
@@ -4190,7 +4202,8 @@ mod tests {
         let registry = bundled().unwrap();
         let mut tiers = 0;
         for (tag, entry) in &registry.models {
-            let is_dense_trunk = tag.starts_with("qwen3.8:27b") && !tag.contains("-draft");
+            let is_dense_trunk =
+                tag.starts_with("qwen3.8:27b") && !tag.contains("-draft") && !is_escha_tier(tag);
             let is_ornith = tag.starts_with("ornith-1.5:");
             if !is_dense_trunk && !is_ornith {
                 continue;
@@ -4437,10 +4450,15 @@ mod tests {
         // are text-only DFlash controller sidecars and carry no vision. Unlike
         // dflash, the vision file is standalone: no registry entry's `file`
         // names it.
+        //
+        // Escha trellis tiers ship from hipfire-models/qwen3.8-27b-escha,
+        // which does not mirror the shared pack yet; they are published
+        // text-only until it is uploaded there (same exemption as
+        // scripts/test_registry_gen_vision.py).
         let registry = bundled().unwrap();
         let mut declared = 0;
         for (tag, entry) in &registry.models {
-            if !tag.starts_with("qwen3.8:27b") || tag.contains("-draft") {
+            if !tag.starts_with("qwen3.8:27b") || tag.contains("-draft") || is_escha_tier(tag) {
                 continue;
             }
             let sidecar = entry

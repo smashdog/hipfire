@@ -1465,6 +1465,7 @@ dependencies = [
  "hipfire-config",
  "hipfire-cpu",
  "hipfire-dispatch",
+ "hipfire-quantize",
  "hipfire-reap",
  "hipfire-runtime",
  "railgun",
@@ -1665,6 +1666,7 @@ dependencies = [
 name = "hipfire-dispatch"
 version = "0.4.7"
 dependencies = [
+ "half",
  "hip-bridge",
  "hipfire-config",
  "hipfire-cpu",
@@ -3296,6 +3298,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "hipfire-kernel-abi",
+ "hipfire-quantize",
  "libloading",
  "peacemaker-ir",
  "peacemaker-isa",

@@ -366,7 +366,68 @@ impl hipfire_runtime::serve::SlotEngineHandle for SlotEngine {
         (*self).shutdown_engine()
     }
 }
-/// Everything the engine thread owns.
+/// Per-request MTP sampling/penalty configuration, parked on the rig at admit
+/// and applied on the slot's first draft step (a cold admit's `MtpSpecState`
+/// only exists after the first prefill chunk allocates it).
+///
+/// Sampling (`temp > 0`) drives the sampled draft + residual acceptance in
+/// `mtp_draft_phase_inner` / `mtp_batched_verify_accept_from_batch`; the
+/// penalties install the exact-AR history the verify rows scope against
+/// (`emitted ‖ candidates[..k]`, trailing `repeat_window`), mirroring the
+/// sequential drafter's `begin_window` per window.
+struct MtpReqSampling {
+    sampling: crate::mtp_spec::MtpSamplingConfig,
+    /// Full rendered prompt the request started from (`prompt_tokens` cold,
+    /// `extended` on a continuation). `sess.tokens[prompt_len..]` is the
+    /// emitted history the penalty rows scope against.
+    prompt_len: usize,
+    /// Trailing `repeat_window` tokens of that prompt (`set_prompt`).
+    prompt_tail: Vec<u32>,
+    /// Host RNG seed for the sampled accept rule (`request_rng_state`).
+    rng_seed: u64,
+    /// True once the slot's MTP state has this config installed; the penalty
+    /// window is still rebuilt from `emitted` on every later window.
+    applied: bool,
+}
+
+impl MtpReqSampling {
+    fn new(req: &SubmitRequest, prompt: &[u32]) -> Self {
+        let repeat_window = effective_repeat_window(
+            req.repeat_window,
+            req.repeat_penalty,
+            req.presence_penalty,
+            req.frequency_penalty,
+        );
+        Self {
+            sampling: crate::mtp_spec::MtpSamplingConfig {
+                temp: req.temperature.max(0.0),
+                // The AR slot sampler maps an absent/0 top-k onto its default
+                // 20-candidate pool (`SlotSampleParams::top_k` docs) and caps
+                // at 64; the verify softmax kernel takes that same cap.
+                top_k: if req.top_k > 0 {
+                    (req.top_k as usize).min(64)
+                } else {
+                    20
+                },
+                top_p: if req.top_p > 0.0 {
+                    req.top_p.min(1.0)
+                } else {
+                    1.0
+                },
+                min_p: req.min_p.clamp(0.0, 1.0),
+                repeat_penalty: req.repeat_penalty,
+                repeat_window,
+                presence_penalty: req.presence_penalty,
+                frequency_penalty: req.frequency_penalty,
+            },
+            prompt_len: prompt.len(),
+            prompt_tail: prompt[prompt.len().saturating_sub(repeat_window)..].to_vec(),
+            rng_seed: hipfire_runtime::spec::request_rng_state(req.seed as u64),
+            applied: false,
+        }
+    }
+}
+
 /// Upper bound on a request's token-penalty window (`repeat_window`). The
 /// penalty prepass is O(window²) per launch on device, and the per-slot
 /// window buffer is sized by this; the daemon clamps requests to the same
@@ -395,6 +456,9 @@ struct ModelRig {
     /// Per-slot MTP spec state. None for slots that haven't started MTP yet
     /// or when MTP is off. Allocated lazily on first MTP prefill.
     mtp_states: Vec<Option<crate::mtp_spec::MtpSpecState>>,
+    /// Per-slot MTP request sampling/penalty config, installed at admit and
+    /// applied on the slot's first draft step (see [`MtpReqSampling`]).
+    mtp_req_sampling: Vec<Option<MtpReqSampling>>,
     /// Batched scratch (+ per-row FWHT-rot buffer) for MTP head-KV prefill
     /// from the scheduler's batched prompt chunks. None when MTP is off.
     mtp_prefill_batched: Option<(crate::mtp_head::Qwen35MtpHeadBatchedScratch, GpuTensor)>,
@@ -1906,6 +1970,7 @@ impl Rig {
                 logits_out,
                 mtp_head,
                 mtp_states: (0..cfg.n_slots).map(|_| None).collect(),
+                mtp_req_sampling: (0..cfg.n_slots).map(|_| None).collect(),
                 mtp_prefill_batched,
                 spec_verify_tape,
                 mtp_prefill_hidden,
@@ -2542,6 +2607,7 @@ impl ModelRig {
         mut gpu: &mut Gpu,
         slot: SlotId,
         work: &mut PendingWork,
+        emitted: &[u32],
     ) -> Result<crate::mtp_spec::MtpDraftOutput, String> {
         let head = self
             .mtp_head
@@ -2574,6 +2640,31 @@ impl ModelRig {
             if let Err(e) = state.mtp_scratch.ensure_compressed_logits(&mut gpu, cvs) {
                 self.mtp_states[slot.0] = Some(state);
                 return Err(format!("ensure head compressed logits: {e}"));
+            }
+        }
+
+        // Install this request's sampling/penalty config (parked by admit;
+        // a cold admit's state only exists from now on). `set_sampling`
+        // reseeds the draft RNG, so it runs exactly once per request — the
+        // per-window penalty history is rebuilt from `emitted` below instead.
+        let mut req_sampling = self.mtp_req_sampling[slot.0].take();
+        if let Some(cfg) = req_sampling.as_mut() {
+            if !cfg.applied {
+                state.set_sampling(cfg.sampling, cfg.rng_seed);
+                if cfg.sampling.penalized() {
+                    state.penalty = hipfire_runtime::spec_sampling::PenaltyHistory::new(
+                        cfg.sampling.repeat_window,
+                    );
+                    // Generation-only history: the prompt tail seeds row 0,
+                    // emitted tokens are added per window, exactly like AR's
+                    // `sess.tokens` tail window.
+                    state.penalty.set_prompt(&cfg.prompt_tail);
+                }
+                cfg.applied = true;
+            }
+            if cfg.sampling.penalized() {
+                // Row k of this window scopes `suffix_W(emitted ‖ c[..k])`.
+                state.penalty.begin_window(emitted);
             }
         }
 
@@ -2611,6 +2702,7 @@ impl ModelRig {
         })();
 
         self.mtp_states[slot.0] = Some(state);
+        self.mtp_req_sampling[slot.0] = req_sampling;
         outcome
     }
 }
@@ -3151,11 +3243,13 @@ fn effective_repeat_window(
     }
 }
 
-/// True when the request asks for real sampling. Sampled requests decode AR
-/// for the same reason penalized ones do: the verify accept is a bare greedy
-/// argmax and cannot reproduce a sampled pick — running MTP anyway would emit
-/// a greedy/spec hybrid instead of the requested distribution. The daemon
-/// defaults temperature to 0.0 (greedy), so MTP stays on for default requests.
+/// True when the request asks for real sampling (temperature > 0).
+///
+/// Sampled requests now run MTP through residual acceptance
+/// (`mtp_sampled_accept` with the draft nucleus), which reproduces the AR
+/// distribution. The predicate survives for the routes that still require a
+/// deterministic greedy chain: the DFlash2 slot draft, and the prefix-resume
+/// drafter plan (a resumed request's head KV is zero for the reused span).
 fn request_sampled(req: &SubmitRequest) -> bool {
     req.temperature > 0.0
 }
@@ -4200,10 +4294,33 @@ fn run_loop(
                         // `remaining_prompt` is stashed so a later draft drop
                         // can restore it.
                         let seed = work[s].remaining_prompt.last().copied();
+                        // Token penalties scope the verify rows against this
+                        // request's emitted history (`sess.tokens` past the
+                        // rendered prompt); only penalized MTP requests need
+                        // it, so the others skip the copy.
+                        let emitted: Vec<u32> = match work[s].spec {
+                            SpecKind::Mtp => {
+                                let pl = rig.model.mtp_req_sampling[s]
+                                    .as_ref()
+                                    .filter(|c| c.sampling.penalized())
+                                    .map(|c| c.prompt_len);
+                                match pl {
+                                    Some(pl) => slots[s]
+                                        .as_ref()
+                                        .and_then(|f| rig.sessions.get(f.session))
+                                        .map(|sess| {
+                                            sess.tokens[pl.min(sess.tokens.len())..].to_vec()
+                                        })
+                                        .unwrap_or_default(),
+                                    None => Vec::new(),
+                                }
+                            }
+                            _ => Vec::new(),
+                        };
                         let outcome = match work[s].spec {
                             SpecKind::Mtp => rig
                                 .model
-                                .mtp_draft_step(&mut rig.gpu, SlotId(s), &mut work[s])
+                                .mtp_draft_step(&mut rig.gpu, SlotId(s), &mut work[s], &emitted)
                                 .map(SpecDraftRows::Mtp),
                             SpecKind::Dflash => rig
                                 .model
@@ -5399,6 +5516,13 @@ fn run_loop(
                     let row_off: usize = (0..s)
                         .map(|i| batch.m_per_slot.get(i).copied().unwrap_or(0))
                         .sum();
+                    if rig.gpu.slot_trace() {
+                        eprintln!(
+                            "[slot-trace] spec prefill slot {s} kind={:?} m={m} rp={}",
+                            work[s].spec,
+                            work[s].remaining_prompt.len()
+                        );
+                    }
                     let prefill_outcome: Result<(), String> = match work[s].spec {
                         SpecKind::Mtp => {
                             let chunk_tokens: Vec<u32> =
@@ -6314,8 +6438,9 @@ fn admit(
                             .unwrap_or(0);
                         // MTP: activate if enabled. Vision continuations stay on
                         // the sequential M-RoPE path (no MTP), matching cold
-                        // admits; penalized requests stay on AR (see
-                        // `request_penalized`). The head KV reset is only needed
+                        // admits; sampling and penalties ride the MTP path via
+                        // `mtp_req_sampling` (see the cold-admit note). The head
+                        // KV reset is only needed
                         // when the head KV was lost (swap-restore) or holds
                         // another session's rows: a session resident on this slot
                         // since its last turn keeps a head KV that matches its
@@ -6331,8 +6456,6 @@ fn admit(
                         let mtp_ok = rig.model.mtp_head.is_some()
                             && rig.model.mtp_k > 0
                             && req.visual_data.is_none()
-                            && !request_penalized(&req)
-                            && !request_sampled(&req)
                             && req.json_schema.is_none()
                             && mtp_head_kv_valid
                             && rig.model.mtp_states[slot.0].is_some();
@@ -6385,6 +6508,11 @@ fn admit(
                             SpecKind::Dflash
                         } else {
                             SpecKind::None
+                        };
+                        rig.model.mtp_req_sampling[slot.0] = if work[slot.0].spec == SpecKind::Mtp {
+                            Some(MtpReqSampling::new(&req, &extended))
+                        } else {
+                            None
                         };
                         if !work[slot.0].spec.active() {
                             if let Some(state) = rig.model.mtp_states[slot.0].as_mut() {
@@ -7042,15 +7170,16 @@ fn admit(
         work[slot.0].vl_prefill = None;
         work[slot.0].pos3_delta = 0; // fresh session: no image-turn offset
                                      // Activate MTP for text-only requests when the head is loaded.
-                                     // Penalized requests stay on AR: the verify accept is a bare greedy
-                                     // argmax and cannot reproduce penalize-then-argmax; sampled requests
-                                     // (temperature > 0) stay on AR for the same reason — the verify path
-                                     // cannot reproduce a sampled pick. Grammar-constrained requests also
-                                     // stay on AR: constrained MTP requires joint verification (applying
-                                     // grammar masks before acceptance, not only after a bad token has
-                                     // advanced state), which does not yet exist (spec §6 X2: "MTP +
-                                     // grammar → AR selected before execution until exact joint
-                                     // acceptance is implemented and validated").
+                                     // Sampling and token penalties ride the MTP path: the
+                                     // request's `MtpSamplingConfig` (parked in
+                                     // `mtp_req_sampling`) makes verify use residual acceptance
+                                     // against the penalized target nucleus, reproducing the AR
+                                     // distribution. Grammar-constrained requests stay on AR:
+                                     // constrained MTP requires joint verification (applying
+                                     // grammar masks before acceptance, not only after a bad token
+                                     // has advanced state), which does not yet exist (spec §6 X2:
+                                     // "MTP + grammar → AR selected before execution until exact
+                                     // joint acceptance is implemented and validated").
                                      // Radix-reuse retires drafting: the head's private KV is zero for
                                      // the reused span (shared pages carry only trunk KV), and drafting
                                      // over a zeroed prefix collapses acceptance to ~1 — pure overhead
@@ -7058,8 +7187,6 @@ fn admit(
                                      // identical output without the overhead.
         let mtp_ok = rig.model.mtp_head.is_some()
             && rig.model.mtp_k > 0
-            && !penalized
-            && !request_sampled(&req)
             && !grammar_constrained
             && reused == 0;
         // DFlash2 admit on the new-session arm: same request-shape gates as
@@ -7097,6 +7224,25 @@ fn admit(
         } else {
             SpecKind::None
         };
+        rig.model.mtp_req_sampling[slot.0] = if work[slot.0].spec == SpecKind::Mtp {
+            Some(MtpReqSampling::new(&req, &req.prompt_tokens))
+        } else {
+            None
+        };
+        if rig.gpu.slot_trace() {
+            eprintln!(
+                "[slot-trace] admit(cold) slot {} spec={:?} temp={} top_k={} top_p={} \
+                 penalized={} reused={} prompt={}",
+                slot.0,
+                work[slot.0].spec,
+                req.temperature,
+                req.top_k,
+                req.top_p,
+                penalized,
+                reused,
+                req.prompt_tokens.len()
+            );
+        }
     }
     rig.sample_params[slot.0] = sample_params;
     // A prefix-cache hit's shared pages are already radix-owned up to

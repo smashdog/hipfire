@@ -31,6 +31,12 @@ sha2.workspace = true
 [dev-dependencies]
 redline-rocr = { path = "../redline-rocr" }
 half.workspace = true
+# G2 parity gate only (test_escha_decode_gpu_vs_cpu): escha_ref::reconstruct is
+# the CPU oracle the GPU tile decode is asserted bit-exact against. Note
+# hipfire-quantize already carries a dev-dependency back on rdna-compute (for
+# its own GL-codebook parity test); Cargo permits a dev-dependency cycle since
+# dev-deps are excluded from the normal build graph.
+hipfire-quantize = { path = "../hipfire-quantize" }
 peacemaker-npu = { path = "../peacemaker-npu" }
 peacemaker-isa = { path = "../peacemaker-isa", features = ["toolchain"] }
 peacemaker-ir = { path = "../peacemaker-ir" }
