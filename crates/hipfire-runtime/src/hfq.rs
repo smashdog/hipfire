@@ -1499,9 +1499,13 @@ impl HfqFile {
     /// for base models). The runtime renders this when present so prompt
     /// framing matches the model's training-time expectation; absent or
     /// failing renders fall back to the hand-rolled `prompt_frame` path.
+    ///
+    /// GGUF-converted artifacts carry no `tokenizer_config`; their converter
+    /// copies the GGUF KV metadata verbatim, so the same template lives at
+    /// `gguf_meta["tokenizer.chat_template"]` and is used as the fallback.
     pub fn chat_template(&self) -> Option<String> {
         let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
-        let ct = meta.get("tokenizer_config")?.get("chat_template")?;
+        let ct = Self::chat_template_value(&meta)?;
         // Plain-string form: return it directly.
         if let Some(s) = ct.as_str() {
             return Some(s.to_string());
@@ -1511,13 +1515,21 @@ impl HfqFile {
         self.chat_template_named("default")
     }
 
+    /// Template JSON for this artifact: HF-native metadata first, then the
+    /// GGUF KV spelling for converter output without a `tokenizer_config`.
+    fn chat_template_value(meta: &serde_json::Value) -> Option<&serde_json::Value> {
+        meta.get("tokenizer_config")
+            .and_then(|tc| tc.get("chat_template"))
+            .or_else(|| meta.get("gguf_meta")?.get("tokenizer.chat_template"))
+    }
+
     /// Select a named chat template. Cohere-style models ship `chat_template`
     /// as a LIST of {name, template}; older models ship a plain string. Returns
     /// the requested name, else the "default" entry, else the first; for a plain
     /// string, returns it directly.
     pub fn chat_template_named(&self, name: &str) -> Option<String> {
         let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
-        let ct = meta.get("tokenizer_config")?.get("chat_template")?;
+        let ct = Self::chat_template_value(&meta)?;
         if let Some(s) = ct.as_str() {
             return Some(s.to_string());
         }
@@ -5594,5 +5606,54 @@ mod mq3v2_symmetric_tests {
             !f.mq3v2_symmetric(),
             "asymmetric ladder base must report marker=false"
         );
+    }
+}
+
+#[cfg(test)]
+mod chat_template_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn tokenizer_config_template_wins_over_gguf_meta() {
+        let meta = serde_json::json!({
+            "tokenizer_config": {"chat_template": "hf-native"},
+            "gguf_meta": {"tokenizer.chat_template": "gguf-copy"},
+        });
+        assert_eq!(
+            HfqFile::chat_template_value(&meta).and_then(|v| v.as_str()),
+            Some("hf-native")
+        );
+    }
+
+    #[test]
+    fn gguf_meta_template_used_without_tokenizer_config() {
+        let meta = serde_json::json!({
+            "gguf_meta": {"tokenizer.chat_template": "gguf-copy"},
+        });
+        assert_eq!(
+            HfqFile::chat_template_value(&meta).and_then(|v| v.as_str()),
+            Some("gguf-copy")
+        );
+    }
+
+    #[test]
+    fn gguf_meta_template_used_when_tokenizer_config_lacks_key() {
+        let meta = serde_json::json!({
+            "tokenizer_config": {"tokenizer_class": "Qwen2Tokenizer"},
+            "gguf_meta": {"tokenizer.chat_template": "gguf-copy"},
+        });
+        assert_eq!(
+            HfqFile::chat_template_value(&meta).and_then(|v| v.as_str()),
+            Some("gguf-copy")
+        );
+    }
+
+    #[test]
+    fn no_template_anywhere_is_none() {
+        let meta = serde_json::json!({
+            "tokenizer_config": {"tokenizer_class": "Qwen2Tokenizer"},
+            "gguf_meta": {"tokenizer.ggml.model": "gpt2"},
+        });
+        assert!(HfqFile::chat_template_value(&meta).is_none());
     }
 }

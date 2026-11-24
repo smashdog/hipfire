@@ -1638,7 +1638,10 @@ impl SlotBackend {
         } else {
             ThinkMode::NonThink
         };
-        let mut emitter = Qwen35Emit::from_ctx(SpecEmitCtx {
+        // Serving uses the PolyStrata-style fallback: a malformed tool span
+        // becomes ordinary assistant text instead of a terminal
+        // `malformed_protocol` error that kills the request.
+        let mut emitter = Qwen35Emit::from_ctx_recover(SpecEmitCtx {
             tokenizer: &self.tokenizer,
             eos: self.tokenizer.eos_id,
             im_end: self.tokenizer.special_token_id("<|im_end|>"),
