@@ -93,6 +93,15 @@ pub const KV_BLOCK_TOKENS: usize = 128;
 /// (only this much stays resident), which is the point of the integration.
 const DEFAULT_POOL_BLOCKS_PER_SLOT: usize = 64;
 
+/// Long-context default working set: 90 pages (11.5K tokens). At or above
+/// 49,152 tokens the historical 8K set cannot hold enough of the selected
+/// regions for a 48K+ recall; 90 pages is the smallest tested size that keeps
+/// both Layerwise and Legacy recall correct at a 62K prompt.
+const DEFAULT_LONG_POOL_BLOCKS_PER_SLOT: usize = 90;
+
+/// Context size where the long-context working set starts (384 × 128 tokens).
+const DEFAULT_LONG_POOL_CONTEXT_BLOCKS: usize = 384;
+
 /// Blocks written between selection rounds. Larger = fewer selection passes
 /// (cheaper) but more transient residency; the pool headroom is sized for it.
 const DEFAULT_SELECT_INTERVAL: usize = 4;
@@ -113,7 +122,142 @@ const DEFAULT_RESIDENT_FLOOR: usize = 32;
 const MTP_HISTORY_UG_MIN_BLOCKS: usize = 16;
 
 /// Host payload capacity for the packed Q8 pages (RAM tier).
-const DEFAULT_HOST_BYTES: u64 = 16 << 30;
+pub(crate) const DEFAULT_HOST_BYTES: u64 = 16 << 30;
+
+/// Full-context host payload requirement for the configured slot count.
+///
+/// The host tier retains every token a slot can feed once the GPU residency
+/// budget is exceeded: Legacy spills the over-budget pages, Layerwise writes
+/// the whole fed history through. `n_record_layers` includes the Layerwise MTP
+/// head aux ordinal. A 20% envelope covers allocator/metadata slack and the
+/// final partial page; 256 MiB covers fixed bookkeeping. Parked histories and
+/// prefix checkpoints are additional charges, so this is a floor, not a cap.
+pub(crate) fn required_host_bytes(
+    n_slots: usize,
+    cap_tokens: usize,
+    n_record_layers: usize,
+    per_pos_bytes: usize,
+    per_pos_v_bytes: usize,
+) -> u64 {
+    let record_bytes = (per_pos_bytes as u64).saturating_add(per_pos_v_bytes as u64);
+    let per_slot = (cap_tokens as u64)
+        .saturating_mul(n_record_layers as u64)
+        .saturating_mul(record_bytes);
+    let raw = (n_slots as u64).saturating_mul(per_slot);
+    raw.saturating_add(raw / 5).saturating_add(256 << 20)
+}
+
+/// Keep an explicit host limit strict, but lift the built-in default to the
+/// full-context floor. An operator who set HOST_BYTES too low gets a startup
+/// error instead of a mid-serve capacity fault; an unset value simply scales
+/// with the geometry the operator already admitted.
+pub(crate) fn resolve_host_bytes(
+    current: u64,
+    required: u64,
+    implicit: bool,
+) -> Result<u64, String> {
+    if current >= required {
+        return Ok(current);
+    }
+    if implicit {
+        return Ok(required);
+    }
+    Err(format!(
+        "kvmem: HIPFIRE_KVMEM_HOST_BYTES={current} is below the full-context host \
+         requirement {required} for this geometry; raise it or lower slots/context"
+    ))
+}
+
+impl KvMemCtl {
+    pub(crate) fn host_capacity_bytes(&self) -> u64 {
+        self.host_capacity
+    }
+
+    pub(crate) fn host_charged_bytes(&self) -> u64 {
+        self.storage.charged_bytes()
+    }
+
+    pub(crate) fn host_record_bytes(&self) -> u64 {
+        self.host_record_bytes
+    }
+
+    pub(crate) fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Admission-time headroom check: `additional_tokens` is the new turn's
+    /// prompt suffix plus its generation budget. Rejecting here is a retryable
+    /// capacity signal; letting the feed hit the same limit is an engine-wide
+    /// poison. The estimate is deliberately conservative (Legacy also counts
+    /// tokens that may stay resident), so it can refuse a turn that would have
+    /// fit, never admit one that cannot.
+    pub(crate) fn ensure_host_headroom(&self, additional_tokens: usize) -> Result<(), String> {
+        if !self.host_headroom_enforced {
+            return Ok(());
+        }
+        let need = (additional_tokens as u64).saturating_mul(self.host_record_bytes);
+        let charged = self.host_charged_bytes();
+        if charged.saturating_add(need) <= self.host_capacity {
+            return Ok(());
+        }
+        Err(format!(
+            "kvmem host capacity: charged={charged} + need={need} exceeds capacity={} \
+             (additional_tokens={additional_tokens}, record_bytes={})",
+            self.host_capacity, self.host_record_bytes
+        ))
+    }
+}
+
+#[cfg(test)]
+mod host_bytes_tests {
+    use super::*;
+
+    // 27B q8: 16 FA layers x (1024 B K + 1024 B V) = 32 KiB/token.
+    const PER_POS: usize = 1024;
+    const LAYERS: usize = 16;
+    const CTX: usize = 262_144;
+
+    #[test]
+    fn one_slot_262k_fits_the_default_16gib() {
+        let required = required_host_bytes(1, CTX, LAYERS, PER_POS, PER_POS);
+        assert!(
+            required < DEFAULT_HOST_BYTES,
+            "{required} !< {DEFAULT_HOST_BYTES}"
+        );
+    }
+
+    #[test]
+    fn two_slots_262k_exceed_the_default_16gib() {
+        let required = required_host_bytes(2, CTX, LAYERS, PER_POS, PER_POS);
+        assert!(
+            required > DEFAULT_HOST_BYTES,
+            "{required} !> {DEFAULT_HOST_BYTES}"
+        );
+    }
+
+    #[test]
+    fn mtp_head_ordinal_adds_one_record_layer() {
+        let trunk = required_host_bytes(1, CTX, LAYERS, PER_POS, PER_POS);
+        let head = required_host_bytes(1, CTX, LAYERS + 1, PER_POS, PER_POS);
+        assert!(head > trunk);
+    }
+
+    #[test]
+    fn implicit_default_raises_and_explicit_short_limit_fails() {
+        let required = required_host_bytes(2, CTX, LAYERS, PER_POS, PER_POS);
+        assert_eq!(
+            resolve_host_bytes(DEFAULT_HOST_BYTES, required, true),
+            Ok(required)
+        );
+        let err = resolve_host_bytes(DEFAULT_HOST_BYTES, required, false).unwrap_err();
+        assert!(err.contains("HIPFIRE_KVMEM_HOST_BYTES"), "{err}");
+        assert_eq!(resolve_host_bytes(required, required, false), Ok(required));
+        assert_eq!(
+            resolve_host_bytes(required + 1, required, false),
+            Ok(required + 1)
+        );
+    }
+}
 
 /// Disk-tier capacity when `HIPFIRE_KVMEM_SPILL_DIR` is set.
 const DEFAULT_SPILL_BYTES: u64 = 64 << 30;
@@ -470,8 +614,9 @@ pub struct KvMemPlan {
 ///
 /// Defaults preserve upstream behaviour for contexts that fit the historical
 /// 8K-token working set: the pool is built exactly as `legacy_equivalent`, the
-/// budget equals the slot cap, and no page is ever spilled. A `multi_slot_ctx`
-/// beyond that keeps the 8K working set and lets KVMem hold the rest.
+/// budget equals the slot cap, and no page is ever spilled. Past the long-
+/// context threshold the default grows to 90 pages/slot so the selected
+/// regions can carry a 48K–62K recall; KVMem still holds the rest.
 pub fn resolve_plan(
     n_slots: usize,
     cap_tokens: usize,
@@ -496,9 +641,16 @@ pub fn resolve_plan(
     let explicit_pages = options.plan_pages.map(|p| p.max(n_slots));
     let pages_per_slot = match explicit_pages {
         Some(total) => (total / n_slots).max(1),
-        None => cap_blocks
-            .min(DEFAULT_POOL_BLOCKS_PER_SLOT)
-            .max(headroom.saturating_add(DEFAULT_RESIDENT_FLOOR)),
+        None => {
+            let default_blocks = if cap_blocks >= DEFAULT_LONG_POOL_CONTEXT_BLOCKS {
+                DEFAULT_LONG_POOL_BLOCKS_PER_SLOT
+            } else {
+                DEFAULT_POOL_BLOCKS_PER_SLOT
+            };
+            cap_blocks
+                .min(default_blocks)
+                .max(headroom.saturating_add(DEFAULT_RESIDENT_FLOOR))
+        }
     };
     let pages_total = explicit_pages.unwrap_or(pages_per_slot * n_slots);
     // A slot whose cap fits the pool never spills (upstream parity). Past
@@ -953,6 +1105,15 @@ pub struct KvMemCtl {
     slots: Vec<SlotState>,
     #[allow(dead_code)]
     storage: Storage,
+    /// Host tier capacity admitted at construction (`Storage` has no capacity
+    /// accessor) and the packed record bytes one token costs. Used by the
+    /// admission headroom check so an over-committed turn is a typed Overload
+    /// before any row is fed, not a mid-serve capacity fault.
+    host_capacity: u64,
+    host_record_bytes: u64,
+    /// Admission headroom is only meaningful for the RAM-only tier: a
+    /// configured spill file demotes an over-RAM charge instead of failing.
+    host_headroom_enforced: bool,
     raw_cfg: RawStoreConfig,
     kv_cfg: KvStoreConfig,
     /// Admitted public Legacy policy. None is the unchanged Layerwise/internal
@@ -968,6 +1129,9 @@ pub struct KvMemCtl {
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    /// Tap K row width in f32 elements (`n_kv_heads * head_dim`); the batched
+    /// feed D2H sizes its pinned slab from this.
+    k_width: usize,
     /// P4.4: KV tier (per-tier layerwise format identity + admission).
     kv_mode: KvMode,
     q_width: usize,
@@ -982,8 +1146,6 @@ pub struct KvMemCtl {
     /// sealed-archive write. Empty under Legacy (no allocation, byte-neutral).
     wt_k: Vec<u8>,
     wt_v: Vec<u8>,
-    /// Tap readback staging (`read_k_rows_at`).
-    staging: Vec<f32>,
     /// Retrieval query staging: layer-major raw Q rows.
     sums: Vec<f32>,
     q_row: Vec<f32>,

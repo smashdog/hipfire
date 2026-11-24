@@ -5,6 +5,13 @@
 use super::transfer::{copy_legacy_page_to_device, copy_legacy_page_to_host};
 use super::*;
 
+/// Query-sum/score diagnostics are per-query and high-volume; keep them opt-in
+/// (`HIPFIRE_KVMEM_QUERY_DIAG=1`) so normal serve logs stay selection-focused.
+fn query_diag_enabled() -> bool {
+    std::env::var_os("HIPFIRE_KVMEM_QUERY_DIAG")
+        .is_some_and(|value| matches!(value.to_string_lossy().trim(), "1" | "on" | "true" | "yes"))
+}
+
 impl KvMemCtl {
     pub fn legacy_config(&self) -> Option<&hipfire_config::kvmem::ResolvedConfig> {
         self.legacy.as_ref()
@@ -92,10 +99,12 @@ impl KvMemCtl {
                     .map(|v| f64::from(*v) * f64::from(*v))
                     .sum::<f64>()
                     .sqrt();
-                eprintln!(
-                    "[kvmem-legacy] QuerySums rows={rows} widths={} norm={norm:.4}",
-                    sums.len()
-                );
+                if query_diag_enabled() {
+                    eprintln!(
+                        "[kvmem-legacy] QuerySums rows={rows} widths={} norm={norm:.4}",
+                        sums.len()
+                    );
+                }
                 mean_key_retrieval_scores(
                     &source.raw,
                     blocks,
@@ -128,7 +137,7 @@ impl KvMemCtl {
             ),
         }
         .map_err(|e| format!("kvmem proven Query scoring: {e}"))?;
-        {
+        if query_diag_enabled() {
             let mut ranked: Vec<(usize, f64)> = scores.iter().copied().enumerate().collect();
             ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.0.cmp(&a.0)));
             let top: Vec<String> = ranked
@@ -176,8 +185,18 @@ impl KvMemCtl {
         selector
             .begin_retrieval_round()
             .map_err(|e| e.to_string())?;
+        // Keep a boundary-spanning answer visible: page scoring alone can cut
+        // between the page that holds the evidence and the page that holds its
+        // tail. Bleed each page's score to its immediate neighbours at 0.9 for
+        // the selector only, so the scoring page keeps priority and a boosted
+        // neighbour cannot tie-displace it; `scores` is still the original
+        // signal for QueryCommit feedback.
+        let mut dilated = scores.clone();
+        for i in 1..scores.len().saturating_sub(1) {
+            dilated[i] = scores[i].max(0.9 * scores[i - 1].max(scores[i + 1]));
+        }
         selector
-            .set_retrieval_scores(&scores)
+            .set_retrieval_scores(&dilated)
             .map_err(|e| e.to_string())?;
         let selected = selector
             .pick_topk_blocks(&required)
@@ -558,5 +577,185 @@ impl KvMemCtl {
             source.frontier
         );
         Ok(restored_bytes)
+    }
+
+    /// Copy the still-resident pages of `[from, frontier)` from the arenas into
+    /// the slot's host archive before a canonical prefix freeze. Legacy only
+    /// writes a page to the host store when Pressure spills it, so a freeze
+    /// taken while the prefix is resident would see an incomplete packed grid
+    /// and refuse to emit a persistent pack. The copy is additive (the GPU
+    /// page stays live); a later spill overwrites the same host block with the
+    /// same bytes. Layerwise already write-throughs every fed row.
+    pub fn archive_resident_prefix(
+        &mut self,
+        gpu: &Gpu,
+        pool: &SlotPool,
+        k_arenas: &[GpuTensor],
+        v_arenas: &[GpuTensor],
+        slot: usize,
+        frontier: u32,
+        from: u32,
+    ) -> Result<(), String> {
+        if self.strategy.is_layerwise() {
+            return Ok(());
+        }
+        let fed = self
+            .slots
+            .get(slot)
+            .ok_or_else(|| format!("kvmem: archive prefix slot {slot} out of range"))?
+            .fed;
+        if frontier == 0
+            || frontier % KV_BLOCK_TOKENS as u32 != 0
+            || frontier > fed
+            || from > frontier
+            || from % KV_BLOCK_TOKENS as u32 != 0
+        {
+            return Err(format!(
+                "kvmem: archive prefix range [{from},{frontier}) invalid for fed {fed}"
+            ));
+        }
+        let bt = pool
+            .block_table(SlotId(slot))
+            .ok_or_else(|| "kvmem: archive prefix slot has no block table".to_string())?;
+        if bt.live_tokens() < frontier as usize {
+            return Err(format!(
+                "kvmem: archive prefix block table holds {} tokens, need {frontier}",
+                bt.live_tokens()
+            ));
+        }
+        let first = (from / KV_BLOCK_TOKENS as u32) as usize;
+        let end_page = (frontier / KV_BLOCK_TOKENS as u32) as usize;
+        let mut pages = Vec::with_capacity(end_page.saturating_sub(first));
+        for lp in first..end_page {
+            let Some(phys) = bt.physical(lp) else {
+                // Already spilled: the host archive owns the packed rows.
+                continue;
+            };
+            let rows = (frontier as usize - lp * KV_BLOCK_TOKENS).min(KV_BLOCK_TOKENS);
+            pages.push((lp, phys, rows));
+        }
+        if !pages.is_empty() {
+            let t = std::time::Instant::now();
+            self.archive_legacy_pages_to_host(gpu, slot, &pages, k_arenas, v_arenas)?;
+            eprintln!(
+                "[kvmem-legacy] archived resident prefix slot={slot} from={from} \
+                 frontier={frontier} pages={} archive_ms={:.1}",
+                pages.len(),
+                t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Ok(())
+    }
+
+    /// Materialize a page-less imported prefix into a Legacy-sized resident
+    /// working set. A restart cold pack has no pinned GPU pages; without a
+    /// restore the suffix prefill would attend over an entirely spilled block
+    /// table and lose the imported context, and the engine has no Legacy cold
+    /// restore arm. Restore the mandatory sink/recent pages plus the
+    /// recency-ranked remainder up to the resident budget. The unselected
+    /// pages stay spilled (Legacy attention masks them) and remain available
+    /// to Query/flush restore; unlike the Layerwise path these pages are NOT
+    /// pinned, because Legacy Pressure must still be able to evict them.
+    ///
+    /// Returns the number of restored pages. The caller leaves the checkpoint
+    /// page list empty so a later reuse re-materializes from the sealed pack.
+    pub fn stage_legacy_page_less_import(
+        &mut self,
+        gpu: &Gpu,
+        pool: &mut SlotPool,
+        k_arenas: &[GpuTensor],
+        v_arenas: &[GpuTensor],
+        slot: usize,
+        frontier: u32,
+    ) -> Result<usize, String> {
+        if self.strategy.is_layerwise() {
+            return Err("kvmem: Legacy cold import requested from Layerwise executor".into());
+        }
+        if self.legacy.is_none() {
+            return Err("kvmem: Legacy cold import without the admitted Legacy contract".into());
+        }
+        if slot >= self.slots.len() {
+            return Err("kvmem: Legacy cold import slot out of range".into());
+        }
+        if frontier == 0 || frontier % KV_BLOCK_TOKENS as u32 != 0 {
+            return Err(format!(
+                "kvmem: Legacy cold import frontier {frontier} is not page aligned"
+            ));
+        }
+        let blocks = (frontier / KV_BLOCK_TOKENS as u32) as usize;
+        let candidates: Vec<u32> = (0..blocks as u32).collect();
+        let required = hipfire_kvmem::query_prefix_required(
+            frontier as u64,
+            KV_BLOCK_TOKENS as u32,
+            self.kv_cfg.sink_blocks,
+            self.kv_cfg.recent_blocks,
+            &[],
+        )
+        .map_err(|e| format!("kvmem Legacy cold import mandatory: {e}"))?;
+        let selected = if blocks <= self.budget_blocks as usize {
+            // The whole prefix fits the resident window. Restoring it all
+            // gives the suffix prefill the same view a just-finished first
+            // pass would have.
+            candidates
+        } else {
+            // Legacy keeps its resident window by recency (pressure scores are
+            // zero on this route). Restore the same page set the first
+            // Pressure step would have kept.
+            let scores = vec![0.0f64; blocks];
+            hipfire_kvmem::pressure_selection(
+                &candidates,
+                &scores,
+                &required,
+                self.budget_blocks as u32,
+            )
+            .map_err(|e| format!("kvmem Legacy cold import selection: {e}"))?
+        };
+        if selected.is_empty() {
+            return Ok(0);
+        }
+
+        // Start from an all-spilled logical table, then bind only the selected
+        // working set. The suffix prefill appends pages beyond `frontier`
+        // without allocating the masked middle.
+        pool.reset(SlotId(slot));
+        pool.install_spilled_prefix(SlotId(slot), frontier as usize)
+            .map_err(|e| format!("kvmem Legacy cold import table: {e}"))?;
+        let mut batch: Vec<(usize, usize, u32)> = Vec::with_capacity(selected.len());
+        for &lp in &selected {
+            let phys = pool
+                .page_pool_mut()
+                .ok_or_else(|| "kvmem: Legacy cold import requires a paged pool".to_string())?
+                .alloc_page_unbound()
+                .map_err(|e| format!("kvmem Legacy cold import alloc: {e}"))?;
+            pool.bind_restored_page(SlotId(slot), lp as usize, phys)
+                .map_err(|e| format!("kvmem Legacy cold import bind: {e}"))?;
+            batch.push((slot, lp as usize, phys));
+        }
+        let mut t_restore = std::time::Duration::ZERO;
+        let mut n_restored = 0usize;
+        if let Err(e) = self.flush_restore_batch(
+            gpu,
+            &batch,
+            k_arenas,
+            v_arenas,
+            self.diagnostics.time,
+            &mut t_restore,
+            &mut n_restored,
+        ) {
+            // The caller resets the host slot; release the partial GPU view
+            // too so a retry/reuse cannot observe half-restored pages.
+            pool.reset(SlotId(slot));
+            return Err(e);
+        }
+        self.restore_pages_total += batch.len() as u64;
+        eprintln!(
+            "[kvmem-legacy] cold prefix import slot={slot} frontier={frontier} \
+             blocks={blocks} resident={} budget={} spilled={} restore_ms={:.1}",
+            batch.len(),
+            self.budget_blocks,
+            blocks.saturating_sub(batch.len()),
+            t_restore.as_secs_f64() * 1e3,
+        );
+        Ok(batch.len())
     }
 }

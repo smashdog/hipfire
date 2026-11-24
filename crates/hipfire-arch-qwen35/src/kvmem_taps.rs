@@ -458,6 +458,48 @@ impl KvMemTaps {
         )
     }
 
+    /// Batched sibling of [`Self::read_k_rows_at`]: issue one async D2H per
+    /// FullAttention layer for `n_rows` rows at `row_start` into a caller-owned
+    /// pinned buffer, then ONE stream wait. `out` must hold
+    /// `n_fa_layers * n_rows * k_width * 4` bytes; layer `il` lands at
+    /// `il * n_rows * k_width * 4`. Replaces 16 blocking round-trips per feed.
+    pub fn read_k_rows_all_layers_into(
+        &self,
+        gpu: &Gpu,
+        row_start: usize,
+        n_rows: usize,
+        out: &mut [u8],
+        stream: Option<&hip_bridge::Stream>,
+    ) -> HipResult<()> {
+        assert!(
+            row_start.saturating_add(n_rows) <= self.max_rows,
+            "KvMemTaps::read_k_rows_all_layers_into: rows \
+             {row_start}..{}/{n_rows}..{} out of range",
+            row_start.saturating_add(n_rows),
+            self.max_rows
+        );
+        let row_bytes = n_rows * self.k_width * std::mem::size_of::<f32>();
+        let need = self.n_fa_layers * row_bytes;
+        assert!(
+            out.len() >= need,
+            "KvMemTaps::read_k_rows_all_layers_into: out len {} < need {need}",
+            out.len()
+        );
+        for layer in 0..self.n_fa_layers {
+            let elem_offset = (layer * self.max_rows + row_start) * self.k_width;
+            gpu.hip.memcpy_dtoh_async_at(
+                &mut out[layer * row_bytes..(layer + 1) * row_bytes],
+                &self.k_tap.buf,
+                elem_offset * std::mem::size_of::<f32>(),
+                stream,
+            )?;
+        }
+        match stream {
+            Some(s) => gpu.hip.stream_synchronize(s),
+            None => gpu.hip.stream_synchronize_default(),
+        }
+    }
+
     /// Read back one slot's tapped Q row of FullAttention layer `layer`
     /// (D2H, synchronous), `q_width` floats.
     pub fn read_q_slot(
@@ -657,5 +699,44 @@ mod tests {
         gpu.free_tensor(slots).unwrap();
         let stream = gpu.active_stream.take().unwrap();
         gpu.hip.stream_destroy(stream).unwrap();
+    }
+
+    /// K3: the batched all-layer read must be byte-identical to one
+    /// synchronous read per FullAttention layer for the same rows.
+    #[test]
+    #[ignore = "needs a GPU and a HIP toolchain"]
+    fn read_k_rows_all_layers_matches_per_layer_sync() {
+        let mut gpu = Gpu::init().expect("gpu init");
+        let taps = KvMemTaps::new(&mut gpu, 2, 1, 3, 2, 2, 4).expect("taps");
+        let total = taps.n_fa_layers * taps.max_rows * taps.k_width;
+        let vals: Vec<f32> = (0..total).map(|i| (i as f32) * 0.25 - 7.0).collect();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                vals.as_ptr() as *const u8,
+                total * std::mem::size_of::<f32>(),
+            )
+        };
+        gpu.hip
+            .memcpy_htod(&taps.k_tap.buf, bytes)
+            .expect("upload K tap");
+        let (row_start, n_rows) = (1usize, 2usize);
+        let mut expected = Vec::new();
+        for layer in 0..taps.n_fa_layers {
+            let mut rows = Vec::new();
+            taps.read_k_rows_at(&gpu, layer, row_start, n_rows, &mut rows)
+                .expect("per-layer read");
+            expected.extend_from_slice(&rows);
+        }
+        let need = taps.n_fa_layers * n_rows * taps.k_width * std::mem::size_of::<f32>();
+        let mut slab = gpu.hip.transfer_buffer(need).expect("pinned slab");
+        taps.read_k_rows_all_layers_into(&gpu, row_start, n_rows, slab.as_bytes_mut(), None)
+            .expect("batched read");
+        let got: Vec<f32> = slab.as_bytes_mut()[..need]
+            .chunks_exact(4)
+            .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(got, expected, "batched K read differs from per-layer sync");
+        gpu.free_tensor(taps.q_tap).expect("free q tap");
+        gpu.free_tensor(taps.k_tap).expect("free k tap");
     }
 }

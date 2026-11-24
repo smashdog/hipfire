@@ -88,6 +88,7 @@ fn main() {
         prompt_tokens,
         convo: Vec::new(),
         continuation: Continuation::Cold,
+        force_cold: false,
         max_tokens: max_tok.unwrap_or(96),
         temperature: 0.0,
         top_p: 1.0,

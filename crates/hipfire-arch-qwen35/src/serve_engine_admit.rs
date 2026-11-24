@@ -100,12 +100,16 @@ pub(super) fn admit(
         // the session that emitted the calls being answered. Either way the
         // suffix is appended to the session's exact stored tokens, so the KV
         // and DeltaNet state extend strictly.
-        let matched = match &req.continuation {
-            Continuation::Cold => None,
-            Continuation::UserTurn(_) => rig.sessions.find_continuation(&req.convo, &busy),
-            Continuation::ToolResults { session, .. } => {
-                rig.sessions
-                    .confirm_reentry(SessionId(*session), &req.convo, &busy)
+        let matched = if req.force_cold {
+            None
+        } else {
+            match &req.continuation {
+                Continuation::Cold => None,
+                Continuation::UserTurn(_) => rig.sessions.find_continuation(&req.convo, &busy),
+                Continuation::ToolResults { session, .. } => {
+                    rig.sessions
+                        .confirm_reentry(SessionId(*session), &req.convo, &busy)
+                }
             }
         };
         let matched = if kvmem_legacy_enabled(rig) {
@@ -263,6 +267,21 @@ pub(super) fn admit(
                         &req.reply,
                         Event::Rejected {
                             class: RejectClass::Validation,
+                            reason,
+                        },
+                    );
+                    return;
+                }
+                if let Err(reason) = kvmem_hooks::ensure_continuation_host_headroom(
+                    rig,
+                    slot,
+                    extended.len(),
+                    req.max_tokens,
+                ) {
+                    let _ = send_event(
+                        &req.reply,
+                        Event::Rejected {
+                            class: RejectClass::Overload,
                             reason,
                         },
                     );
@@ -726,6 +745,17 @@ pub(super) fn admit(
         .len()
         .saturating_add(req.max_tokens.max(1))
         .min(rig.cap_tokens);
+    if let Err(reason) = kvmem_hooks::ensure_host_headroom(rig, grant_tokens) {
+        let _ = send_event(
+            &req.reply,
+            Event::Rejected {
+                class: RejectClass::Overload,
+                reason,
+            },
+        );
+        lock_stats(stats).note_rejected();
+        return;
+    }
     let mut opened = admit_cold(rig, &mut cold_reuse, grant_tokens);
     // KVMem: never *evict* a resident session to make room. Its pages are the
     // residency decision KVMem already made, and a swap snapshot cannot
@@ -919,7 +949,7 @@ pub(super) fn admit(
     // terminates (released by release_pin_ticket on every exit path) or
     // released immediately below when the hit does not convert.
     let mut pin_ticket = PinTicket::none();
-    if should_lookup_prefix(rig.prefix_cache, req.visual_data.is_some()) {
+    if should_lookup_prefix(rig.prefix_cache, req.visual_data.is_some()) && !req.force_cold {
         rig.lookup_count += 1;
         let domain = rig.cache_domain.as_ref().unwrap();
         let (lookup_result, hit_handles, ticket) = {
@@ -1452,7 +1482,11 @@ pub(super) fn admit(
         // draft-less image retires speculation for this request instead of
         // inheriting another request's draft rows.
         #[cfg(feature = "kvmem")]
-        if kvmem_legacy_enabled(rig) && reused == 0 && req.prompt_tokens.len() > 1 {
+        if kvmem_legacy_enabled(rig)
+            && reused == 0
+            && !req.force_cold
+            && req.prompt_tokens.len() > 1
+        {
             let prompt = &req.prompt_tokens;
             // A restored frontier must leave at least the last prompt token to
             // prefill: that step produces the logits the first output token is

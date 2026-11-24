@@ -320,6 +320,11 @@ impl KvMemCtl {
                 options.spill_bytes.unwrap_or(DEFAULT_SPILL_BYTES).max(1),
             ),
         };
+        // With a disk tier, a RAM charge that exceeds `host_bytes` demotes to
+        // the spill file instead of failing. The admission headroom check only
+        // guards the hard-failure case; the tiered path keeps its historical
+        // "accept and spill" contract.
+        let host_headroom_enforced = spill_dir.is_none();
         let storage = match spill_dir {
             Some(dir) => {
                 std::fs::create_dir_all(&dir)
@@ -427,6 +432,11 @@ impl KvMemCtl {
         Ok(Self {
             slots,
             storage,
+            host_capacity: host_bytes,
+            host_record_bytes: (n_record_layers as u64).saturating_mul(
+                (geom.per_pos_bytes as u64).saturating_add(geom.per_pos_v_bytes as u64),
+            ),
+            host_headroom_enforced,
             raw_cfg,
             kv_cfg,
             legacy,
@@ -437,6 +447,7 @@ impl KvMemCtl {
             n_heads: geom.n_heads,
             n_kv_heads: geom.n_kv_heads,
             head_dim: geom.head_dim,
+            k_width,
             kv_mode: geom.kv_mode,
             q_width,
             k_page_bytes: KV_BLOCK_TOKENS * geom.per_pos_bytes,
@@ -459,7 +470,6 @@ impl KvMemCtl {
                     0
                 }
             ],
-            staging: vec![0f32; geom.max_rows * k_width],
             sums: vec![0f32; n_record_layers * q_width],
             q_row: vec![0f32; q_width],
             // Trunk ordinals carry one tapped Q row each; the appended head aux

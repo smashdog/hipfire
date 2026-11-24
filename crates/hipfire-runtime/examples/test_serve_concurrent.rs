@@ -105,6 +105,7 @@ fn main() {
                 // no continuation tokens.
                 convo: Vec::new(),
                 continuation: Continuation::Cold,
+                force_cold: false,
                 max_tokens: MAX_TOKENS,
                 temperature: 0.0,
                 top_p: 1.0,

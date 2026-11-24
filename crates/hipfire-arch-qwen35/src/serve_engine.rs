@@ -4914,7 +4914,25 @@ fn run_loop(
             kvmem_engine::read_legacy_query_rows(&mut rig, &legacy_query_reads);
             if let Err(e) = kvmem_hooks::feed_step(&mut rig, &batch, &slots, &work, &spec_drafts, n)
             {
+                // A host-tier capacity fault is recoverable by dropping every
+                // slot's host state: the forward's GPU rows are stale after
+                // fail_all_active, and each reset releases the raw stores so
+                // the next session starts from a clean charge. Any other feed
+                // failure keeps the poison contract.
+                let recoverable = kvmem_hooks::is_host_capacity_error(&e);
+                for d in spec_drafts.iter_mut() {
+                    if let Some(d) = d.take() {
+                        d.free_gpu(&mut rig.gpu);
+                    }
+                }
                 fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                if recoverable && kvmem_hooks::recover_host_capacity(&mut rig) {
+                    eprintln!(
+                        "[kvmem] host capacity exhausted; reset all slots and \
+                         continued: {e}"
+                    );
+                    continue 'serve;
+                }
                 poison = Some(e);
                 break 'serve;
             }

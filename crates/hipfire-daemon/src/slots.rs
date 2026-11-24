@@ -252,6 +252,13 @@ pub struct SlotBackend {
     layers: usize,
     vocab: usize,
     is_vl: bool,
+    /// Lower-cased load path. The short-context cold policy matches its model
+    /// scope against this instead of guessing from the response template.
+    model_scope: String,
+    /// KVMem is enabled for this process. The daemon only applies the
+    /// short-cold and zero-token retry policies on the KVMem path; stock and
+    /// non-KVMem engines keep their existing reuse semantics.
+    kvmem_enabled: bool,
     /// Post-gate audio-tower / video-leg residency, published verbatim in
     /// the `loaded` ack (`audio` / `video`) so `/v1/models` can advertise
     /// the modalities the serve actually accepts.
@@ -727,6 +734,8 @@ impl SlotBackend {
         let effort_probe =
             crate::effort_probe::probe_loaded_effort(Some(&tokenizer), chat_template.as_deref());
         let chat_template_source = chat_template.as_ref().map(|_| SLOT_CHAT_TEMPLATE_SOURCE);
+        let kvmem_enabled = process_config.kvmem.is_some();
+        let model_scope = model_path.to_ascii_lowercase();
         Ok(Self {
             engine,
             effort_probe,
@@ -739,6 +748,8 @@ impl SlotBackend {
             layers,
             vocab,
             is_vl,
+            model_scope,
+            kvmem_enabled,
             is_audio,
             is_video,
             vision_config,
@@ -1801,7 +1812,40 @@ impl SlotBackend {
         let mut repeat_stopped = false;
         let mut loop_stopped = false;
         let mut pass_prompt = prompt_tokens;
-        let mut pass_continuation = continuation;
+        // 短会话强制 cold 是可选实验（HIPFIRE_KVMEM_PREFIX_REUSE_MIN_TOKENS>0，
+        // 默认关闭）：A/B 显示 cold 自身也可能 EOS，且 cached=0 会抑制下面的冷重试。
+        // 策略只命中 HIPFIRE_KVMEM_SHORT_COLD_MODELS（默认 mq4-xt,mq4-xts）。
+        let short_cold_min = env_usize("HIPFIRE_KVMEM_PREFIX_REUSE_MIN_TOKENS", 0);
+        let short_cold_models = hipfire_config::developer_var("HIPFIRE_KVMEM_SHORT_COLD_MODELS")
+            .unwrap_or_else(|_| "mq4-xt,mq4-xts".to_string());
+        // VL media reuse is a separate contract (media-prefix anchors), so the
+        // short-cold policy deliberately leaves vision requests untouched.
+        let request_has_vision = visual_data.is_some();
+        let short_cold = self.kvmem_enabled
+            && short_cold_min > 0
+            && prompt_len < short_cold_min
+            && !request_has_vision
+            && short_cold_model_match(&self.model_scope, &short_cold_models)
+            && matches!(
+                &continuation,
+                Continuation::Cold | Continuation::UserTurn(_)
+            );
+        if short_cold {
+            eprintln!(
+                "[kvmem-prefix] cold short model={} prompt={} threshold={}",
+                self.model_scope, prompt_len, short_cold_min
+            );
+        }
+        let request_has_schema = json_schema.is_some();
+        let request_tool_results = matches!(&continuation, Continuation::ToolResults { .. });
+        let mut pass_continuation = if short_cold {
+            Continuation::Cold
+        } else {
+            continuation
+        };
+        let mut retry_cold = false;
+        let mut cold_retry_used = false;
+        let cold_retry_enabled = self.kvmem_enabled && env_flag("HIPFIRE_KVMEM_COLD_RETRY", true);
         let mut pass_max_tokens = max_tokens;
         let mut pass_temperature = temperature;
         let mut pass_presence = presence_penalty;
@@ -1901,6 +1945,7 @@ impl SlotBackend {
                 prompt_tokens: std::mem::take(&mut pass_prompt),
                 convo: convo.clone(),
                 continuation: std::mem::replace(&mut pass_continuation, Continuation::Cold),
+                force_cold: (pass_index == 1 && short_cold) || retry_cold,
                 max_tokens: pass_max_tokens,
                 temperature: pass_temperature,
                 top_p,
@@ -1999,7 +2044,7 @@ impl SlotBackend {
                                 }
                             }
                             accepted_session = Some(session);
-                            if pass_index == 1 {
+                            if pass_index == 1 || retry_cold {
                                 // The client-facing prompt accounting is the
                                 // FIRST pass's; later passes extend it
                                 // engine-side only.
@@ -2250,6 +2295,54 @@ impl SlotBackend {
                 // n counts the sampled terminator: the reference appends it
                 // to its sampled stream before breaking.
                 gates.note_eos();
+            }
+            // KVMem warm-prefix numerical divergence can turn a near-EOS
+            // distribution into an immediate stop. If the client has seen
+            // nothing and the prompt was partly cached, replay once with a
+            // genuinely cold prefill. Enabled by default; disable with
+            // HIPFIRE_KVMEM_COLD_RETRY=0. Never applies to vision/schema/
+            // tool-result turns.
+            let zero_token_eos = natural_stop
+                && generated == 0
+                && produced == 0
+                && tokens_total == 0
+                && gen_ids.is_empty()
+                && terminal_tool_calls.is_empty()
+                && cached_tokens > 0;
+            if zero_token_eos
+                && cold_retry_enabled
+                && !cold_retry_used
+                && !request_has_vision
+                && !request_has_schema
+                && !request_tool_results
+            {
+                cold_retry_used = true;
+                let retry_cached = cached_tokens;
+                if let Some(sess) = accepted_session.take() {
+                    self.close_session(sess);
+                }
+                accepted_ticket = None;
+                saved_stop = None;
+                gen_ids.clear();
+                gates = StreamGates::new(repeat_stop);
+                tokens_total = 0;
+                produced = 0;
+                cached_tokens = 0;
+                prefill_tokens = original_prompt.len();
+                pending_injection = None;
+                terminal_tool_calls.clear();
+                injected_once = false;
+                pass_prompt = original_prompt.clone();
+                pass_continuation = Continuation::Cold;
+                pass_max_tokens = max_tokens;
+                pass_temperature = temperature;
+                pass_presence = presence_penalty;
+                retry_cold = true;
+                eprintln!(
+                    "[kvmem-retry] cold retry id={id} prompt={} cached={retry_cached} reason=eos_empty",
+                    original_prompt.len()
+                );
+                continue 'pass;
             }
             saved_stop = Some((reason, generated));
 
@@ -3850,6 +3943,40 @@ fn build_slot_vl_prompt(
     ))
 }
 
+// ── KVMem cold-policy helpers ─────────────────────────────────────────────
+
+/// Parse a non-negative integer developer variable; malformed/unset values
+/// fall back to `default` (the caller's documented policy default).
+fn env_usize(name: &str, default: usize) -> usize {
+    hipfire_config::developer_var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+/// Parse a boolean developer variable using the same spellings as the rest of
+/// the daemon (`1/true/on/yes`).
+fn env_flag(name: &str, default: bool) -> bool {
+    hipfire_config::developer_var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(default)
+}
+
+/// Match a lower-cased model path against a comma-separated quant/profile
+/// list. Empty list disables the policy.
+fn short_cold_model_match(model_scope: &str, models: &str) -> bool {
+    models
+        .split(',')
+        .map(str::trim)
+        .any(|model| !model.is_empty() && model_scope.contains(&model.to_ascii_lowercase()))
+}
+
 // ── Tests (pure, no GPU) ───────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3858,6 +3985,16 @@ mod tests {
     use hipfire_engine::terminal::{batch_clear_all_terminals, batch_terminal_generation};
     use hipfire_runtime::prompt_frame::Role;
     use serde_json::json;
+
+    #[test]
+    fn short_cold_model_scope_matches_case_insensitive_substrings() {
+        let scope = "/mnt/ai/models/hipfire/qwen3.8-27b/qwen3.8-27b.mq4-xts";
+        assert!(short_cold_model_match(scope, "mq4-xt,mq4-xts"));
+        assert!(short_cold_model_match(scope, "MQ4-XTS"));
+        assert!(!short_cold_model_match(scope, "mq3,escha"));
+        assert!(!short_cold_model_match(scope, ""));
+        assert!(!short_cold_model_match(scope, " , "));
+    }
 
     /// The waiting-room fallbacks used when the process config lacks a key
     /// must equal the registered defaults (a hard-coded 30000 ms once

@@ -250,8 +250,6 @@ fn compatibility_key(spelling: &str) -> Option<String> {
             | "SELECT_METHOD"
             | "GPU_HIGH_WATERMARK"
             | "GPU_LOW_WATERMARK"
-            | "CACHE_DIR"
-            | "CACHE_BYTES"
     ) || suffix.starts_with("LAYERWISE_"))
     .then_some(suffix)
 }

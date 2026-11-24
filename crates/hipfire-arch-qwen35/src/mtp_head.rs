@@ -2600,11 +2600,21 @@ pub fn mtp_head_forward_block_only(
         "mtp_head_forward_block_only: prev_hidden has {} elems but expected n_embd={n_embd}",
         prev_hidden.numel(),
     );
-    assert!(
-        pos < kv.max_seq,
-        "mtp_head_forward_block_only: pos={pos} >= kv.max_seq={}",
-        kv.max_seq,
-    );
+    // A bounded head cache (Layerwise + MTP) can only be addressed through the
+    // restored aux plane. Reaching the full-resident wrapper with a global
+    // position past the bound means the Layerwise head restore was skipped
+    // (e.g. a transient missing head plane); fail the draft instead of
+    // panicking the engine loop so the request can be rejected cleanly.
+    if pos >= kv.max_seq {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "mtp_head_forward_block_only: pos={pos} >= kv.max_seq={} \
+                 (bounded head KV requires the Layerwise restored aux plane)",
+                kv.max_seq
+            ),
+        ));
+    }
 
     // Upload position scalar for the RoPE / attention kernels.
     let pos_i32 = pos as i32;
@@ -2665,12 +2675,15 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     // cache. Under the bounded paged pool `pos` is the global frontier hint and
     // may exceed the pool capacity — the COMPACT write position (`paged.positions`)
     // is the real bound, validated by the head staging geometry, so skip this assert.
-    if paged.is_none() {
-        assert!(
-            pos < kv.max_seq,
-            "mtp_head_forward_block_only_with_pos_buf: pos={pos} >= kv.max_seq={}",
-            kv.max_seq,
-        );
+    if paged.is_none() && pos >= kv.max_seq {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "mtp_head_forward_block_only_with_pos_buf: pos={pos} >= kv.max_seq={} \
+                 (bounded head KV requires a paged Layerwise source)",
+                kv.max_seq
+            ),
+        ));
     }
 
     // ── 1. Token embedding (table lookup OR caller-supplied override) ────

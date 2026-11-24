@@ -406,6 +406,18 @@ impl KvMemCtl {
             .and_then(|st| st.lw_aux_selection.take())
     }
 
+    /// Clone slot `slot`'s current auxiliary-selection binding WITHOUT
+    /// consuming it. The binding describes the trunk working set selected at
+    /// the last pressure step and stays valid until the next selection; every
+    /// MTP draft over that window must restore the same head view, so the
+    /// draft path peeks instead of taking the one-shot binding (K12).
+    /// `None` under Legacy / AR-only / before any selection / out of range.
+    pub fn peek_aux_selection(&self, slot: usize) -> Option<AuxiliarySelection> {
+        self.slots
+            .get(slot)
+            .and_then(|st| st.lw_aux_selection.clone())
+    }
+
     /// P4.1② G3b: host-side seal of the head auxiliary plane. Seals this feed's
     /// gathered packed Q8 K/V rows into the slot's COMPOSITE host record at the
     /// aux ordinal (`aux_ordinal`, the appended `n_fa`-th layer), mirroring the
@@ -847,16 +859,40 @@ impl KvMemCtl {
         let t_all = std::time::Instant::now();
         let mut t_read = std::time::Duration::ZERO;
         let mut t_write = std::time::Duration::ZERO;
+        // K3: gather every FullAttention layer's fed K rows into the pinned
+        // slab with one stream-ordered D2H per layer, then a single wait. The
+        // per-layer host writes below stay in ordinal order, so the archived
+        // statistics are byte-identical to the former 16 blocking reads.
+        let row_bytes = n_rows * self.k_width * std::mem::size_of::<f32>();
+        let need = n_fa * row_bytes;
+        self.ensure_xfer_slab(gpu, need)?;
+        let stream = gpu.steady_copy_stream();
+        let t = std::time::Instant::now();
+        {
+            let slab = self
+                .xfer_slab
+                .as_mut()
+                .expect("xfer slab after ensure")
+                .as_bytes_mut();
+            taps.read_k_rows_all_layers_into(gpu, row_start, n_rows, &mut slab[..need], stream)
+                .map_err(|e| format!("kvmem tap read (batch {n_fa} layers): {e:?}"))?;
+        }
+        if timed {
+            t_read += t.elapsed();
+        }
+        let st = &mut self.slots[slot];
         for il in 0..n_fa {
             let t = std::time::Instant::now();
-            taps.read_k_rows_at(gpu, il, row_start, n_rows, &mut self.staging)
-                .map_err(|e| format!("kvmem tap read (layer {il}): {e:?}"))?;
-            if timed {
-                t_read += t.elapsed();
-            }
-            let t = std::time::Instant::now();
+            let bytes = &self
+                .xfer_slab
+                .as_mut()
+                .expect("xfer slab after ensure")
+                .as_bytes_mut()[il * row_bytes..(il + 1) * row_bytes];
+            let rows = unsafe {
+                std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n_rows * self.k_width)
+            };
             st.raw
-                .write_layer_mean_k(pos0 as u32, n_rows as u32, il as u32, &self.staging)
+                .write_layer_mean_k(pos0 as u32, n_rows as u32, il as u32, rows)
                 .map_err(|e| format!("kvmem write stats (layer {il}): {e}"))?;
             if timed {
                 t_write += t.elapsed();
@@ -923,8 +959,8 @@ impl KvMemCtl {
     /// ends on a partial tail. Only called when `strategy == Layerwise`.
     ///
     /// D2 gathers synchronously (matching the legacy `spill_page` D2H path) for
-    /// correctness; async pipelining over the Phase 1 pinned slab to overlap
-    /// compute is a later refinement within sub-patch ②.
+    /// correctness; K4 batches all layers through the pinned slab with one
+    /// stream-ordered wait per feed instead of 32 blocking round-trips.
     pub(super) fn write_through_archive(
         &mut self,
         gpu: &Gpu,
@@ -944,14 +980,6 @@ impl KvMemCtl {
         let vpb = self.v_page_bytes;
         let krow = kpb / KV_BLOCK_TOKENS;
         let vrow = vpb / KV_BLOCK_TOKENS;
-        if n_rows * krow > self.wt_k.len() || n_rows * vrow > self.wt_v.len() {
-            return Err(format!(
-                "kvmem write-through: feed of {n_rows} rows exceeds the staging capacity \
-                 ({} K / {} V bytes)",
-                self.wt_k.len(),
-                self.wt_v.len()
-            ));
-        }
         let first_lp = pos0 / KV_BLOCK_TOKENS;
         let last_lp = (pos0 + n_rows - 1) / KV_BLOCK_TOKENS;
         // Resolve every fed page's physical index up front so a non-resident
@@ -966,57 +994,94 @@ impl KvMemCtl {
             })?;
             phys_pages.push(phys);
         }
-        for il in 0..self.n_fa_layers {
-            // Gather the fed K rows page-by-page into the contiguous buffer.
-            for (i, lp) in (first_lp..=last_lp).enumerate() {
-                let phys = phys_pages[i] as usize;
-                let row_lo = pos0.max(lp * KV_BLOCK_TOKENS);
-                let row_hi = (pos0 + n_rows).min((lp + 1) * KV_BLOCK_TOKENS);
-                let cnt = row_hi - row_lo;
-                let intra = row_lo - lp * KV_BLOCK_TOKENS;
-                let dst = (row_lo - pos0) * krow;
-                let src = phys * kpb + intra * krow;
-                gpu.hip
-                    .memcpy_dtoh_at(
-                        &mut self.wt_k[dst..dst + cnt * krow],
-                        &k_arenas[il].buf,
-                        src,
-                    )
-                    .map_err(|e| format!("kvmem write-through K gather (layer {il}): {e:?}"))?;
+        let layer_k = n_rows * krow;
+        let layer_v = n_rows * vrow;
+        let need_k = self.n_fa_layers * layer_k;
+        let need_v = self.n_fa_layers * layer_v;
+        self.ensure_xfer_slab(gpu, need_k + need_v)?;
+        let stream = gpu.steady_copy_stream();
+        let gather = (|| -> Result<(), String> {
+            let slab = self
+                .xfer_slab
+                .as_mut()
+                .expect("xfer slab after ensure")
+                .as_bytes_mut();
+            for il in 0..self.n_fa_layers {
+                for (i, lp) in (first_lp..=last_lp).enumerate() {
+                    let phys = phys_pages[i] as usize;
+                    let row_lo = pos0.max(lp * KV_BLOCK_TOKENS);
+                    let row_hi = (pos0 + n_rows).min((lp + 1) * KV_BLOCK_TOKENS);
+                    let cnt = row_hi - row_lo;
+                    let intra = row_lo - lp * KV_BLOCK_TOKENS;
+                    let dst = il * layer_k + (row_lo - pos0) * krow;
+                    let src = phys * kpb + intra * krow;
+                    gpu.hip
+                        .memcpy_dtoh_async_at(
+                            &mut slab[dst..dst + cnt * krow],
+                            &k_arenas[il].buf,
+                            src,
+                            stream,
+                        )
+                        .map_err(|e| format!("kvmem write-through K gather (layer {il}): {e:?}"))?;
+                }
+                for (i, lp) in (first_lp..=last_lp).enumerate() {
+                    let phys = phys_pages[i] as usize;
+                    let row_lo = pos0.max(lp * KV_BLOCK_TOKENS);
+                    let row_hi = (pos0 + n_rows).min((lp + 1) * KV_BLOCK_TOKENS);
+                    let cnt = row_hi - row_lo;
+                    let intra = row_lo - lp * KV_BLOCK_TOKENS;
+                    let dst = need_k + il * layer_v + (row_lo - pos0) * vrow;
+                    let src = phys * vpb + intra * vrow;
+                    gpu.hip
+                        .memcpy_dtoh_async_at(
+                            &mut slab[dst..dst + cnt * vrow],
+                            &v_arenas[il].buf,
+                            src,
+                            stream,
+                        )
+                        .map_err(|e| format!("kvmem write-through V gather (layer {il}): {e:?}"))?;
+                }
             }
+            Ok(())
+        })();
+        if let Err(e) = gather {
+            // Drain any copies already issued before the error; the slab must
+            // not be refilled or dropped with an in-flight D2H.
+            let _ = match stream {
+                Some(s) => gpu.hip.stream_synchronize(s),
+                None => gpu.hip.stream_synchronize_default(),
+            };
+            return Err(e);
+        }
+        match stream {
+            Some(s) => gpu.hip.stream_synchronize(s),
+            None => gpu.hip.stream_synchronize_default(),
+        }
+        .map_err(|e| format!("kvmem write-through sync: {e:?}"))?;
+        let slab = self
+            .xfer_slab
+            .as_mut()
+            .expect("xfer slab after ensure")
+            .as_bytes_mut();
+        for il in 0..self.n_fa_layers {
+            let k0 = il * layer_k;
             self.slots[slot]
                 .raw
                 .write_layer_k_gpu(
                     pos0 as u32,
                     n_rows as u32,
                     il as u32,
-                    &self.wt_k[..n_rows * krow],
+                    &slab[k0..k0 + layer_k],
                 )
                 .map_err(|e| format!("kvmem write-through K seal (layer {il}): {e}"))?;
-            // Gather the fed V rows.
-            for (i, lp) in (first_lp..=last_lp).enumerate() {
-                let phys = phys_pages[i] as usize;
-                let row_lo = pos0.max(lp * KV_BLOCK_TOKENS);
-                let row_hi = (pos0 + n_rows).min((lp + 1) * KV_BLOCK_TOKENS);
-                let cnt = row_hi - row_lo;
-                let intra = row_lo - lp * KV_BLOCK_TOKENS;
-                let dst = (row_lo - pos0) * vrow;
-                let src = phys * vpb + intra * vrow;
-                gpu.hip
-                    .memcpy_dtoh_at(
-                        &mut self.wt_v[dst..dst + cnt * vrow],
-                        &v_arenas[il].buf,
-                        src,
-                    )
-                    .map_err(|e| format!("kvmem write-through V gather (layer {il}): {e:?}"))?;
-            }
+            let v0 = need_k + il * layer_v;
             self.slots[slot]
                 .raw
                 .write_layer_v_gpu(
                     pos0 as u32,
                     n_rows as u32,
                     il as u32,
-                    &self.wt_v[..n_rows * vrow],
+                    &slab[v0..v0 + layer_v],
                 )
                 .map_err(|e| format!("kvmem write-through V seal (layer {il}): {e}"))?;
         }
@@ -1148,11 +1213,6 @@ impl KvMemCtl {
                 "kvmem stage: frontier {frontier} is not page aligned"
             ));
         }
-        let (k_page_bytes, v_page_bytes) = (self.k_page_bytes, self.v_page_bytes);
-        let st = self
-            .slots
-            .get_mut(slot)
-            .ok_or_else(|| format!("kvmem stage: slot {slot} out of range"))?;
         let pages = (frontier / KV_BLOCK_TOKENS as u32) as usize;
         pool.set_seq_len(SlotId(slot), frontier as usize)
             .map_err(|e| format!("kvmem stage provision: {e}"))?;
@@ -1173,24 +1233,26 @@ impl KvMemCtl {
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
-        let mut page_k = vec![0u8; k_page_bytes];
-        let mut page_v = vec![0u8; v_page_bytes];
-        for (lp, &phys) in phys_pages.iter().enumerate() {
-            restore_page(
-                gpu,
-                &st.raw,
-                &mut page_k,
-                &mut page_v,
-                k_arenas,
-                v_arenas,
-                k_page_bytes,
-                v_page_bytes,
-                phys,
-                lp,
-                self.diagnostics.verify,
-            )
-            .map_err(|e| format!("kvmem stage restore: {e}"))?;
-        }
+        // K5: use the same chunked pinned-slab restore as spill/restore
+        // selection instead of one blocking D2H+H2D round-trip per page. The
+        // batch path validates the host payload, scatters with stream-ordered
+        // async H2D and drains the whole chunk before the suffix prefill.
+        let batch: Vec<(usize, usize, u32)> = phys_pages
+            .iter()
+            .enumerate()
+            .map(|(lp, &phys)| (slot, lp, phys))
+            .collect();
+        let mut t_restore = std::time::Duration::ZERO;
+        let mut n_restored = 0usize;
+        self.flush_restore_batch(
+            gpu,
+            &batch,
+            k_arenas,
+            v_arenas,
+            false,
+            &mut t_restore,
+            &mut n_restored,
+        )?;
         Ok(phys_pages)
     }
 }

@@ -1855,3 +1855,43 @@ fn snapshots_inherit_origins_across_freezes() {
     assert_ne!(snap2.origin_id(1), Some(o1_0), "block 1 is a new origin");
     assert!(snap2.origin_id(2).is_some());
 }
+
+/// K2: the admission guard must accept a turn that fits and reject one that
+/// cannot, using the cheap per-token record accounting. Host-only.
+#[test]
+fn host_headroom_rejects_overcommit_and_accepts_fit() {
+    let ctl =
+        KvMemCtl::new_with_strategy(1, &plan(), &geom(), RecallStrategy::Legacy).expect("ctl");
+    assert!(ctl.host_capacity_bytes() >= 16 << 20);
+    assert!(ctl.host_record_bytes() > 0);
+    assert!(ctl.ensure_host_headroom(1).is_ok());
+    let fit = (ctl.host_capacity_bytes() / ctl.host_record_bytes()) as usize;
+    assert!(ctl.ensure_host_headroom(fit).is_ok());
+    assert!(ctl.ensure_host_headroom(fit + 1).is_err());
+}
+
+/// K13: an unsized pool keeps the 8K working set for short contexts, and
+/// raises it to the long-context size at the 49,152-token boundary.
+#[test]
+fn kvmem_plan_scales_default_pool_for_long_context() {
+    let options = KvMemOptions::default();
+    let short = resolve_plan(2, 32768, 1024, &options).expect("short plan");
+    assert_eq!(short.pages_total, 2 * DEFAULT_POOL_BLOCKS_PER_SLOT);
+    assert_eq!(
+        short.budget_blocks,
+        DEFAULT_POOL_BLOCKS_PER_SLOT - 13,
+        "8K pool keeps its 13-page headroom"
+    );
+    let long = resolve_plan(2, 262144, 1024, &options).expect("long plan");
+    assert_eq!(long.pages_total, 2 * DEFAULT_LONG_POOL_BLOCKS_PER_SLOT);
+    assert_eq!(
+        long.budget_blocks,
+        DEFAULT_LONG_POOL_BLOCKS_PER_SLOT - 13,
+        "long pool keeps its 13-page headroom"
+    );
+    let boundary = resolve_plan(1, 384 * KV_BLOCK_TOKENS, 1024, &options).expect("boundary plan");
+    assert_eq!(
+        boundary.pages_total, DEFAULT_LONG_POOL_BLOCKS_PER_SLOT,
+        "49,152 tokens selects the long-context working set"
+    );
+}

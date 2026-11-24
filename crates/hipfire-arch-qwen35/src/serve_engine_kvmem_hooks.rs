@@ -272,6 +272,72 @@ pub(super) fn filter_continuation(rig: &Rig, matched: Option<SessionId>) -> Opti
     }
 }
 
+pub(super) fn ensure_host_headroom(rig: &Rig, additional_tokens: usize) -> Result<(), String> {
+    #[cfg(feature = "kvmem")]
+    {
+        if let Some(ctl) = rig.model.kvmem.as_ref() {
+            ctl.ensure_host_headroom(additional_tokens)?;
+        }
+    }
+    let _ = (rig, additional_tokens);
+    Ok(())
+}
+
+/// Stable classifier for the host-tier capacity fault. The admission check
+/// should make this unreachable; it remains the last line of defence so a
+/// charge admitted by a concurrent slot cannot tear down every request.
+pub(super) fn is_host_capacity_error(reason: &str) -> bool {
+    reason.contains("kvmem host capacity:") || reason.contains("native KV RAM capacity exhausted")
+}
+
+/// Drop every slot's host state after a capacity fault and let the serve loop
+/// continue. The caller has already run `fail_all_active`, so no session or
+/// work item references these slots; `reset_slot` releases the raw stores and
+/// bumps the Layerwise incarnation, so the next occupant cannot alias the
+/// partially-written session.
+pub(super) fn recover_host_capacity(rig: &mut Rig) -> bool {
+    #[cfg(feature = "kvmem")]
+    {
+        let Some(ctl) = rig.model.kvmem.as_mut() else {
+            return false;
+        };
+        for slot in 0..ctl.slot_count() {
+            if let Err(e) = ctl.reset_slot(slot) {
+                eprintln!("[kvmem] host-capacity reset slot={slot} failed: {e}");
+                return false;
+            }
+        }
+        return true;
+    }
+    #[cfg(not(feature = "kvmem"))]
+    {
+        let _ = rig;
+        false
+    }
+}
+
+/// Continuation sibling: the retained prefix is already charged to the host
+/// tier, so only the new suffix plus the generation budget is additional.
+pub(super) fn ensure_continuation_host_headroom(
+    rig: &Rig,
+    slot: SlotId,
+    extended_tokens: usize,
+    max_tokens: usize,
+) -> Result<(), String> {
+    #[cfg(feature = "kvmem")]
+    {
+        if let Some(ctl) = rig.model.kvmem.as_ref() {
+            let already = ctl.fed_tokens(slot.0).unwrap_or(0) as usize;
+            let additional = extended_tokens
+                .saturating_sub(already)
+                .saturating_add(max_tokens.max(1));
+            ctl.ensure_host_headroom(additional)?;
+        }
+    }
+    let _ = (rig, slot, extended_tokens, max_tokens);
+    Ok(())
+}
+
 pub(super) fn begin_continuation_request(
     rig: &mut Rig,
     slot: SlotId,

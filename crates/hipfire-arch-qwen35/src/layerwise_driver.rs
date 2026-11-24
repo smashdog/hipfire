@@ -3410,6 +3410,12 @@ pub struct LayerwiseDriver<'a> {
     /// Legacy / AR-only (byte-neutral); attached under Layerwise + native MTP via
     /// [`Self::attach_head_plane`].
     head: Option<HeadSubsystem>,
+    /// K6: reusable page-mass gather buffer. Selection runs every
+    /// `select_interval` blocks and each call used to alloc/free a multi-MiB
+    /// D2D gather scratch; the high-water buffer is kept for the driver's
+    /// lifetime instead (the arena and kernels are untouched).
+    page_mass_scratch: Option<GpuTensor>,
+    page_mass_scratch_bytes: usize,
 }
 
 impl<'a> LayerwiseDriver<'a> {
@@ -3475,6 +3481,8 @@ impl<'a> LayerwiseDriver<'a> {
             stamp,
             active: None,
             head: None,
+            page_mass_scratch: None,
+            page_mass_scratch_bytes: 0,
         })
     }
 
@@ -3577,7 +3585,21 @@ impl<'a> LayerwiseDriver<'a> {
         active
             .request
             .projected_native(&id, begin, q, |query, frame| {
-                score_current_layer_native(gpu, keys, il, bt, query, frame)
+                let scores = score_current_layer_native(gpu, keys, il, bt, query, frame)?;
+                // Match the host/Legacy selectors' +-1 page dilation (0.9),
+                // which prevents an answer spanning a page boundary from being
+                // split: the scored page keeps priority, while a neighbour is
+                // lifted only part-way. Masked blocks must stay zero.
+                let mut dilated = scores.clone();
+                for i in 1..scores.len().saturating_sub(1) {
+                    dilated[i] = scores[i].max(0.9 * scores[i - 1].max(scores[i + 1]));
+                }
+                for (i, &mask) in frame.score_mask.iter().enumerate() {
+                    if mask == 0 {
+                        dilated[i] = 0.0;
+                    }
+                }
+                Ok(dilated)
             })
             .map_err(|e| format!("layerwise driver: projected_native {model_layer}: {e}"))?;
         let plan = active
@@ -3704,9 +3726,21 @@ impl<'a> LayerwiseDriver<'a> {
         let gather_bytes = pages
             .checked_mul(k_plane)
             .ok_or_else(|| format!("layerwise mass: gather {pages} * {k_plane} overflow"))?;
-        let gather = gpu
-            .alloc_tensor(&[gather_bytes], DType::Raw)
-            .map_err(|e| format!("layerwise mass: gather alloc {gather_bytes}B: {e:?}"))?;
+        if self.page_mass_scratch_bytes < gather_bytes {
+            if let Some(old) = self.page_mass_scratch.take() {
+                let _ = gpu.free_tensor(old);
+                self.page_mass_scratch_bytes = 0;
+            }
+            let scratch = gpu
+                .alloc_tensor(&[gather_bytes], DType::Raw)
+                .map_err(|e| format!("layerwise mass: gather alloc {gather_bytes}B: {e:?}"))?;
+            self.page_mass_scratch = Some(scratch);
+            self.page_mass_scratch_bytes = gather_bytes;
+        }
+        let gather = self
+            .page_mass_scratch
+            .as_ref()
+            .expect("page-mass gather scratch");
         let result = (|| -> Result<Vec<f32>, String> {
             // Gather each selected history page's K plane, then the suffix K
             // plane, into consecutive page-major slots of the scratch buffer.
@@ -3756,7 +3790,6 @@ impl<'a> LayerwiseDriver<'a> {
             .map_err(|e| format!("layerwise mass: kernel: {e:?}"))?;
             Ok(out)
         })();
-        let _ = gpu.free_tensor(gather);
         result
     }
 
@@ -4399,6 +4432,9 @@ impl<'a> LayerwiseDriver<'a> {
             // hold GpuTensors with no Drop, so release them explicitly.
             head.staging.free_gpu(gpu);
             head.arena.free(gpu)?;
+        }
+        if let Some(scratch) = self.page_mass_scratch {
+            let _ = gpu.free_tensor(scratch);
         }
         self.arena.free(gpu)
     }

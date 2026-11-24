@@ -97,6 +97,12 @@ pub struct SubmitRequest {
     /// continuation matching — see `Session::convo`.
     pub convo: Vec<u64>,
     pub continuation: Continuation,
+    /// Request-level cold start. This is stronger than `Continuation::Cold`:
+    /// it also refuses cross-session KVMem/radix prefix reuse, so the prompt
+    /// is prefilled as one fresh span. Used by the daemon's short-context
+    /// cold policy and the zero-token cold retry; ordinary requests keep it
+    /// false.
+    pub force_cold: bool,
     pub max_tokens: usize,
     /// 0.0 = greedy. Per-request; the engine installs it on the slot.
     pub temperature: f32,

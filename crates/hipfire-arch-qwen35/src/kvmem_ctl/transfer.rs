@@ -13,7 +13,7 @@ impl KvMemCtl {
     /// `hipHostMalloc` is costly and would otherwise land in the TTFT path every
     /// time the batch grows. Every chunk is `<= cap` by construction, so this
     /// allocates at most once per controller.
-    fn ensure_xfer_slab(&mut self, gpu: &Gpu, need: usize) -> Result<(), String> {
+    pub(super) fn ensure_xfer_slab(&mut self, gpu: &Gpu, need: usize) -> Result<(), String> {
         if self.xfer_slab.as_ref().is_none_or(|b| b.size() < need) {
             let alloc = need.max(XFER_SLAB_CAP);
             self.xfer_slab = None;
@@ -332,6 +332,124 @@ impl KvMemCtl {
             if timed {
                 *t_restore += t.elapsed();
                 *n_restored += chunk.len();
+            }
+        }
+        Ok(())
+    }
+
+    /// Batch the additive host archive of still-resident Legacy prefix pages.
+    /// Mirrors [`Self::flush_spill_batch`]: one stream sync drains every page in
+    /// a slab chunk before the host writes the packed rows. Falls back to the
+    /// blocking per-page capture when batching is disabled or a graph is being
+    /// captured.
+    pub(super) fn archive_legacy_pages_to_host(
+        &mut self,
+        gpu: &Gpu,
+        slot: usize,
+        pages: &[(usize, u32, usize)],
+        k_arenas: &[GpuTensor],
+        v_arenas: &[GpuTensor],
+    ) -> Result<(), String> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let stream = gpu.steady_copy_stream();
+        let batched = self.batch_xfer && !gpu.graphs.capture_mode;
+        if !batched {
+            let raw = &self.slots[slot].raw;
+            for &(lp, phys, rows) in pages {
+                copy_legacy_page_to_host(
+                    gpu,
+                    raw,
+                    &mut self.page_k,
+                    &mut self.page_v,
+                    k_arenas,
+                    v_arenas,
+                    self.k_page_bytes,
+                    self.v_page_bytes,
+                    phys,
+                    lp,
+                    rows,
+                    self.diagnostics.verify,
+                )?;
+            }
+            return Ok(());
+        }
+        let per_page = self.page_xfer_bytes();
+        let chunk_pages = (XFER_SLAB_CAP / per_page).max(1);
+        let kpb = self.k_page_bytes;
+        let vpb = self.v_page_bytes;
+        let k_row = kpb / KV_BLOCK_TOKENS;
+        let v_row = vpb / KV_BLOCK_TOKENS;
+        let n_layers = self.n_fa_layers;
+        let verify = self.diagnostics.verify;
+        for chunk in pages.chunks(chunk_pages) {
+            self.ensure_xfer_slab(gpu, chunk.len() * per_page)?;
+            let slab = self
+                .xfer_slab
+                .as_mut()
+                .expect("transfer slab")
+                .as_bytes_mut();
+            // Phase A: async D2H gather every page/layer into the slab.
+            let mut off = 0usize;
+            for &(_lp, phys, rows) in chunk {
+                let klen = rows * k_row;
+                let vlen = rows * v_row;
+                for il in 0..n_layers {
+                    gpu.hip
+                        .memcpy_dtoh_async_at(
+                            &mut slab[off..off + klen],
+                            &k_arenas[il].buf,
+                            phys as usize * kpb,
+                            stream,
+                        )
+                        .map_err(|e| format!("kvmem archive K read (layer {il}): {e:?}"))?;
+                    off += kpb;
+                    gpu.hip
+                        .memcpy_dtoh_async_at(
+                            &mut slab[off..off + vlen],
+                            &v_arenas[il].buf,
+                            phys as usize * vpb,
+                            stream,
+                        )
+                        .map_err(|e| format!("kvmem archive V read (layer {il}): {e:?}"))?;
+                    off += vpb;
+                }
+            }
+            // ONE wait drains the whole chunk before the host reads the slab.
+            match stream {
+                Some(s) => gpu.hip.stream_synchronize(s),
+                None => gpu.hip.stream_synchronize_default(),
+            }
+            .map_err(|e| format!("kvmem archive sync: {e:?}"))?;
+            // Phase B: write the host archive; the GPU page stays live.
+            let mut off = 0usize;
+            for &(lp, _phys, rows) in chunk {
+                let pos0 = (lp * KV_BLOCK_TOKENS) as u32;
+                let klen = rows * k_row;
+                let vlen = rows * v_row;
+                for il in 0..n_layers {
+                    let kstart = off;
+                    self.slots[slot]
+                        .raw
+                        .write_layer_k_gpu(pos0, rows as u32, il as u32, &slab[off..off + klen])
+                        .map_err(|e| format!("kvmem archive K store (layer {il}): {e}"))?;
+                    off += kpb;
+                    let vstart = off;
+                    self.slots[slot]
+                        .raw
+                        .write_layer_v_gpu(pos0, rows as u32, il as u32, &slab[off..off + vlen])
+                        .map_err(|e| format!("kvmem archive V store (layer {il}): {e}"))?;
+                    off += vpb;
+                    if verify {
+                        eprintln!(
+                            "[kvmem-verify] capture layer={il} lp={lp} rows={rows} \
+                             k={:016x} v={:016x}",
+                            fnv64(&slab[kstart..kstart + klen]),
+                            fnv64(&slab[vstart..vstart + vlen])
+                        );
+                    }
+                }
             }
         }
         Ok(())

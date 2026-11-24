@@ -116,9 +116,22 @@ impl KvMemCtl {
                         .map_err(|e| format!("kvmem set scores: {e}"))?;
                 } else {
                     let scores = self.refresh_scores(gpu, taps, s, pages)?;
+                    // Page granularity can split a retrieval needle across a
+                    // boundary: the page holding the question's evidence may
+                    // score just below the cut while the next page (holding
+                    // only the tail) scores just above it. Bleed each page's
+                    // score to its immediate neighbours at 0.9 before the
+                    // top-k cut so a boundary-spanning run is selected as a
+                    // unit. The 0.9 decay keeps the scoring page ahead of a
+                    // boosted neighbour, so the neighbour cannot tie-displace
+                    // it; an unpaged/interior selection is unchanged.
+                    let mut dilated = scores.clone();
+                    for i in 1..scores.len().saturating_sub(1) {
+                        dilated[i] = scores[i].max(0.9 * scores[i - 1].max(scores[i + 1]));
+                    }
                     self.slots[s]
                         .kv
-                        .set_retrieval_scores(&scores)
+                        .set_retrieval_scores(&dilated)
                         .map_err(|e| format!("kvmem set scores: {e}"))?;
                 }
                 let picked = self.slots[s]

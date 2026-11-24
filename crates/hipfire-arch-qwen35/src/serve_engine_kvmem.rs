@@ -819,7 +819,57 @@ pub(super) fn prepare_legacy_query_checkpoints(
             .as_ref()
             .is_some_and(|run| run.query.checkpoint_due(work[slot].next_pos));
         if due {
-            let kind = rig.legacy_queries[slot].as_ref().unwrap().kind;
+            let (kind, restore_begin, prompt_end) = {
+                let run = rig.legacy_queries[slot].as_ref().unwrap();
+                (
+                    run.kind,
+                    run.query.restore_begin() as u64,
+                    run.query.prompt_end() as u64,
+                )
+            };
+            // A Query only earns its checkpoint when the probe can actually
+            // need cold pages. If the whole restore frontier is resident and
+            // the prompt (plus speculative workspace) fits the window, the
+            // post-probe policy is already known to be `window_resident`:
+            // skip the checkpoint (which copies every resident page D2H into
+            // the host fork and exports the recurrent DN) and keep the intact
+            // first pass. This is the expensive all-resident cold-reuse case
+            // (the K7 full-budget arm).
+            let window_tokens = rig
+                .model
+                .kvmem
+                .as_ref()
+                .expect("Legacy query gate checked controller presence")
+                .window_capacity_tokens();
+            let workspace = if kind.active() {
+                rig.model.spec_rows as u64
+            } else {
+                0
+            };
+            let resident_pages = rig.pool.block_table(SlotId(slot)).map_or(0, |bt| {
+                (0..bt.num_pages())
+                    .filter(|&lp| bt.physical(lp).is_some())
+                    .count()
+            });
+            let resident_tokens = resident_pages as u64 * crate::kvmem_ctl::KV_BLOCK_TOKENS as u64;
+            let window_resident = resident_tokens >= restore_begin
+                && prompt_end.saturating_add(workspace) <= window_tokens;
+            if window_resident {
+                let run = rig.legacy_queries[slot].as_mut().unwrap();
+                run.query.bypass("window_resident_precapture")?;
+                eprintln!(
+                    "[kvmem-legacy] QueryBypass slot={slot} reason=window_resident \
+                     resident_pages={resident_pages} frontier={restore_begin} \
+                     prompt_end={prompt_end} first_pass_preserved=true"
+                );
+                if let Some(run) = rig.legacy_queries[slot].as_ref() {
+                    caps[slot] = run.query.cap_prefill(
+                        work[slot].next_pos,
+                        work[slot].remaining_prompt.len().min(rig.prefill_chunk),
+                    );
+                }
+                continue;
+            }
             let capture = capture_legacy_native_image(rig, slot, kind);
             let run = rig.legacy_queries[slot].as_mut().unwrap();
             match capture {
@@ -1412,6 +1462,24 @@ pub(super) fn freeze_prefill_boundaries(
                 .map_err(|e| format!("kvmem freeze DN capture: {e:?}"))?;
                 if cid == crate::checkpoint::CheckpointId::NONE {
                     return Err("kvmem freeze: checkpoint pool ceiling refused capture".to_string());
+                }
+                // Legacy writes a page to the host archive only when
+                // Pressure spills it. Copy the still-resident prefix pages
+                // first so the canonical fork owns a complete packed grid
+                // and can emit a persistent restart pack.
+                {
+                    let model = &mut rig.model;
+                    if let Some(ctl) = model.kvmem.as_mut() {
+                        ctl.archive_resident_prefix(
+                            &rig.gpu,
+                            &rig.pool,
+                            &model.k_arenas,
+                            &model.v_arenas,
+                            s,
+                            boundary as u32,
+                            last_frozen as u32,
+                        )?;
+                    }
                 }
                 // 2-4. Host freeze + displaced release + page PIN.
                 kvmem_catalog_and_pin(
@@ -2209,6 +2277,12 @@ pub(super) fn kvmem_prefix_reuse(
     req: &SubmitRequest,
 ) -> Option<usize> {
     let trace = kvmem_trace(rig);
+    if req.force_cold {
+        if trace {
+            eprintln!("[kvmem-prefix] force_cold: canonical prefix reuse skipped");
+        }
+        return None;
+    }
     #[cfg(feature = "kvmem")]
     let req_media: Option<u64> = req
         .visual_data
@@ -2523,64 +2597,120 @@ pub(super) fn kvmem_prefix_reuse(
                 // demand (carrier restore), so the share is skipped; Legacy
                 // has no cold restore path and fails closed to a cold prefill.
                 if gpu_pages.is_empty() {
-                    if !ctl.strategy().is_layerwise() {
-                        let _ = ctl.reset_slot(slot.0);
-                        let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
-                        return Err(
-                            "kvmem reuse: no pinned pages (restart) and Legacy has no cold restore"
-                                .to_string(),
+                    if ctl.strategy().is_layerwise() {
+                        // G3 cold-reuse fix: a page-less import has no bound
+                        // prefix pages, so the suffix prefill would attend over
+                        // unbound rows and lose the imported context.
+                        // Materialize the prefix from the archived store into
+                        // pool pages first, then pin them so later reuses are
+                        // hot.
+                        let staged = ctl.stage_page_less_import(
+                            &rig.gpu,
+                            &mut rig.pool,
+                            &rig.model.k_arenas,
+                            &rig.model.v_arenas,
+                            slot.0,
+                            frontier,
                         );
-                    }
-                    // G3 cold-reuse fix: a page-less import has no bound prefix
-                    // pages, so the suffix prefill would attend over unbound
-                    // rows and lose the imported context. Materialize the
-                    // prefix from the archived store into pool pages first,
-                    // then pin them so later reuses are hot.
-                    let staged = ctl.stage_page_less_import(
-                        &rig.gpu,
-                        &mut rig.pool,
-                        &rig.model.k_arenas,
-                        &rig.model.v_arenas,
-                        slot.0,
-                        frontier,
-                    );
-                    let pages = match staged {
-                        Ok(pages) => pages,
-                        Err(e) => {
-                            let _ = ctl.reset_slot(slot.0);
-                            let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
-                            return Err(format!("kvmem reuse: cold prefix staging failed: {e}"));
-                        }
-                    };
-                    let mut taken: Vec<u32> = Vec::new();
-                    let mut ref_err = None;
-                    if let Some(pp) = rig.pool.page_pool_mut() {
-                        for &phys in &pages {
-                            match pp.add_cache_ref(phys) {
-                                Ok(()) => taken.push(phys),
-                                Err(e) => {
-                                    ref_err = Some(e);
-                                    break;
+                        let pages = match staged {
+                            Ok(pages) => pages,
+                            Err(e) => {
+                                let _ = ctl.reset_slot(slot.0);
+                                let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+                                return Err(format!(
+                                    "kvmem reuse: cold prefix staging failed: {e}"
+                                ));
+                            }
+                        };
+                        let mut taken: Vec<u32> = Vec::new();
+                        let mut ref_err = None;
+                        if let Some(pp) = rig.pool.page_pool_mut() {
+                            for &phys in &pages {
+                                match pp.add_cache_ref(phys) {
+                                    Ok(()) => taken.push(phys),
+                                    Err(e) => {
+                                        ref_err = Some(e);
+                                        break;
+                                    }
                                 }
                             }
+                        } else {
+                            ref_err = Some("not paged".to_string());
                         }
+                        if let Some(e) = ref_err {
+                            if let Some(pp) = rig.pool.page_pool_mut() {
+                                for &phys in &taken {
+                                    let _ = pp.release_cache_ref(phys);
+                                }
+                            }
+                            let _ = ctl.reset_slot(slot.0);
+                            let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+                            return Err(format!("kvmem reuse: cold prefix pin failed: {e}"));
+                        }
+                        if let Some(ckpt) = ctl.prefix_checkpoint_mut(reuse_id) {
+                            ckpt.gpu_pages = pages;
+                        }
+                        ctl.note_prefix_restore_hit();
                     } else {
-                        ref_err = Some("not paged".to_string());
-                    }
-                    if let Some(e) = ref_err {
-                        if let Some(pp) = rig.pool.page_pool_mut() {
-                            for &phys in &taken {
-                                let _ = pp.release_cache_ref(phys);
+                        // Legacy has no pinned-page cold restore arm. Restore
+                        // a recency/sink working set into an all-spilled block
+                        // table so the suffix prefill can attend the imported
+                        // prefix. Do not pin these pages: Legacy Pressure must
+                        // remain free to evict them, and the checkpoint keeps
+                        // no page list so a later reuse re-materializes from
+                        // the sealed pack.
+                        match ctl.stage_legacy_page_less_import(
+                            &rig.gpu,
+                            &mut rig.pool,
+                            &rig.model.k_arenas,
+                            &rig.model.v_arenas,
+                            slot.0,
+                            frontier,
+                        ) {
+                            Ok(pages) => {
+                                ctl.note_prefix_restore_hit();
+                                // The cold fork above rebuilt the slot state and
+                                // dropped the request query. Re-arm it here, clipped
+                                // to the imported frontier: rows before the frontier
+                                // are already in the imported raw, so only the new
+                                // suffix rows can be captured and scored. Without
+                                // this, Legacy never starts a Query and the spilled
+                                // middle pages stay unmasked forever (K7 recall gap).
+                                if let Some((begin, end)) = req.query {
+                                    let begin = begin.max(u64::from(frontier));
+                                    let trimmed = (begin < end).then_some((begin, end));
+                                    if let Err(e) = ctl.set_request_query(slot.0, trimmed) {
+                                        let _ = ctl.reset_slot(slot.0);
+                                        let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+                                        return Err(format!(
+                                            "kvmem reuse: Legacy cold Query re-arm failed: {e}"
+                                        ));
+                                    }
+                                    if trace {
+                                        eprintln!(
+                                            "[kvmem-legacy] cold pack query slot={} \
+                                             span={trimmed:?} frontier={frontier}",
+                                            slot.0
+                                        );
+                                    }
+                                }
+                                if trace {
+                                    eprintln!(
+                                        "[kvmem-legacy] cold pack reuse slot={} \
+                                         frontier={frontier} resident_pages={pages}",
+                                        slot.0
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                let _ = ctl.reset_slot(slot.0);
+                                let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
+                                return Err(format!(
+                                    "kvmem reuse: Legacy cold prefix staging failed: {e}"
+                                ));
                             }
                         }
-                        let _ = ctl.reset_slot(slot.0);
-                        let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
-                        return Err(format!("kvmem reuse: cold prefix pin failed: {e}"));
                     }
-                    if let Some(ckpt) = ctl.prefix_checkpoint_mut(reuse_id) {
-                        ckpt.gpu_pages = pages;
-                    }
-                    ctl.note_prefix_restore_hit();
                 } else if rig.pool.share_published_pages(slot, &gpu_pages).is_err() {
                     let _ = ctl.reset_slot(slot.0);
                     let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
@@ -3306,14 +3436,14 @@ pub(super) fn build_kvmem_controller(
     spec_rows: usize,
     prefill_chunk: usize,
     plan: Option<crate::kvmem_ctl::KvMemPlan>,
-    options: Option<crate::kvmem_ctl::KvMemOptions>,
+    mut options: Option<crate::kvmem_ctl::KvMemOptions>,
 ) -> Result<Option<crate::kvmem_ctl::KvMemCtl>, String> {
     let Some(plan) = plan else {
         return Ok(None);
     };
     // Restate an implicit default budget at the clamped value the plan was
     // admitted with, so the controller and operator-facing record agree.
-    let legacy_config = cfg.kvmem.as_ref().map(|config| {
+    let mut legacy_config = cfg.kvmem.as_ref().map(|config| {
         let budget_tokens = crate::kvmem_ctl::effective_legacy_budget(
             config.budget_tokens as usize,
             crate::kvmem_ctl::implicit_legacy_budget(config),
@@ -3334,6 +3464,94 @@ pub(super) fn build_kvmem_controller(
         }
         config
     });
+    // Scale the host tier with the geometry the operator already admitted.
+    // The default 16 GiB was sized for the historical 8K working set; at 262k
+    // a single slot retains 8 GiB and two slots exceed the default. Explicit
+    // HOST_BYTES values stay strict: a too-small limit is a startup error, not
+    // a mid-serve capacity fault that poisons every active request.
+    let strategy = if legacy_config.is_some() {
+        crate::kvmem_ctl::RecallStrategy::Legacy
+    } else {
+        options
+            .as_ref()
+            .map(|options| options.strategy)
+            .unwrap_or(crate::kvmem_ctl::RecallStrategy::Legacy)
+    };
+    let n_record_layers = n_fa_layers
+        + if strategy.is_layerwise() && mtp_head {
+            1
+        } else {
+            0
+        };
+    let required_host = crate::kvmem_ctl::required_host_bytes(
+        n_slots,
+        cfg.cap_tokens,
+        n_record_layers,
+        per_pos_bytes,
+        per_pos_v_bytes,
+    );
+    let (current_host, implicit_host) = match legacy_config.as_ref() {
+        Some(config) => (
+            config.host_bytes,
+            config
+                .report
+                .get("host_bytes")
+                .is_none_or(|report| report.source == hipfire_config::kvmem::Source::Default),
+        ),
+        None => (
+            options
+                .as_ref()
+                .and_then(|options| options.host_bytes)
+                .unwrap_or(crate::kvmem_ctl::DEFAULT_HOST_BYTES),
+            options
+                .as_ref()
+                .is_none_or(|options| options.host_bytes.is_none()),
+        ),
+    };
+    let spill_configured = match legacy_config.as_ref() {
+        Some(config) => config.disk_path.is_some(),
+        None => options
+            .as_ref()
+            .and_then(|options| options.spill_dir.as_ref())
+            .is_some_and(|dir| !dir.is_empty()),
+    };
+    let resolved_host = if spill_configured {
+        // A disk tier turns an over-RAM charge into a spill instead of a hard
+        // failure, so an explicit RAM cap below the full-context requirement
+        // stays valid here. Layerwise pays a synchronous spill per feed; the
+        // warning is the operator's cue to raise the RAM cap.
+        if current_host < required_host {
+            eprintln!(
+                "[kvmem-config] host_bytes={current_host} is below the full-context \
+                 requirement {required_host}; the spill tier absorbs the excess \
+                 (Layerwise pays synchronous spill per feed)"
+            );
+        }
+        current_host
+    } else {
+        crate::kvmem_ctl::resolve_host_bytes(current_host, required_host, implicit_host)?
+    };
+    if resolved_host != current_host {
+        eprintln!(
+            "[kvmem-config] host_bytes auto-raised {current_host} -> {resolved_host} \
+             (full-context requirement {required_host}, slots={n_slots}, \
+             cap_tokens={}, record_layers={n_record_layers})",
+            cfg.cap_tokens
+        );
+        if let Some(config) = legacy_config.as_mut() {
+            config.host_bytes = resolved_host;
+            config.notes.push(format!(
+                "host_bytes auto-raised from {current_host} to {resolved_host} \
+                 (full-context requirement for {n_slots} slot(s) at {} tokens)",
+                cfg.cap_tokens
+            ));
+            if let Some(report) = config.report.get_mut("host_bytes") {
+                report.effective = serde_json::json!(resolved_host);
+            }
+        } else if let Some(options) = options.as_mut() {
+            options.host_bytes = Some(resolved_host);
+        }
+    }
     if let Some(config) = legacy_config.as_ref() {
         eprintln!(
             "[kvmem-config] contract={} budget_tokens={} gen_reserve_tokens={} \
@@ -3367,6 +3585,13 @@ pub(super) fn build_kvmem_controller(
             spec_rows,
             prefill_chunk,
             cfg.cap_tokens,
+        );
+    } else {
+        eprintln!(
+            "[kvmem-config] host_bytes={resolved_host} required={required_host} \
+             slots={n_slots} cap_tokens={} record_layers={n_record_layers} \
+             strategy={strategy:?}",
+            cfg.cap_tokens
         );
     }
     Ok(Some(crate::kvmem_ctl::KvMemCtl::new_with_config(
@@ -3428,7 +3653,7 @@ impl ModelRig {
         if fed < BT {
             return draft(gpu, None);
         }
-        let aux = match ctl.take_aux_selection(slot) {
+        let aux = match ctl.peek_aux_selection(slot) {
             Some(a) => a,
             None => return draft(gpu, None),
         };

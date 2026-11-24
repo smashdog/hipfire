@@ -68,6 +68,7 @@ fn main() {
                     prompt_tokens: prompt,
                     convo: vec![0xA13_000 + i as u64],
                     continuation: Continuation::Cold,
+                    force_cold: false,
                     max_tokens: 8,
                     temperature: 0.0,
                     top_p: 1.0,
