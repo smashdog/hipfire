@@ -20,6 +20,7 @@ pub mod evidence;
 pub mod host_memory;
 pub mod http_auth;
 pub mod intent;
+pub mod kvmem;
 pub mod load_summary;
 pub mod process_priority;
 pub mod rocm;
@@ -655,6 +656,11 @@ const THINKING_BUDGETS: &[&str] = &["off", "low", "med", "high", "xhigh", "max",
 // non-Qwen3.8 parents still validate. Values pass through as request strings;
 // model-specific mapping lives downstream of config validation.
 pub const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high", "xhigh", "max"];
+// What the multi-slot route does when it detects a reasoning loop: `off`
+// keeps generating, `stop` ends the request as length, `recover` restarts the
+// pass once with the low-effort system sentence. Mirrors
+// `HIPFIRE_REASONING_LOOP_RECOVERY` (`thinking.loop_recovery`).
+pub const LOOP_RECOVERY_MODES: &[&str] = &["off", "stop", "recover"];
 // Which engine executes a spilled layer's weight-reading GEMVs. Exported for the
 // same reason as `REASONING_EFFORTS`: the TUI's option list must be this list, or
 // a value the schema accepts becomes unselectable (and an unselectable value
@@ -1279,6 +1285,57 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_MAX_TOTAL_THINK_TOKENS"),
         "Cross-reopen reasoning budget; zero disables it."
+    ),
+    field!(
+        "thinking.close_retry",
+        "thinking_close_retry",
+        Reasoning,
+        Request,
+        DefaultValue::Bool(true),
+        ValueRule::Bool,
+        false,
+        true,
+        None,
+        "Think-close retry: when a thinking turn stops with the span still open, inject the close and keep generating (per-model override of HIPFIRE_REASONING_CLOSE_RETRY for the multi-slot route)."
+    ),
+    field!(
+        "thinking.loop_recovery",
+        "thinking_loop_recovery",
+        Reasoning,
+        Request,
+        DefaultValue::String("recover"),
+        ValueRule::Enum(LOOP_RECOVERY_MODES),
+        false,
+        true,
+        None,
+        "Reasoning-loop action: off, stop, or recover (per-model override of HIPFIRE_REASONING_LOOP_RECOVERY for the multi-slot route)."
+    ),
+    field!(
+        "thinking.repeat_stop_tokens",
+        "thinking_repeat_stop_tokens",
+        Reasoning,
+        Request,
+        DefaultValue::Integer(256),
+        ValueRule::Integer {
+            min: 0,
+            max: 65536
+        },
+        false,
+        true,
+        None,
+        "Same-token run guard: consecutive identical tokens that end the pass as length; zero disables (per-model override of HIPFIRE_REPEAT_STOP_TOKENS for the multi-slot route)."
+    ),
+    field!(
+        "thinking.answer_room",
+        "thinking_answer_room",
+        Reasoning,
+        Request,
+        DefaultValue::Bool(true),
+        ValueRule::Bool,
+        false,
+        true,
+        None,
+        "Answer room: with thinking on and no explicit budget, cap the thinking so the answer keeps a quarter of max_tokens (from 1024 up, or when the cap is all the context has left); an explicit budget that eats the room is clamped. Per-model override of HIPFIRE_THINKING_ANSWER_ROOM for the multi-slot route."
     ),
     field!(
         "serve.host",
@@ -4376,12 +4433,28 @@ impl ResolvedConfig {
 pub struct ProcessConfig {
     pub schema_version: i64,
     pub values: ConfigLayer,
+    /// Strict, versioned Legacy policy; None retains the env-only Layerwise path
+    /// or identifies an older client awaiting snapshot-only normalization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kvmem: Option<kvmem::ResolvedConfig>,
 }
 
 static ACTIVE_PROCESS_CONFIG: OnceLock<ProcessConfig> = OnceLock::new();
 
 impl ProcessConfig {
     pub fn from_resolved(resolved: &ResolvedConfig) -> Result<Self> {
+        Self::from_resolved_with_kvmem(resolved, &BTreeMap::new())
+    }
+
+    /// Apply raw CLI presence before strict KVMem validation, so a winning CLI
+    /// value can override an invalid, shadowed compatibility environment value.
+    pub fn from_resolved_with_kvmem(
+        resolved: &ResolvedConfig,
+        cli: &BTreeMap<String, String>,
+    ) -> Result<Self> {
+        let kvmem = kvmem::RawConfig::from_global(resolved, cli)
+            .and_then(|raw| raw.resolve())
+            .map_err(kvmem_config_error)?;
         let mut values = ConfigLayer::default();
         for schema in FIELDS {
             if schema.env_compat.is_none() {
@@ -4408,6 +4481,7 @@ impl ProcessConfig {
         let config = Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             values,
+            kvmem,
         };
         config.validate()?;
         Ok(config)
@@ -4424,6 +4498,9 @@ impl ProcessConfig {
             });
         }
         self.values.validate()?;
+        if let Some(kvmem) = &self.kvmem {
+            kvmem.validate().map_err(kvmem_config_error)?;
+        }
         for key in self.values.values.keys() {
             if is_developer_key(key) {
                 continue;
@@ -4441,6 +4518,17 @@ impl ProcessConfig {
         Ok(())
     }
 
+    /// Normalize older clients using only the supplied developer snapshot.
+    /// Layerwise returns None and keeps its existing native policy parser.
+    pub fn resolve_missing_kvmem(&mut self) -> Result<()> {
+        if self.kvmem.is_none() {
+            self.kvmem = kvmem::RawConfig::from_process_values(&self.values)
+                .and_then(|raw| raw.resolve())
+                .map_err(kvmem_config_error)?;
+        }
+        self.validate()
+    }
+
     /// Render the compatibility spelling expected by an internal snapshot
     /// parser. This is an in-memory adapter only; it does not mutate or inspect
     /// the ambient process environment.
@@ -4450,6 +4538,13 @@ impl ProcessConfig {
         }
         let key = developer_key_for_env(name)?;
         self.values.get(&key).and_then(render_compat_value)
+    }
+}
+
+fn kvmem_config_error(error: kvmem::ResolveError) -> ConfigError {
+    ConfigError::InvalidValue {
+        key: format!("kvmem.{}", error.parameter),
+        message: error.message,
     }
 }
 
@@ -6340,8 +6435,15 @@ pub fn load_env_layer() -> Result<ConfigLayer> {
         let Some(key) = developer_key_for_env(name) else {
             continue;
         };
-        let Ok(raw) = raw.into_string() else {
-            continue;
+        let raw = match raw.into_string() {
+            Ok(raw) => raw,
+            Err(_) if name == "HIPFIRE_KVMEM" || name.starts_with("HIPFIRE_KVMEM_") => {
+                return Err(ConfigError::InvalidValue {
+                    key,
+                    message: format!("{name} must be valid UTF-8; explicit KVMem input cannot be silently omitted"),
+                });
+            }
+            Err(_) => continue,
         };
         layer.set(&key, ConfigValue::String(raw))?;
     }
@@ -7348,6 +7450,7 @@ mod tests {
             let process = ProcessConfig {
                 schema_version: CONFIG_SCHEMA_VERSION,
                 values: layer,
+                kvmem: None,
             };
             assert_eq!(
                 process.legacy_value(SYM_IU4_ENV).as_deref(),
@@ -8469,6 +8572,7 @@ mod tests {
         let config = ProcessConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
             values,
+            kvmem: None,
         };
         let table = legacy_table(&config);
         let mut names: Vec<&str> = FIELDS

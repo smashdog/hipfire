@@ -83,6 +83,9 @@ pub mod kernel_pack;
 pub mod kernel_registry;
 pub mod kernels;
 pub mod kv_slots;
+pub mod kvmem_page_mass;
+pub mod kvmem_page_score;
+pub mod kvmem_tap;
 pub mod lane_fa;
 pub mod lane_gdn;
 pub mod lane_leviathan;
@@ -116,6 +119,9 @@ pub use slab_admission::{
     qwen4_slab_codec_admitted, qwen4_slab_codec_prefill_admitted, qwen4_slab_default_cold_codec,
     qwen4_slab_layer_cold_codec, qwen4_slab_layer_prefills, SlabLayerCodecError,
 };
+/// Layerwise packed-page composite-slot pool + arena geometry (Phase 3.2 ①地基).
+/// Clean sibling to `page_pool`/`slot_pool`; not wired into live serve in ①.
+pub mod layerwise_pool;
 pub mod mq6_railgun;
 pub mod mq_f16_producers;
 pub mod mq_f16_residual_producers;

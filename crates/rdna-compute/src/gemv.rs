@@ -1388,7 +1388,7 @@ impl EschaXGroup {
 pub fn escha_grouped_tile(m: usize) -> (usize, usize) {
     static TILE: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
     let (rows, ctiles) = *TILE.get_or_init(|| {
-        std::env::var("HIPFIRE_ESCHA_GROUPED_TILE")
+        hipfire_config::developer_var("HIPFIRE_ESCHA_GROUPED_TILE")
             .ok()
             .and_then(|s| {
                 let (r, c) = s.split_once('x')?;

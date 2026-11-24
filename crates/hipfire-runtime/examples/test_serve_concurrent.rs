@@ -99,6 +99,7 @@ fn main() {
         let (tx, rx) = channel::<Event>();
         engine
             .submit(SubmitRequest {
+                query: None,
                 prompt_tokens: toks,
                 // Single-turn: nothing to continue, so no conversation key and
                 // no continuation tokens.

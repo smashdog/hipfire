@@ -43,8 +43,8 @@ fn main() {
         .collect(); // [8, 8]
 
     // Call hipfire's real router for layer 0 on each token.
-    let got = hipfire_arch_qwen35::escha_router_topk_for_test(&hfq, 0, &x, 8, 2048, 8)
-        .expect("router");
+    let got =
+        hipfire_arch_qwen35::escha_router_topk_for_test(&hfq, 0, &x, 8, 2048, 8).expect("router");
 
     let mut bad = 0usize;
     for t in 0..8 {

@@ -327,6 +327,32 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 
 **Backend precedence** (forced choices): CLI `--kv-backend` **>** per-model `memory.kv_backend` **>** global `memory.kv_backend`. Omitted backend stays automatic VMM-preferring policy, not an authored pin.
 
+### KVMem Legacy flags (`run` / `serve` / `bench`)
+
+These flags resolve through the shared Legacy KVMem contract. CLI wins over
+environment, then developer config, then defaults. A positive
+`--kvmem-budget` implicitly enables KVMem. `--kvmem-check` prints the resolved
+JSON report without loading a model or touching a GPU.
+
+| Flag | Values / default | Purpose |
+|---|---|---|
+| `--kvmem` / `--no-kvmem` | boolean | Explicitly enable or disable Legacy KVMem. |
+| `--kvmem-budget <TOKENS>` | positive; default 32768 | Selected-history budget B, excluding generation reserve. |
+| `--kvmem-gen-reserve <TOKENS>` | positive; default 1024 | Reusable append reserve R; not an output-token limit. |
+| `--kvmem-sink-tokens <TOKENS>` / `--kvmem-recent-tokens <TOKENS>` | nonnegative; defaults 0 / 64 | Protected prefix/suffix, floored to 128-token blocks. Zero is literal zero protection. |
+| `--kvmem-host-mib <MIB>` / `--kvmem-disk-mib <MIB>` | positive / nonnegative; defaults 16384 / 0 | Host RAM and SSD payload budgets. Positive disk budget requires `--kvmem-disk-path`. |
+| `--kvmem-disk-path <PATH>` | path | SSD spill directory; forbidden when disk budget is zero. |
+| `--kvmem-sessions <N>` | positive; default 4 | Retained inactive histories, excluding the active request. |
+| `--kvmem-cache-min-tokens <TOKENS>` | only 0 | Reserved compatibility control; no native consumer. |
+| `--kvmem-block-tokens <128>` | only 128 | Fixed native block size. |
+| `--kvmem-recall-strategy <legacy>` | only `legacy` | Formal Legacy policy. The existing Layerwise env-only route remains separate. |
+| `--kvmem-query-scorer <SCORER>` | `page-softmax` (default) / `meanq-cosine` | Query scoring function. |
+| `--kvmem-score-agg <AGG>` | `mean` / `max` | Aggregation; defaults to `mean` for page-softmax and `max` for cosine. |
+| `--kvmem-lrfu` / `--no-kvmem-lrfu` | boolean | Enable/disable LRFU; explicit tuning requires LRFU. |
+| `--kvmem-lrfu-lambda <FLOAT>` / `--kvmem-lrfu-top-frac <FLOAT>` | `[0,1]` / `(0,1]`; defaults 0.5 / 0.9 | LRFU decay and top-fraction. |
+| `--kvmem-graph-alpha <0>` | only 0 | Graph scoring is unsupported; zero is the effective default. |
+| `--kvmem-query-max-tokens <TOKENS>` / `--kvmem-query-replay-max-tokens <TOKENS>` | positive; defaults 512 / 2048 | Query capture-tail and complete causal replay bounds. Zero is rejected. |
+
 ### `hipfire serve` flags
 
 | Flag / arg | Purpose |

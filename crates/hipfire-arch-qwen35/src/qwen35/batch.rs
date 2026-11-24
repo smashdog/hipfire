@@ -17,6 +17,8 @@ use super::prefill::MOE_GROUPED_BLOCK_M;
 use super::weights::DeltaNetState;
 use super::weights::Qwen35Weights;
 use super::weights::StateQuant;
+#[cfg(feature = "kvmem")]
+use crate::kvmem_taps::KvMemTaps;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
 use hipfire_dispatch::pipeline::batched::run_plain_gemm_key;
@@ -202,6 +204,14 @@ pub struct PrefillBatchScratch {
     // `new`); currently always allocated when LA layers exist, like the Q8
     // tape. s_tape_f32: [max_batch × n_v_heads × head_dim × head_dim] f32.
     pub dn_s_tape_f32: Option<GpuTensor>,
+
+    // ── KVMem host-offload statistics taps (None = disabled) ──
+    // Post-norm/pre-RoPE Q/K copies for the KVMem retrieval statistics. Only
+    // allocated when the serving engine enables KVMem (`enable_kvmem_taps`);
+    // otherwise the forward launches nothing extra and stays bit-identical.
+    // See `crate::kvmem_taps`.
+    #[cfg(feature = "kvmem")]
+    pub kvmem_taps: Option<KvMemTaps>,
 }
 
 impl PrefillBatchScratch {
@@ -620,6 +630,8 @@ impl PrefillBatchScratch {
             dn_s_tape_q8: i_dn_s_tape_q8.map(|i| take!(i)),
             dn_s_tape_scales: i_dn_s_tape_scales.map(|i| take!(i)),
             dn_s_tape_f32: i_dn_s_tape_f32.map(|i| take!(i)),
+            #[cfg(feature = "kvmem")]
+            kvmem_taps: None,
         })
     }
 
@@ -711,10 +723,53 @@ impl PrefillBatchScratch {
                 note(gpu.free_tensor(t));
             }
         }
+        #[cfg(feature = "kvmem")]
+        if let Some(taps) = self.kvmem_taps {
+            if let Some(capture) = taps.query_capture {
+                note(gpu.free_tensor(capture.values));
+                note(gpu.free_tensor(capture.source_rows));
+            }
+            note(gpu.free_tensor(taps.q_tap));
+            note(gpu.free_tensor(taps.k_tap));
+        }
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Allocate the KVMem statistics tap buffers for the multi-slot forward.
+    ///
+    /// `n_slots` is the owning slot pool's capacity; the buffers are sized
+    /// once and reused for every step. Enabling taps adds one small copy
+    /// kernel per FullAttention layer to each forward; nothing reads them
+    /// unless the engine's KVMem controller does, and the tap never modifies
+    /// Q/K, so an enabled-but-unread tap is still bit-identical.
+    #[cfg(feature = "kvmem")]
+    pub fn enable_kvmem_taps(
+        &mut self,
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        n_slots: usize,
+    ) -> HipResult<()> {
+        if self.kvmem_taps.is_some() {
+            return Ok(());
+        }
+        let n_fa_layers = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == LayerType::FullAttention)
+            .count();
+        self.kvmem_taps = Some(KvMemTaps::new(
+            gpu,
+            n_fa_layers,
+            n_slots,
+            self.max_batch,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+        )?);
+        Ok(())
     }
 }
 /// Persistent fixed-slot state for independent-sequence Qwen3.5 decode.

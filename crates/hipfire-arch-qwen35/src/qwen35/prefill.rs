@@ -4542,6 +4542,14 @@ pub fn qwen35_layer_batch_admissible(
             if l.w_down.m != dim || l.w_down.k != config.hidden_dim {
                 return Err(HipError::new(0, "DeltaNet w_down shape mismatch"));
             }
+            // Escha trellis layer: geometry above is dtype-agnostic (a code's
+            // m/k are its oc/ic), but `is_batchable_la` only admits the fused
+            // MQ/low-bit ladder and rejects trellis codes. The slot body runs
+            // escha through its own grouped-GEMM arm, so the dtype gate does
+            // not apply — admit once the shapes check out.
+            if l.escha.is_some() {
+                return Ok(());
+            }
             for (name, dt) in [
                 ("wqkv", l.wqkv.gpu_dtype),
                 ("wz", l.wz.gpu_dtype),
@@ -4594,6 +4602,12 @@ pub fn qwen35_layer_batch_admissible(
             }
             if l.w_down.m != dim || l.w_down.k != config.hidden_dim {
                 return Err(HipError::new(0, "FullAttn w_down shape mismatch"));
+            }
+            // Escha trellis layer: see the DeltaNet branch — shapes are
+            // dtype-agnostic, the grouped-GEMM arm replaces the fused ladder
+            // that `is_batchable_la` gates, so admit once geometry checks out.
+            if l.escha.is_some() {
+                return Ok(());
             }
             for (name, dt) in [
                 ("wq", l.wq.gpu_dtype),

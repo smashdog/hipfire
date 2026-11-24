@@ -33,6 +33,16 @@
 use crate::mtp_head::{
     self, Qwen35MtpHead, Qwen35MtpHeadBatchedScratch, Qwen35MtpHeadKvCache, Qwen35MtpHeadScratch,
 };
+// The head-layerwise draft handle lives in the (deltanet + kvmem)-gated
+// `layerwise_driver`. `mtp_spec` itself is deltanet-gated, so within it the
+// real type exists iff `kvmem` is on. The no-kvmem default build keeps a
+// zero-sized `PhantomData` stand-in (mirrors `lib.rs::LayerwiseFwd`): callers
+// pass `None` there, the dispatch's `Some` arm is cfg-gated out, and the
+// `Option<&mut …>` threading / `is_none()` gates behave identically.
+#[cfg(feature = "kvmem")]
+use crate::layerwise_driver::HeadLayerwise;
+#[cfg(not(feature = "kvmem"))]
+type HeadLayerwise<'a> = core::marker::PhantomData<&'a ()>;
 use crate::qwen35::prefill::{fp8_verify_open, fp8_verify_target};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use crate::qwen35::{LayerType, LayerWeights, PrefillBatchScratch, StateQuant};
@@ -746,13 +756,25 @@ impl MtpSpecState {
         head: &Qwen35MtpHead,
         max_n: usize,
         kv_mode: crate::mtp_head::MtpKvMode,
+        head_max_seq: Option<usize>,
     ) -> HipResult<Self> {
         Self::new_for_components_with_verify_capacity(
-            gpu, config, dn_state, head, max_n, max_n, kv_mode,
+            gpu,
+            config,
+            dn_state,
+            head,
+            max_n,
+            max_n,
+            kv_mode,
+            head_max_seq,
         )
     }
 
     /// Component-level constructor with explicit `verify_capacity`.
+    ///
+    /// P4.1② f2 (E): `head_max_seq` bounds the head KV cache to the Layerwise
+    /// working-set window + one draft-scratch block (`Some(cap)`); `None` keeps
+    /// the full-resident `config.max_seq` cache (Legacy / AR-only, byte-neutral).
     pub fn new_for_components_with_verify_capacity(
         gpu: &mut Gpu,
         config: &Qwen35Config,
@@ -761,6 +783,7 @@ impl MtpSpecState {
         max_n: usize,
         verify_capacity: usize,
         kv_mode: crate::mtp_head::MtpKvMode,
+        head_max_seq: Option<usize>,
     ) -> HipResult<Self> {
         assert!(
             max_n >= 1,
@@ -801,7 +824,14 @@ impl MtpSpecState {
         let trunk_pbs = qwen35::PrefillBatchScratch::new(gpu, config, verify_capacity + 1)?;
         let trunk_gdn_tape = GdnTape::new_for_config(gpu, config, verify_capacity + 1)?;
         let mtp_scratch = Qwen35MtpHeadScratch::new(gpu, &head.config)?;
-        let mtp_kv = Qwen35MtpHeadKvCache::new_with_kv_mode(gpu, &head.config, kv_mode)?;
+        // P4.1② f2 (E): bound the head KV to the Layerwise window + scratch block
+        // when the caller supplies a capacity; otherwise full-resident (Legacy).
+        let mtp_kv = match head_max_seq {
+            Some(cap) => {
+                Qwen35MtpHeadKvCache::new_with_kv_mode_bounded(gpu, &head.config, kv_mode, cap)?
+            }
+            None => Qwen35MtpHeadKvCache::new_with_kv_mode(gpu, &head.config, kv_mode)?,
+        };
 
         let mtp_t_outs = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
         let mtp_lm_tmp = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
@@ -1207,6 +1237,28 @@ impl MtpSpecState {
         Ok(())
     }
 
+    /// Invalidate recordings before installing a native host image. This does
+    /// not reset KV or request sampling state. The image owner validates all
+    /// payloads first and publishes `prev_hidden_pos` only after every upload
+    /// succeeds. Graph failure latches/counters remain lifetime diagnostics.
+    pub fn invalidate_native_image_graphs(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        if gpu.graphs.capture_mode || gpu.replay.is_recording() {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MTP native image restore during recording",
+            ));
+        }
+        gpu.bind_thread()?;
+        // Includes the optional trunk-snapshot side stream.
+        gpu.hip.device_synchronize()?;
+        destroy_mtp_proposal_graph(gpu, self);
+        destroy_mtp_verify_graph(gpu, self);
+        self.mtp_proposal_graph_warmed = false;
+        self.mtp_verify_graph_mode = "direct";
+        self.prev_hidden_pos = None;
+        Ok(())
+    }
+
     pub fn free_gpu(self, gpu: &mut Gpu) {
         gpu.bind_thread_or_warn();
         // Drain launches and destroy their nodes before releasing captured buffers.
@@ -1411,6 +1463,7 @@ fn run_mtp_proposal_graph_body_q8(
                 cur_pos + k,
                 seq_cap,
                 weights,
+                None,
             )?;
         } else {
             let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
@@ -1426,6 +1479,7 @@ fn run_mtp_proposal_graph_body_q8(
                 cur_pos + k,
                 seq_cap,
                 weights,
+                None,
             )?;
         }
         mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
@@ -1882,7 +1936,11 @@ fn mtp_assemble_verify_tokens(last_committed: u32, candidates: &[u32]) -> Vec<u3
 /// row 0 pairs `last_committed` with the pre-window hidden, row `i > 0` pairs
 /// `candidates[i - 1]` with verify hidden row `i - 1`. The pending token at
 /// `cur_pos + advance` is written by the next window, as in decode.
-fn mtp_takeover_fill_tokens(last_committed: u32, candidates: &[u32], advance: usize) -> Vec<u32> {
+pub(crate) fn mtp_takeover_fill_tokens(
+    last_committed: u32,
+    candidates: &[u32],
+    advance: usize,
+) -> Vec<u32> {
     assert!(
         advance >= 1 && advance <= candidates.len() + 1,
         "takeover fill: advance {advance} out of 1..={}",
@@ -2219,6 +2277,39 @@ fn mtp_penalty_apply_row(
 /// the window's candidates from `candidates[..n_verify - 1]` (so rejected /
 /// pruned draft-phase pushes never survive), uploads the history once, then
 /// launches one prepass per non-empty row. No-op unless `sampling.penalized()`.
+///
+/// Drafter-agnostic: MTP and the DFlash2 slot verify both call this with their
+/// own [`PenaltyHistory`] + repeat buffer. The caller must have run
+/// `penalty.begin_window(emitted)` for this window.
+pub(crate) fn spec_apply_verify_penalties(
+    gpu: &mut Gpu,
+    penalty: &mut hipfire_runtime::spec_sampling::PenaltyHistory,
+    repeat_buf: &GpuTensor,
+    logits_view: &GpuTensor,
+    candidates: &[u32],
+    n_verify: usize,
+    vocab: usize,
+    sampling: &MtpSamplingConfig,
+) -> HipResult<()> {
+    if !sampling.penalized() {
+        return Ok(());
+    }
+    mtp_penalty_require_window(penalty)?;
+    debug_assert!(n_verify >= 1 && candidates.len() + 1 >= n_verify);
+    penalty.rewind_drafts();
+    for &c in &candidates[..n_verify - 1] {
+        penalty.push_draft(c);
+    }
+    mtp_penalty_upload_history(gpu, penalty, repeat_buf)?;
+    for k in 0..n_verify {
+        let row = logits_view.sub_offset(k * vocab, vocab);
+        mtp_penalty_apply_row(gpu, penalty, repeat_buf, &row, k, vocab, sampling)?;
+    }
+    Ok(())
+}
+
+/// MTP wrapper around [`spec_apply_verify_penalties`] that also records the
+/// per-window host-side penalty cost under `HIPFIRE_MTP_PHASE_TIMING=1`.
 fn mtp_apply_verify_penalties(
     gpu: &mut Gpu,
     state: &mut MtpSpecState,
@@ -2232,25 +2323,16 @@ fn mtp_apply_verify_penalties(
         return Ok(());
     }
     let t0 = MtpPenaltyTiming::start();
-    mtp_penalty_require_window(&state.penalty)?;
-    debug_assert!(n_verify >= 1 && candidates.len() + 1 >= n_verify);
-    state.penalty.rewind_drafts();
-    for &c in &candidates[..n_verify - 1] {
-        state.penalty.push_draft(c);
-    }
-    mtp_penalty_upload_history(gpu, &state.penalty, &state.mtp_sample_repeat_buf)?;
-    for k in 0..n_verify {
-        let row = logits_view.sub_offset(k * vocab, vocab);
-        mtp_penalty_apply_row(
-            gpu,
-            &state.penalty,
-            &state.mtp_sample_repeat_buf,
-            &row,
-            k,
-            vocab,
-            sampling,
-        )?;
-    }
+    spec_apply_verify_penalties(
+        gpu,
+        &mut state.penalty,
+        &state.mtp_sample_repeat_buf,
+        logits_view,
+        candidates,
+        n_verify,
+        vocab,
+        sampling,
+    )?;
     if t0.is_some() {
         let uploads = u32::from(!state.penalty.tokens().is_empty());
         let launches = (0..n_verify)
@@ -2377,7 +2459,7 @@ fn mtp_verify_accept_impl(
     if use_sampling {
         hit_eos = mtp_sampled_accept(
             gpu,
-            state,
+            &mut state.rng,
             &logits_view,
             draft_softmaxes,
             draft_probs,
@@ -3188,7 +3270,7 @@ pub fn mtp_batched_verify_accept_from_batch(
         let mut accept_count = 0usize;
         let hit_eos = mtp_sampled_accept(
             gpu,
-            state,
+            &mut state.rng,
             &logits_view,
             &draft.draft_softmaxes,
             &draft.draft_probs,
@@ -3948,6 +4030,7 @@ where
                         &target.weights,
                         Some(rot),
                         true,
+                        /* rope_shift */ 0,
                     )?;
                     slice_off = slice_end;
                 }
@@ -4836,9 +4919,9 @@ pub fn spec_step_mtp_compressed(
 /// empty). RNG draw count/order is identical to the learned-draft path.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
-fn mtp_sampled_accept(
+pub(crate) fn mtp_sampled_accept(
     gpu: &mut Gpu,
-    state: &mut MtpSpecState,
+    rng: &mut MtpRng,
     logits_view: &GpuTensor,
     draft_softmaxes: &[Vec<f32>],
     draft_probs: &[f32],
@@ -4902,7 +4985,7 @@ fn mtp_sampled_accept(
         let target_row_k = target_row_at(k);
         let p_d = draft_probs[k].max(f32::MIN_POSITIVE);
         let p_t = target_row_k[candidates[k] as usize];
-        let u = state.rng.next_uniform_f32();
+        let u = rng.next_uniform_f32();
         if u * p_d <= p_t {
             // Accept.
             committed.push(candidates[k]);
@@ -4916,7 +4999,7 @@ fn mtp_sampled_accept(
             // across the MISMATCHED per-side nuclei. Both rows are full-vocab
             // length `vocab` (different zero-support), so sample_residual's
             // element-wise subtraction is well-formed.
-            let u2 = state.rng.next_uniform_f32();
+            let u2 = rng.next_uniform_f32();
             let bonus = if point_mass {
                 sample_residual_point_mass(&target_row_k, candidates[k], u2)
             } else {
@@ -4935,7 +5018,7 @@ fn mtp_sampled_accept(
         // All `drafts_generated` accepted (and none was EOS): sample the bonus
         // from the target nucleus at position `*accept_count` (== drafts_generated).
         let row = target_row_at(*accept_count);
-        let u = state.rng.next_uniform_f32();
+        let u = rng.next_uniform_f32();
         let bonus = sample_categorical(&row, u);
         committed.push(bonus);
         if bonus == eos_token_id {
@@ -5002,6 +5085,83 @@ pub fn spec_step_mtp_compressed_serial(
 /// calls this then `mtp_shared_verify_accept_rollback_inner`; the slot engine
 /// calls this per-slot, then does a batched `forward_batch_slots_graphed`,
 /// then `mtp_batched_verify_accept_from_batch` per-slot.
+/// P4.1② G4 (f2): single head block-forward dispatch for the serial draft loop.
+/// Under Layerwise (`head_lw = Some`) the head attends through the bounded restored
+/// aux pool ([`HeadPagedKv`]): row `row` advances the COMPACT write coordinate
+/// ([`LayerwiseDriver::stage_head_draft_row`], ninfer NL:10335) and the GLOBAL RoPE
+/// position `pos` is written to the head's `rope_pos` buffer (ninfer NL:10300
+/// `begin + i + sequence.rope_delta`, here `sequence.rope_delta == 0` so the global
+/// frontier `pos` is used directly — it equals `compact_write + auxiliary_removed_tokens`).
+/// Legacy / AR-only (`None`) keeps the full-resident head KvCache and the
+/// `mtp_head_forward_block_only` wrapper byte-for-byte. The head ALGORITHM is
+/// identical either way; only KV residency differs.
+#[allow(clippy::too_many_arguments)]
+fn mtp_head_block_forward_dispatch(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    scratch: &Qwen35MtpHeadScratch,
+    kv: &mut Qwen35MtpHeadKvCache,
+    next_token: u32,
+    prev_hidden: &GpuTensor,
+    next_token_embed: Option<&GpuTensor>,
+    pos: usize,
+    row: usize,
+    trunk_weights: &Qwen35Weights,
+    head_lw: Option<&mut HeadLayerwise<'_>>,
+) -> HipResult<()> {
+    match head_lw {
+        Some(hlw) => {
+            #[cfg(feature = "kvmem")]
+            {
+                hlw.carrier
+                    .driver
+                    .stage_head_draft_row(gpu, row)
+                    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+                let rope = i32::try_from(pos).map_err(|_| {
+                    hip_bridge::HipError::new(
+                        0,
+                        &format!("mtp head draft: rope pos {pos} overflow i32"),
+                    )
+                })?;
+                gpu.hip.memcpy_htod(&hlw.rope_pos, &rope.to_ne_bytes())?;
+                let paged = hlw.paged_kv();
+                mtp_head::mtp_head_forward_block_only_with_pos_buf(
+                    gpu,
+                    head,
+                    scratch,
+                    kv,
+                    next_token,
+                    prev_hidden,
+                    next_token_embed,
+                    &scratch.pos_buf,
+                    pos,
+                    hlw.ctx_len,
+                    trunk_weights,
+                    Some(&paged),
+                )
+            }
+            #[cfg(not(feature = "kvmem"))]
+            {
+                // No-kvmem default build: `HeadLayerwise` is a zero-sized stub
+                // and every caller passes `None`, so this arm is unreachable.
+                let _ = (hlw, row);
+                unreachable!("mtp head layerwise draft requires the kvmem feature")
+            }
+        }
+        None => mtp_head::mtp_head_forward_block_only(
+            gpu,
+            head,
+            scratch,
+            kv,
+            next_token,
+            prev_hidden,
+            next_token_embed,
+            pos,
+            trunk_weights,
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn mtp_draft_phase_inner(
     gpu: &mut Gpu,
@@ -5013,6 +5173,7 @@ pub fn mtp_draft_phase_inner(
     last_committed: u32,
     k: usize,
     skip_proposal_graph: bool,
+    mut head_lw: Option<&mut HeadLayerwise<'_>>,
 ) -> HipResult<MtpDraftOutput> {
     // Per-call k is authoritative (remaining max_emit from MtpSpeculator). Never
     // draft more than state.max_n, and k==0 means verify [seed] only + bonus.
@@ -5177,7 +5338,13 @@ pub fn mtp_draft_phase_inner(
         );
     }
     let proposal_graph_policy = mtp_proposal_graph_policy_from_env();
+    // P4.1② G4 (f2): the Layerwise head drafts through the bounded restored aux
+    // pool with a per-row advancing compact write coordinate (ninfer's serial AR
+    // steps, NL:10329-10336). A captured proposal graph bakes fixed position
+    // buffers and cannot replay the paged restore/advance, so force the serial
+    // loop whenever a head Layerwise handle is bound. Legacy (None) is unchanged.
     let use_proposal_graph = !skip_proposal_graph
+        && head_lw.is_none()
         && max_n > 0
         && !state.mtp_proposal_graph_disabled
         && mtp_proposal_graph_eligible_for(
@@ -5287,32 +5454,32 @@ pub fn mtp_draft_phase_inner(
             // call. In full-vocab mode we run block_only here and do the
             // rmsnorm + trunk-lm_head GEMV manually below.
             if use_full_vocab {
-                if k == 0 {
-                    mtp_head::mtp_head_forward_block_only(
-                        gpu,
-                        head,
-                        &state.mtp_scratch,
-                        &mut state.mtp_kv,
-                        next_tok,
-                        &state.prev_hidden,
-                        next_token_embed,
-                        cur_pos + k,
-                        trunk_weights,
-                    )?;
+                // P4.1② G4 (f2): under Layerwise the head attends through the
+                // bounded restored aux pool (HeadPagedKv); Legacy keeps the
+                // full-resident head KvCache. The dispatch advances the compact
+                // write row and fills the GLOBAL RoPE position cur_pos+k (ninfer
+                // NL:10296/10300; sequence_rope_delta==0 until the COW boundary
+                // rebuild adds it). The head algorithm is identical either way.
+                let prev_row;
+                let prev_hidden = if k == 0 {
+                    &state.prev_hidden
                 } else {
-                    let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-                    mtp_head::mtp_head_forward_block_only(
-                        gpu,
-                        head,
-                        &state.mtp_scratch,
-                        &mut state.mtp_kv,
-                        next_tok,
-                        &prev_row,
-                        next_token_embed,
-                        cur_pos + k,
-                        trunk_weights,
-                    )?;
-                }
+                    prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+                    &prev_row
+                };
+                mtp_head_block_forward_dispatch(
+                    gpu,
+                    head,
+                    &state.mtp_scratch,
+                    &mut state.mtp_kv,
+                    next_tok,
+                    prev_hidden,
+                    next_token_embed,
+                    cur_pos + k,
+                    k,
+                    trunk_weights,
+                    head_lw.as_deref_mut(),
+                )?;
                 // rmsnorm(t_mtp_out, shared_head_norm) → tmp, then trunk lm_head
                 // GEMV → full_vocab_logits_view. weight_gemv dispatches the right
                 // kernel (gemv_mq4g256_with_rotate / gemv_q8_0 / etc.) on the
@@ -5330,58 +5497,54 @@ pub fn mtp_draft_phase_inner(
                     &full_vocab_logits_view,
                 )?;
             } else if use_device_token_chain {
-                if k == 0 {
-                    mtp_head::mtp_head_forward_block_only(
-                        gpu,
-                        head,
-                        &state.mtp_scratch,
-                        &mut state.mtp_kv,
-                        next_tok,
-                        &state.prev_hidden,
-                        next_token_embed,
-                        cur_pos + k,
-                        trunk_weights,
-                    )?;
+                // P4.1② G4 (f2): paged-aware block forward (Layerwise) / full-resident
+                // (Legacy), then the shared compressed draft LM-head tail.
+                let prev_row;
+                let prev_hidden = if k == 0 {
+                    &state.prev_hidden
                 } else {
-                    let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-                    mtp_head::mtp_head_forward_block_only(
-                        gpu,
-                        head,
-                        &state.mtp_scratch,
-                        &mut state.mtp_kv,
-                        next_tok,
-                        &prev_row,
-                        next_token_embed,
-                        cur_pos + k,
-                        trunk_weights,
-                    )?;
-                }
+                    prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+                    &prev_row
+                };
+                mtp_head_block_forward_dispatch(
+                    gpu,
+                    head,
+                    &state.mtp_scratch,
+                    &mut state.mtp_kv,
+                    next_tok,
+                    prev_hidden,
+                    next_token_embed,
+                    cur_pos + k,
+                    k,
+                    trunk_weights,
+                    head_lw.as_deref_mut(),
+                )?;
                 mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
             } else {
-                if k == 0 {
-                    mtp_head::mtp_head_forward_compressed(
-                        gpu,
-                        head,
-                        &state.mtp_scratch,
-                        &mut state.mtp_kv,
-                        next_tok,
-                        &state.prev_hidden,
-                        cur_pos + k,
-                        trunk_weights,
-                    )?;
+                // Compressed host-mediated draft: same paged-aware block forward
+                // (no caller embed override) + the shared compressed LM-head tail
+                // (`mtp_head_forward_compressed` == block_only + apply_lm_head_draft).
+                let prev_row;
+                let prev_hidden = if k == 0 {
+                    &state.prev_hidden
                 } else {
-                    let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-                    mtp_head::mtp_head_forward_compressed(
-                        gpu,
-                        head,
-                        &state.mtp_scratch,
-                        &mut state.mtp_kv,
-                        next_tok,
-                        &prev_row,
-                        cur_pos + k,
-                        trunk_weights,
-                    )?;
-                }
+                    prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+                    &prev_row
+                };
+                mtp_head_block_forward_dispatch(
+                    gpu,
+                    head,
+                    &state.mtp_scratch,
+                    &mut state.mtp_kv,
+                    next_tok,
+                    prev_hidden,
+                    None,
+                    cur_pos + k,
+                    k,
+                    trunk_weights,
+                    head_lw.as_deref_mut(),
+                )?;
+                mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
             }
 
             // Pick the logits buffer to argmax over (mode-dependent).
@@ -5718,6 +5881,7 @@ pub fn spec_step_mtp_compressed_serial_inner(
         last_committed,
         k,
         skip_proposal_graph,
+        None,
     )?;
 
     mtp_shared_verify_accept_rollback_inner(
@@ -5892,6 +6056,7 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
         &target.weights,
         cur_pos,
         &mtp_takeover_fill_tokens(last_committed, candidates, result.advance),
+        /* rope_shift: Legacy sequential verify stays full-resident */ 0,
     )?;
 
     // External windows are never truncated; ensure result fields cohere even
@@ -5909,13 +6074,16 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
 /// KV-only head pass (same gate and kernels as the batched prompt fill) and
 /// falls back to per-row decode forwards otherwise. Rows are independent:
 /// each slot's K/V depends only on its own token and hidden.
-fn mtp_takeover_fill_head_kv(
+pub(crate) fn mtp_takeover_fill_head_kv(
     gpu: &mut Gpu,
     head: &Qwen35MtpHead,
     state: &mut MtpSpecState,
     trunk_weights: &Qwen35Weights,
     cur_pos: usize,
     tokens: &[u32],
+    // P4.1② f2 (E): the bounded-head COMPACT-write shift (= ninfer removed_tokens).
+    // `0` ⇒ full-resident global positions (Legacy / AR-only, byte-neutral).
+    rope_shift: usize,
 ) -> HipResult<()> {
     let n = tokens.len();
     let dim = head.config.n_embd;
@@ -5957,7 +6125,21 @@ fn mtp_takeover_fill_head_kv(
             .takeover_fill_batched
             .as_mut()
             .expect("takeover fill scratch allocated above");
-        let positions: Vec<i32> = (cur_pos..cur_pos + n).map(|p| p as i32).collect();
+        // P4.1② f2 (E): COMPACT staging write positions under the bounded head
+        // pool; RoPE stays GLOBAL via rope_shift (ninfer cache_position_shift,
+        // NL:8442). Fail closed if the verify span straddles the window front.
+        if cur_pos < rope_shift {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "mtp head consume: cur_pos {cur_pos} < removed {rope_shift} \
+                     (verify span exceeds head window)"
+                ),
+            ));
+        }
+        let positions: Vec<i32> = (cur_pos - rope_shift..cur_pos + n - rope_shift)
+            .map(|p| p as i32)
+            .collect();
         let hidden = state.takeover_fill_hidden.sub_offset(0, n * dim);
         mtp_head::mtp_head_forward_block_batched(
             gpu,
@@ -5971,8 +6153,19 @@ fn mtp_takeover_fill_head_kv(
             trunk_weights,
             Some(rot),
             true,
+            /* rope_shift */ rope_shift as i32,
         )
     } else {
+        // P4.1② f2 (E): the bounded head staging pool requires the batched
+        // kv_only fill (compact write + global RoPE). The per-row decode fallback
+        // has no separated RoPE coordinate, so refuse it under a non-zero shift
+        // rather than write a wrong rotation. Legacy (shift 0) is byte-neutral.
+        if rope_shift != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "mtp head consume: bounded head staging requires the batched fill path",
+            ));
+        }
         for (i, &token) in tokens.iter().enumerate() {
             let hidden_row = state.takeover_fill_hidden.sub_offset(i * dim, dim);
             mtp_head::mtp_head_forward_block_only(

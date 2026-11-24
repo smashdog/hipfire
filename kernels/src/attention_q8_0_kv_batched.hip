@@ -143,6 +143,16 @@ extern "C" __global__ void attention_q8_0_kv_batched(
     // Phase 1: Q @ K^T with Q8_0 dequant.
     float local_max = -1e30f;
     for (int t = tid; t < eff_seq_len; t += nthreads) {
+        // KVMem residency: a spilled page holds no K bytes, so its key is
+        // masked with the same -1e30 sentinel an empty sliding-window tile
+        // uses (expf collapses it to zero weight). `t` is uniform across the
+        // block, so this is a whole-block skip, not a divergent read. With
+        // every page present the branch never fires and Phase 1 is the
+        // unchanged arithmetic below.
+        if (!kv_page_present(desc, t)) {
+            scores[t] = -1e30f;
+            continue;
+        }
         float dot = 0.0f;
         for (int bi = 0; bi < blocks_per_head; bi++) {
             const unsigned char* blk = k_cache
@@ -206,6 +216,12 @@ extern "C" __global__ void attention_q8_0_kv_batched(
         int bi = d / 32;
         int bj = d % 32;
         for (int t = 0; t < eff_seq_len; t++) {
+            // KVMem residency: a spilled page's weight is exactly zero on the
+            // masks above (or contributes nothing on the all-absent fill
+            // path), and its address would resolve through -1. Skip the read.
+            if (!kv_page_present(desc, t)) {
+                continue;
+            }
             const unsigned char* blk = v_cache
                                       + kv_offset_for_v(desc, t, per_pos_bytes)
                                       + (kv_head_block_start + bi) * 34;
@@ -436,6 +452,11 @@ extern "C" __global__ void attention_fp8_e4m3_kv_batched(
     // Phase 1: Q @ K^T with fp8 decode.
     float local_max = -1e30f;
     for (int t = tid; t < eff_seq_len; t += nthreads) {
+        // KVMem residency (P4.4): spilled page holds no K bytes; mask sentinel.
+        if (!kv_page_present(desc, t)) {
+            scores[t] = -1e30f;
+            continue;
+        }
         const unsigned char* krow = k_cache + kv_offset_for_k(desc, t, per_pos_bytes);
         const float ks = (float)*((const _Float16*)(krow + scale_off));
         const unsigned char* kc = krow + k_head_off;
@@ -484,6 +505,10 @@ extern "C" __global__ void attention_fp8_e4m3_kv_batched(
     for (int d = tid; d < head_dim; d += nthreads) {
         float val = 0.0f;
         for (int t = 0; t < eff_seq_len; t++) {
+            // KVMem residency (P4.4): spilled page weight is zero; skip the read.
+            if (!kv_page_present(desc, t)) {
+                continue;
+            }
             const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
             const float vs = (float)*((const _Float16*)(vrow + scale_off));
             val += scores[t] * (vs * hipfire_fp8_e4m3_to_f32_batched(vrow[k_head_off + d]));
@@ -558,6 +583,12 @@ extern "C" __global__ void attention_bf16_kv_batched(
     // Phase 1: Q @ K^T with bf16 widening.
     float local_max = -1e30f;
     for (int t = tid; t < eff_seq_len; t += nthreads) {
+        // KVMem residency (P4.4): a spilled page holds no K bytes; mask with the
+        // -1e30 sentinel (expf collapses to zero weight). Whole-block skip.
+        if (!kv_page_present(desc, t)) {
+            scores[t] = -1e30f;
+            continue;
+        }
         const unsigned short* kc =
             (const unsigned short*)(k_cache + kv_offset_for_k(desc, t, per_pos_bytes)) + k_head_off;
         float dot = 0.0f;
@@ -605,6 +636,11 @@ extern "C" __global__ void attention_bf16_kv_batched(
     for (int d = tid; d < head_dim; d += nthreads) {
         float val = 0.0f;
         for (int t = 0; t < eff_seq_len; t++) {
+            // KVMem residency (P4.4): spilled page weight is zero; skip the read
+            // (its address would resolve through the -1 sentinel).
+            if (!kv_page_present(desc, t)) {
+                continue;
+            }
             const unsigned short* vc =
                 (const unsigned short*)(v_cache + kv_offset_for_v(desc, t, per_pos_bytes)) + k_head_off;
             val += scores[t] * hipfire_bf16_to_f32_batched(vc[d]);

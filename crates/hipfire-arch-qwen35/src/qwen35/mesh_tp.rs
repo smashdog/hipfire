@@ -1050,6 +1050,7 @@ impl<'a> Qwen35TpBindings<'a> {
                     dn_state: &rank.dn,
                     position: start,
                     mrope_section: None,
+                    paged: None,
                 };
                 let output = MixerOutput::Write(&s.o);
                 let layer_weights = &rank.weights.layers[layer];

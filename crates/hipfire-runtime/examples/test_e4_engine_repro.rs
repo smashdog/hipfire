@@ -84,6 +84,7 @@ fn main() {
 
     let (reply_tx, reply_rx) = channel();
     let req = SubmitRequest {
+        query: None,
         prompt_tokens,
         convo: Vec::new(),
         continuation: Continuation::Cold,

@@ -18,10 +18,13 @@
 //! accidental `+=`).
 //!
 //! Arch policy:
-//!   - exact gfx1151: bits ∈ {3,4,5,6} → 4 bits × 4 ops = 16 arms
-//!   - exact gfx1100: bits ∈ {4,5,6}   → 3 bits × 4 ops = 12 arms (MQ3 skipped)
+//!   - exact gfx1151: bits ∈ {3,4,5,6} → 16 arms + MQ3 qkvza/qkv ×2 → 20
+//!   - exact gfx1100: bits ∈ {4,5,6}   → 12 arms (MQ3 skipped);
+//!     `HIPFIRE_MQV2_MW_SCREEN_BITS3=1` adds the MQ3 gate/residual arms here
+//!     plus the MQ3-only qkvza (4 regions) and qkv (3 regions) MW families
+//!     → 20 arms.
 //!   - other arch / no GPU: SKIP exit 0
-//! Cross-arch total is 28 operation arms; each run covers its arch subset.
+//! Cross-arch total is 32 operation arms; each run covers its arch subset.
 //! Exit 0 PASS / 1 FAIL.
 
 use rdna_compute::kv_slots::half_from_f32;
@@ -42,6 +45,17 @@ const RESID_M: usize = 56;
 // Production-boundary N paired 1:1 with MW waves (not a cross product).
 const GATE_NS: [(usize, usize); 2] = [(384, 4), (512, 8)];
 const RESID_NS: [(usize, usize); 2] = [(416, 4), (464, 8)];
+
+// MQ3-only qkvza/qkv region boundaries (each lies inside a 16-row tile).
+const QKVZA_QKV_M: usize = 40;
+const QKVZA_Z_M: usize = 28;
+const QKVZA_BETA_M: usize = 36;
+const QKVZA_ALPHA_M: usize = 16;
+const QKV_Q_M: usize = 40;
+const QKV_K_M: usize = 32;
+const QKV_V_M: usize = 48;
+const QKVZA_NS: [(usize, usize); 2] = [(128, 4), (256, 8)];
+const QKV_NS: [(usize, usize); 2] = [(128, 4), (256, 8)];
 
 const NAN_GATE_BITS: u32 = 0x7fc0_0001;
 const NAN_UP_BITS: u32 = 0x7fc0_0002;
@@ -459,6 +473,233 @@ fn run_residual(gpu: &mut Gpu, bits: u8, n: usize, waves: usize, x_host: &[f32])
     ok
 }
 
+fn launch_base_qkvza(
+    gpu: &mut Gpu,
+    a_qkv: &GpuTensor,
+    a_z: &GpuTensor,
+    a_beta: &GpuTensor,
+    a_alpha: &GpuTensor,
+    x: &GpuTensor,
+    y_qkv: &GpuTensor,
+    y_z: &GpuTensor,
+    y_beta: &GpuTensor,
+    y_alpha: &GpuTensor,
+    n: usize,
+) -> Result<(), String> {
+    gpu.gemm_qkvza_mq3g256v2_wmma_gfx11(
+        a_qkv,
+        a_z,
+        a_beta,
+        a_alpha,
+        x,
+        y_qkv,
+        y_z,
+        y_beta,
+        y_alpha,
+        QKVZA_QKV_M,
+        QKVZA_Z_M,
+        QKVZA_BETA_M,
+        QKVZA_ALPHA_M,
+        K,
+        n,
+    )
+    .map_err(|e| format!("{e:?}"))
+}
+
+fn run_qkvza(gpu: &mut Gpu, n: usize, waves: usize, x_host: &[f32]) -> bool {
+    let bits = 3u8;
+    let w_qkv = build_disjoint_halves_seeded(QKVZA_QKV_M, K, 0x1111_2222 ^ (bits as u32) << 16);
+    let w_z = build_disjoint_halves_seeded(QKVZA_Z_M, K, 0x3333_4444 ^ (bits as u32) << 16);
+    let w_beta = build_disjoint_halves_seeded(QKVZA_BETA_M, K, 0x5555_6666 ^ (bits as u32) << 16);
+    let w_alpha = build_disjoint_halves_seeded(QKVZA_ALPHA_M, K, 0x7777_8888 ^ (bits as u32) << 16);
+    let b_qkv = pack_mqv2(bits, &w_qkv, QKVZA_QKV_M, K);
+    let b_z = pack_mqv2(bits, &w_z, QKVZA_Z_M, K);
+    let b_beta = pack_mqv2(bits, &w_beta, QKVZA_BETA_M, K);
+    let b_alpha = pack_mqv2(bits, &w_alpha, QKVZA_ALPHA_M, K);
+    let d_qkv = upload_blob(gpu, &b_qkv);
+    let d_z = upload_blob(gpu, &b_z);
+    let d_beta = upload_blob(gpu, &b_beta);
+    let d_alpha = upload_blob(gpu, &b_alpha);
+    let d_x = gpu.alloc_tensor(&[n * K], DType::F32).expect("x");
+    htod_f32(gpu, &d_x, x_host);
+
+    let sen = [0x7fc0_0011u32, 0x7fc0_0012, 0x7fc0_0013, 0x7fc0_0014];
+    let lens = [
+        n * QKVZA_QKV_M,
+        n * QKVZA_Z_M,
+        n * QKVZA_BETA_M,
+        n * QKVZA_ALPHA_M,
+    ];
+    let d_y_ref: [GpuTensor; 4] = std::array::from_fn(|i| {
+        let t = gpu.alloc_tensor(&[lens[i]], DType::F32).expect("y ref");
+        fill_f32_quiet_nan(gpu, &t, sen[i]);
+        t
+    });
+    gpu.hip.device_synchronize().unwrap();
+    if let Err(e) = with_base_path(gpu, |gpu| {
+        launch_base_qkvza(
+            gpu,
+            &d_qkv,
+            &d_z,
+            &d_beta,
+            &d_alpha,
+            &d_x,
+            &d_y_ref[0],
+            &d_y_ref[1],
+            &d_y_ref[2],
+            &d_y_ref[3],
+            n,
+        )
+    }) {
+        eprintln!("  [qkvza N={n} MW{waves}] base launch FAIL: {e}");
+        return false;
+    }
+    gpu.hip.device_synchronize().unwrap();
+    let y_ref: [Vec<f32>; 4] =
+        std::array::from_fn(|i| gpu.download_f32(&d_y_ref[i]).expect("dl ref"));
+
+    let d_y_mw: [GpuTensor; 4] = std::array::from_fn(|i| {
+        let t = gpu.alloc_tensor(&[lens[i]], DType::F32).expect("y mw");
+        fill_f32_quiet_nan(gpu, &t, sen[i]);
+        t
+    });
+    gpu.hip.device_synchronize().unwrap();
+    if let Err(e) = gpu.gemm_qkvza_mqv2_wmma_gfx11_mw_lds(
+        3,
+        waves,
+        &d_qkv,
+        &d_z,
+        &d_beta,
+        &d_alpha,
+        &d_x,
+        &d_y_mw[0],
+        &d_y_mw[1],
+        &d_y_mw[2],
+        &d_y_mw[3],
+        QKVZA_QKV_M,
+        QKVZA_Z_M,
+        QKVZA_BETA_M,
+        QKVZA_ALPHA_M,
+        K,
+        n,
+    ) {
+        eprintln!("  [qkvza N={n} MW{waves}] MW launch FAIL: {e:?}");
+        return false;
+    }
+    gpu.hip.device_synchronize().unwrap();
+    let y_mw: [Vec<f32>; 4] = std::array::from_fn(|i| gpu.download_f32(&d_y_mw[i]).expect("dl mw"));
+
+    let labels = ["qkvza.qkv", "qkvza.z", "qkvza.beta", "qkvza.alpha"];
+    let mut ok = true;
+    for i in 0..4 {
+        let left = y_mw[i].iter().filter(|x| x.to_bits() == sen[i]).count();
+        if left != 0 {
+            eprintln!(
+                "  [{} N={n} MW{waves}] {left} sentinel(s) remain",
+                labels[i]
+            );
+            ok = false;
+        }
+        if !check_raw_bits(labels[i], bits, n, waves, &y_mw[i], &y_ref[i]) {
+            ok = false;
+        }
+    }
+    ok
+}
+
+fn launch_base_qkv(
+    gpu: &mut Gpu,
+    a_q: &GpuTensor,
+    a_k: &GpuTensor,
+    a_v: &GpuTensor,
+    x: &GpuTensor,
+    y_q: &GpuTensor,
+    y_k: &GpuTensor,
+    y_v: &GpuTensor,
+    n: usize,
+) -> Result<(), String> {
+    gpu.gemm_qkv_mq3g256v2_wmma_gfx11(
+        a_q, a_k, a_v, x, y_q, y_k, y_v, QKV_Q_M, QKV_K_M, QKV_V_M, K, n,
+    )
+    .map_err(|e| format!("{e:?}"))
+}
+
+fn run_qkv(gpu: &mut Gpu, n: usize, waves: usize, x_host: &[f32]) -> bool {
+    let bits = 3u8;
+    let w_q = build_disjoint_halves_seeded(QKV_Q_M, K, 0xA111_2222 ^ (bits as u32) << 8);
+    let w_k = build_disjoint_halves_seeded(QKV_K_M, K, 0xA333_4444 ^ (bits as u32) << 8);
+    let w_v = build_disjoint_halves_seeded(QKV_V_M, K, 0xA555_6666 ^ (bits as u32) << 8);
+    let b_q = pack_mqv2(bits, &w_q, QKV_Q_M, K);
+    let b_k = pack_mqv2(bits, &w_k, QKV_K_M, K);
+    let b_v = pack_mqv2(bits, &w_v, QKV_V_M, K);
+    let d_q = upload_blob(gpu, &b_q);
+    let d_k = upload_blob(gpu, &b_k);
+    let d_v = upload_blob(gpu, &b_v);
+    let d_x = gpu.alloc_tensor(&[n * K], DType::F32).expect("x");
+    htod_f32(gpu, &d_x, x_host);
+
+    let sen = [0x7fc0_0021u32, 0x7fc0_0022, 0x7fc0_0023];
+    let lens = [n * QKV_Q_M, n * QKV_K_M, n * QKV_V_M];
+    let d_y_ref: [GpuTensor; 3] = std::array::from_fn(|i| {
+        let t = gpu.alloc_tensor(&[lens[i]], DType::F32).expect("y ref");
+        fill_f32_quiet_nan(gpu, &t, sen[i]);
+        t
+    });
+    gpu.hip.device_synchronize().unwrap();
+    if let Err(e) = with_base_path(gpu, |gpu| {
+        launch_base_qkv(
+            gpu,
+            &d_q,
+            &d_k,
+            &d_v,
+            &d_x,
+            &d_y_ref[0],
+            &d_y_ref[1],
+            &d_y_ref[2],
+            n,
+        )
+    }) {
+        eprintln!("  [qkv N={n} MW{waves}] base launch FAIL: {e}");
+        return false;
+    }
+    gpu.hip.device_synchronize().unwrap();
+    let y_ref: [Vec<f32>; 3] =
+        std::array::from_fn(|i| gpu.download_f32(&d_y_ref[i]).expect("dl ref"));
+
+    let d_y_mw: [GpuTensor; 3] = std::array::from_fn(|i| {
+        let t = gpu.alloc_tensor(&[lens[i]], DType::F32).expect("y mw");
+        fill_f32_quiet_nan(gpu, &t, sen[i]);
+        t
+    });
+    gpu.hip.device_synchronize().unwrap();
+    if let Err(e) = gpu.gemm_qkv_mqv2_wmma_gfx11_mw_lds(
+        3, waves, &d_q, &d_k, &d_v, &d_x, &d_y_mw[0], &d_y_mw[1], &d_y_mw[2], QKV_Q_M, QKV_K_M,
+        QKV_V_M, K, n,
+    ) {
+        eprintln!("  [qkv N={n} MW{waves}] MW launch FAIL: {e:?}");
+        return false;
+    }
+    gpu.hip.device_synchronize().unwrap();
+    let y_mw: [Vec<f32>; 3] = std::array::from_fn(|i| gpu.download_f32(&d_y_mw[i]).expect("dl mw"));
+
+    let labels = ["qkv.q", "qkv.k", "qkv.v"];
+    let mut ok = true;
+    for i in 0..3 {
+        let left = y_mw[i].iter().filter(|x| x.to_bits() == sen[i]).count();
+        if left != 0 {
+            eprintln!(
+                "  [{} N={n} MW{waves}] {left} sentinel(s) remain",
+                labels[i]
+            );
+            ok = false;
+        }
+        if !check_raw_bits(labels[i], bits, n, waves, &y_mw[i], &y_ref[i]) {
+            ok = false;
+        }
+    }
+    ok
+}
+
 fn main() {
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
@@ -476,19 +717,23 @@ fn main() {
         return;
     }
 
-    // gfx1100 forbids MQ3 runtime execution; gfx1151 covers MQ3.
-    let bits: &[u8] = if is_gfx1151 {
+    // gfx1100 covers MQ3 MW via the opt-in screen (the production lane is the
+    // 53rd weight-prefill patch; this harness is its raw-bit regression).
+    let screen_bits3_gfx1100 =
+        is_gfx1100 && std::env::var("HIPFIRE_MQV2_MW_SCREEN_BITS3").as_deref() == Ok("1");
+    let bits: &[u8] = if is_gfx1151 || screen_bits3_gfx1100 {
         &[3, 4, 5, 6]
     } else {
         &[4, 5, 6]
     };
-    let expected_arms = bits.len() * 4; // 2 gate N + 2 residual N
+    let qkv_families = is_gfx1151 || screen_bits3_gfx1100;
+    let expected_arms = bits.len() * 4 + if qkv_families { 4 } else { 0 };
 
     eprintln!(
         "arch {arch} confirmed — MQ V2 gfx11 MW_LDS raw-bit parity (bits={bits:?}, expected_arms={expected_arms})"
     );
     eprintln!(
-        "shapes: gate_up=({GATE_M},{UP_M}) residual={RESID_M} K={K} gate_N={{384/MW4,512/MW8}} resid_N={{416/MW4,464/MW8}}"
+        "shapes: gate_up=({GATE_M},{UP_M}) residual={RESID_M} qkvza=({QKVZA_QKV_M},{QKVZA_Z_M},{QKVZA_BETA_M},{QKVZA_ALPHA_M}) qkv=({QKV_Q_M},{QKV_K_M},{QKV_V_M}) K={K} gate_N={{384/MW4,512/MW8}} resid_N={{416/MW4,464/MW8}} proj_N={{128/MW4,256/MW8}}"
     );
     assert!(
         GATE_M > 32 && GATE_M < 48,
@@ -497,6 +742,11 @@ fn main() {
     assert_eq!(GATE_M + UP_M, 93);
     assert_eq!((GATE_M + UP_M) % 16, 13);
     assert_eq!(RESID_M % 16, 8);
+    assert_eq!(
+        (QKVZA_QKV_M + QKVZA_Z_M + QKVZA_BETA_M + QKVZA_ALPHA_M) % 16,
+        8
+    );
+    assert_eq!((QKV_Q_M + QKV_K_M + QKV_V_M) % 16, 8);
 
     if gpu.active_capture.is_some() {
         eprintln!("SKIP: active_capture is Some");
@@ -551,6 +801,47 @@ fn main() {
             );
             all_ok &= ok;
         }
+
+        if b == 3 && qkv_families {
+            for &(n, waves) in &QKVZA_NS {
+                eprintln!("--- qkvza N={n} MW{waves} ---");
+                let x_host: Vec<f32> = (0..n * K)
+                    .map(|i| {
+                        prng(
+                            i,
+                            0xD00D_EE00 ^ ((b as u32) << 20) ^ (n as u32) ^ ((waves as u32) << 8),
+                        ) * 2.0
+                            - 1.0
+                    })
+                    .collect();
+                let ok = run_qkvza(&mut gpu, n, waves, &x_host);
+                arms += 1;
+                eprintln!(
+                    "  ARM bits={b} qkvza N={n} MW{waves}: {}",
+                    if ok { "PASS" } else { "FAIL" }
+                );
+                all_ok &= ok;
+            }
+            for &(n, waves) in &QKV_NS {
+                eprintln!("--- qkv N={n} MW{waves} ---");
+                let x_host: Vec<f32> = (0..n * K)
+                    .map(|i| {
+                        prng(
+                            i,
+                            0xBEEF_6600 ^ ((b as u32) << 20) ^ (n as u32) ^ ((waves as u32) << 8),
+                        ) * 2.0
+                            - 1.0
+                    })
+                    .collect();
+                let ok = run_qkv(&mut gpu, n, waves, &x_host);
+                arms += 1;
+                eprintln!(
+                    "  ARM bits={b} qkv N={n} MW{waves}: {}",
+                    if ok { "PASS" } else { "FAIL" }
+                );
+                all_ok &= ok;
+            }
+        }
     }
 
     assert_eq!(
@@ -559,7 +850,7 @@ fn main() {
     );
     if all_ok {
         eprintln!(
-            "\nPASS: all {arms} arms on {arch} (bits{bits:?} × ops{{gate_up×2, residual×2}}) raw f32::to_bits equal; finite/nondegenerate; residual Y+= preserved; gate/up overwrite"
+            "\nPASS: all {arms} arms on {arch} (bits{bits:?} × ops{{gate_up×2, residual×2, qkvza×2, qkv×2}}) raw f32::to_bits equal; finite/nondegenerate; residual Y+= preserved; gate/up/qkvza/qkv overwrite"
         );
     } else {
         eprintln!("\nFAIL: one or more of {arms} raw-bit parity arms failed on {arch}");

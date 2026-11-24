@@ -64,7 +64,9 @@ use hip_bridge::{DeviceBuffer, HipError, HipResult};
 use hipfire_dispatch::pipeline::gated_mlp::{
     Activation, GatedMlpOp, GatedMlpScratch, MlpLadder, MlpOutput, MlpStorage, RmsNorm,
 };
-use hipfire_dispatch::pipeline::hybrid::{AttentionKv, AttentionRow, GatedAttentionOp, HybridDims};
+use hipfire_dispatch::pipeline::hybrid::{
+    AttentionKv, AttentionRow, GatedAttentionOp, HybridDims, PagedAttentionKv,
+};
 use hipfire_dispatch::pipeline::{execute_steps, Step};
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
@@ -810,32 +812,50 @@ impl Qwen35MtpHeadKvCache {
         config: &Qwen35MtpHeadConfig,
         kv_mode: MtpKvMode,
     ) -> HipResult<Self> {
+        Self::new_with_kv_mode_bounded(gpu, config, kv_mode, config.max_seq)
+    }
+
+    /// P4.1② f2 (E): allocate the head KV cache BOUNDED to `max_seq` tokens
+    /// instead of the full `config.max_seq`. Under Layerwise+MTP the head is
+    /// bounded to the trunk working-set window plus one native draft-scratch
+    /// block (`head_pool_capacity(window) = window + KV_BLOCK_TOKENS`); accepted
+    /// history beyond the window is co-archived to the composite aux plane and
+    /// restored-before-attend (G4), never kept full-resident. The head ALGORITHM
+    /// is unchanged (Q4=b) — only KV residency is bounded. `max_seq ==
+    /// config.max_seq` reproduces [`Self::new_with_kv_mode`] byte-for-byte
+    /// (Legacy / full-resident path).
+    pub fn new_with_kv_mode_bounded(
+        gpu: &mut Gpu,
+        config: &Qwen35MtpHeadConfig,
+        kv_mode: MtpKvMode,
+        max_seq: usize,
+    ) -> HipResult<Self> {
         let inner = match kv_mode {
             MtpKvMode::Q8 => hipfire_runtime::llama::KvCache::new_gpu_q8(
                 gpu,
                 /* n_layers */ 1,
                 config.n_head_kv,
                 config.head_dim,
-                config.max_seq,
+                max_seq,
             )?,
             MtpKvMode::Asym3 => hipfire_runtime::llama::KvCache::new_gpu_asym3(
                 gpu,
                 /* n_layers */ 1,
                 config.n_head_kv,
                 config.head_dim,
-                config.max_seq,
+                max_seq,
             )?,
             MtpKvMode::Fwht4 => hipfire_runtime::llama::KvCache::new_gpu_fwht4(
                 gpu,
                 /* n_layers */ 1,
                 config.n_head_kv,
                 config.head_dim,
-                config.max_seq,
+                max_seq,
             )?,
         };
         Ok(Self {
             inner,
-            max_seq: config.max_seq,
+            max_seq,
             n_head_kv: config.n_head_kv,
             head_dim: config.head_dim,
             kv_mode,
@@ -892,6 +912,42 @@ impl Qwen35MtpHeadKvCache {
         // which already bypass this wrapper for the same reason.)
         let _ = self.inner.free_gpu(gpu);
     }
+}
+
+/// P4.1② G4: the MTP head's BOUNDED paged KV addressing for the Layerwise
+/// restore-before-attend path (design §A.8, ninfer `final_hidden` NL:10259-10339).
+/// Supplied to [`mtp_head_forward_block_only_with_pos_buf`], the single decode
+/// row's K/V write+attend routes through `kv_attention_paged` over the restored
+/// bounded head arena — `kv_attention` IGNORES `tier`/`compact_offset`/`givens_*`
+/// under `paged` and writes K/V through the block table itself, so the head
+/// ALGORITHM is unchanged; only KV residency is bounded (Q4=b).
+///
+/// Coordinate contract (the two ninfer coordinates, `layerwise_mtp.rs`):
+/// `positions` is the COMPACT write position (compact frame:
+/// `begin + i - auxiliary_removed_tokens`) the paged writer addresses;
+/// `rope_pos_buf` carries the GLOBAL RoPE position (global frame:
+/// `begin + i + rope_delta`) the attend kernel reads. `descs`/`row_slot`/`ctx_len`
+/// come from [`LayerwiseDriver::head_layer_views`], `k_view`/`v_view` from
+/// [`LayerwiseDriver::head_arena_views`]. Legacy / AR-only pass `None` and keep
+/// the full-resident contiguous cache byte-for-byte.
+///
+/// [`LayerwiseDriver::head_layer_views`]: crate::layerwise_driver::LayerwiseDriver::head_layer_views
+/// [`LayerwiseDriver::head_arena_views`]: crate::layerwise_driver::LayerwiseDriver::head_arena_views
+pub struct HeadPagedKv<'a> {
+    /// Bounded head arena K base (aliases the head arena allocation).
+    pub k_view: &'a GpuTensor,
+    /// Bounded head arena shifted V base.
+    pub v_view: &'a GpuTensor,
+    /// COMPACT write position (device i32, one element) — the paged KV write slot.
+    pub positions: &'a GpuTensor,
+    /// Head slot block table (device `KvSlotDesc` array).
+    pub descs: &'a GpuTensor,
+    /// Head slot id (device i32, one element).
+    pub row_slot: &'a GpuTensor,
+    /// Context cap the paged tile grid / reduce span are sized from.
+    pub ctx_len: usize,
+    /// GLOBAL RoPE position buffer (device i32) the paged attend reads.
+    pub rope_pos_buf: &'a DeviceBuffer,
 }
 
 // ─── Top-level handle ────────────────────────────────────────────────────
@@ -2567,6 +2623,7 @@ pub fn mtp_head_forward_block_only(
         pos,
         pos + 1,
         trunk_weights,
+        None,
     )
 }
 
@@ -2591,6 +2648,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     pos: usize,
     seq_len_hint: usize,
     trunk_weights: &Qwen35Weights,
+    paged: Option<&HeadPagedKv<'_>>,
 ) -> HipResult<()> {
     let cfg = &head.config;
     let w = &head.weights;
@@ -2603,11 +2661,17 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
         "mtp_head_forward_block_only_with_pos_buf: prev_hidden has {} elems but expected n_embd={n_embd}",
         prev_hidden.numel(),
     );
-    assert!(
-        pos < kv.max_seq,
-        "mtp_head_forward_block_only_with_pos_buf: pos={pos} >= kv.max_seq={}",
-        kv.max_seq,
-    );
+    // Full-resident path: the global write position must fit the contiguous
+    // cache. Under the bounded paged pool `pos` is the global frontier hint and
+    // may exceed the pool capacity — the COMPACT write position (`paged.positions`)
+    // is the real bound, validated by the head staging geometry, so skip this assert.
+    if paged.is_none() {
+        assert!(
+            pos < kv.max_seq,
+            "mtp_head_forward_block_only_with_pos_buf: pos={pos} >= kv.max_seq={}",
+            kv.max_seq,
+        );
+    }
 
     // ── 1. Token embedding (table lookup OR caller-supplied override) ────
     let dim_bytes = n_embd * 4;
@@ -2654,6 +2718,26 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     // flash_partials is sized with the same tile the launch picks (see
     // `Qwen35MtpHeadScratch::new`).
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+    // P4.1② G4: under the Layerwise bounded head pool, route this decode row's
+    // K/V write+attend through the restored head arena's block table
+    // (`kv_attention_paged` writes K/V at the COMPACT `positions` and attends the
+    // GLOBAL RoPE `rope_pos_buf`; `kv_attention` ignores tier/compact_offset/givens
+    // under `paged`). Legacy / AR-only (`None`) keep the full-resident contiguous
+    // cache and `pos_buf` byte-for-byte. The head algorithm is identical either way.
+    let (k_cache, v_cache, paged_kv, rope_buf) = match paged {
+        Some(p) => (
+            p.k_view,
+            p.v_view,
+            Some(PagedAttentionKv {
+                positions: p.positions,
+                descs: p.descs,
+                row_slot: p.row_slot,
+                ctx_len: p.ctx_len,
+            }),
+            p.rope_pos_buf,
+        ),
+        None => (&kv.inner.k_gpu[0], &kv.inner.v_gpu[0], None, pos_buf),
+    };
     let attention = GatedAttentionOp {
         dims: cfg.hybrid_dims(),
         x: &scratch.cur,
@@ -2670,16 +2754,17 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
                 flash_mode: llama::attention_flash_mode(&gpu.arch),
                 ..kv.inner.tier_inputs()
             },
-            k_cache: &kv.inner.k_gpu[0],
-            v_cache: &kv.inner.v_gpu[0],
+            k_cache,
+            v_cache,
             physical_cap: kv.inner.physical_cap,
             givens_cos: kv.inner.givens_cos.as_ref(),
             givens_sin: kv.inner.givens_sin.as_ref(),
             compact_offset: 0,
+            paged: paged_kv,
         },
         row: AttentionRow {
             position: seq_len_hint - 1,
-            pos_buf,
+            pos_buf: rope_buf,
             q: &scratch.q,
             k: &scratch.k,
             v: &scratch.v,
@@ -3446,6 +3531,13 @@ pub fn mtp_head_forward_block_batched(
     trunk_weights: &Qwen35Weights,
     rotated_x_scratch: Option<&GpuTensor>,
     kv_only: bool,
+    // P4.1② f2 (E): the Layerwise bounded-pool RoPE shift (= ninfer
+    // `cache_position_shift` = `auxiliary_removed_tokens`, NL:8442-8443).
+    // `positions` are the COMPACT pool-local KV-write slots; RoPE must stay at
+    // the GLOBAL coordinate, so the kernel rotates at `positions + rope_shift`
+    // while K/V land at `positions`. `0` ⇒ compact == global (full-resident /
+    // Legacy): byte-identical to the pre-E single-coordinate path.
+    rope_shift: i32,
 ) -> HipResult<()> {
     // qt53 has only the serial decode route: typed refusal before ANY launch
     // (attention included), never the generic batched-MoE panic below.
@@ -3709,6 +3801,20 @@ pub fn mtp_head_forward_block_batched(
     // ── 5. Batched RoPE on Q + K ─────────────────────────────────────────
     // fast_fill (kv_only): Q is never consumed (return follows the K/V cache
     // writes), so rope runs with zero Q heads over the same valid q_view.
+    //
+    // P4.1② f2 (E): under the Layerwise bounded pool the KV-write slots held in
+    // `scratch.positions` are COMPACT (global - removed); RoPE must rotate at
+    // the GLOBAL coordinate. ninfer folds `removed` into `io.rope_delta`
+    // (NL:8443); the equivalent here is a temporary global-position upload for
+    // the RoPE kernel, then restoring the compact slots for the K/V writes
+    // below. `rope_shift == 0` keeps the single-coordinate path byte-identical
+    // (no extra copies, same kernel arguments).
+    if rope_shift != 0 {
+        let rope_positions: Vec<i32> = positions.iter().map(|&p| p + rope_shift).collect();
+        let rope_bytes =
+            unsafe { std::slice::from_raw_parts(rope_positions.as_ptr() as *const u8, n * 4) };
+        gpu.hip.memcpy_htod(&scratch.positions.buf, rope_bytes)?;
+    }
     gpu.rope_partial_interleaved_f32_batched(
         &q_view,
         &k_view,
@@ -3722,6 +3828,11 @@ pub fn mtp_head_forward_block_batched(
         // pos_offset=0: MTP head has its own non-compacted KV. Unchanged behavior.
         0,
     )?;
+    if rope_shift != 0 {
+        // Restore the COMPACT write slots for the K/V cache writes below.
+        gpu.hip
+            .memcpy_htod(&scratch.positions.buf, position_bytes)?;
+    }
 
     // ── 6. v1 simplification: per-slot K/V writes + attention = V
     // ─────────────────────────────────────────────────────────────────────

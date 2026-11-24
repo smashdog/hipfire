@@ -230,8 +230,8 @@ mod tests {
 
     #[test]
     fn rejects_dims_that_are_not_h128_shaped() {
-        let e = fold_escha_linear(&[0u16; 100 * 128], 100, 128, &[1.0; 100], &[1.0; 128])
-            .unwrap_err();
+        let e =
+            fold_escha_linear(&[0u16; 100 * 128], 100, 128, &[1.0; 100], &[1.0; 128]).unwrap_err();
         assert!(e.contains("multiple of 128"), "{e}");
     }
 }

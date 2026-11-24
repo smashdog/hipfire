@@ -98,6 +98,10 @@ const ATTN_FP8_LOAD_EDITS: &[(&str, &str)] = &[
     ),
     (
         "        for (int t = 0; t < eff_seq_len; t++) {
+            // KVMem residency (P4.4): spilled page weight is zero; skip the read.
+            if (!kv_page_present(desc, t)) {
+                continue;
+            }
             const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
             const float vs = (float)*((const _Float16*)(vrow + scale_off));
             val += scores[t] * (vs * hipfire_fp8_e4m3_to_f32_batched(vrow[k_head_off + d]));
@@ -107,17 +111,30 @@ const ATTN_FP8_LOAD_EDITS: &[(&str, &str)] = &[
         for (; t + 8 <= eff_seq_len; t += 8) {
             float vsu[8];
             unsigned char vbu[8];
+            bool vpr[8];
             #pragma unroll
             for (int u = 0; u < 8; u++) {
+                // KVMem residency (P4.4): spilled page weight is zero; skip the read.
+                vpr[u] = kv_page_present(desc, t + u);
+                if (!vpr[u]) {
+                    vsu[u] = 0.0f;
+                    vbu[u] = 0;
+                    continue;
+                }
                 const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t + u, per_pos_bytes);
                 vsu[u] = (float)*((const _Float16*)(vrow + scale_off));
                 vbu[u] = vrow[k_head_off + d];
             }
             #pragma unroll
             for (int u = 0; u < 8; u++)
-                val += scores[t + u] * (vsu[u] * hipfire_fp8_e4m3_to_f32_batched(vbu[u]));
+                if (vpr[u])
+                    val += scores[t + u] * (vsu[u] * hipfire_fp8_e4m3_to_f32_batched(vbu[u]));
         }
         for (; t < eff_seq_len; t++) {
+            // KVMem residency (P4.4): spilled page weight is zero; skip the read.
+            if (!kv_page_present(desc, t)) {
+                continue;
+            }
             const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
             const float vs = (float)*((const _Float16*)(vrow + scale_off));
             val += scores[t] * (vs * hipfire_fp8_e4m3_to_f32_batched(vrow[k_head_off + d]));

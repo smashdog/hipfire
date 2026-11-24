@@ -53,6 +53,48 @@ use hipfire_runtime::serve_wait::WaitQueue;
 use hipfire_runtime::slot_batch::SlotBatch;
 use hipfire_runtime::tokenizer::Tokenizer;
 
+#[cfg(feature = "kvmem")]
+#[path = "serve_engine_kvmem.rs"]
+mod kvmem_engine;
+
+#[path = "serve_engine_kvmem_hooks.rs"]
+mod kvmem_hooks;
+
+#[path = "serve_engine_admit.rs"]
+mod serve_engine_admit;
+
+#[path = "serve_engine_model.rs"]
+mod serve_engine_model;
+
+use self::kvmem_hooks::{
+    kvmem_dflash_validation_error, kvmem_enabled, kvmem_legacy_enabled, kvmem_requested,
+    legacy_continuation_matches, trace_continuation_divergence,
+};
+
+#[cfg(feature = "kvmem")]
+use self::kvmem_engine::{
+    advance_legacy_query_replay, kvmem_freeze_endpoint, restore_legacy_native_image,
+    LegacyNativeImage, LegacyQueryRun,
+};
+
+/// A live VL session may only be extended when the request's current image is
+/// the same media the session's prefix was built from. Token ids cannot
+/// distinguish two images (their `image_pad` runs are identical), so the
+/// sticky content digest is the only safe gate. A text follow-up carries no
+/// new image and inherits the session's digest unchanged.
+fn media_continuation_matches(
+    session: &hipfire_runtime::session_table::Session,
+    visual: Option<&hipfire_runtime::serve::VisualData>,
+) -> bool {
+    if !session.has_image {
+        return true;
+    }
+    match visual.map(|vd| vd.media_digest()) {
+        Some(digest) => session.media_digest.is_none_or(|held| held == digest),
+        None => true,
+    }
+}
+
 /// Internal control plane for the engine thread. Public methods map onto these
 /// messages; the GPU rig stays exclusively on that thread.
 ///
@@ -73,11 +115,25 @@ enum EngineCommand {
     Reset {
         reply: Sender<Result<(), String>>,
     },
+    /// Cooperative in-turn pass termination (think-recovery): end the
+    /// CURRENT pass of `session` at the next token boundary but keep the
+    /// session's KV resident, so the daemon can immediately start a
+    /// continuation pass against the accepted prefix. The engine reports
+    /// `Done { reason: MaxTokens }` for the interrupted pass; the daemon
+    /// distinguishes it from a real budget exhaustion by the request it
+    /// sent. No-op when the session has no in-flight slot (already done,
+    /// parked, or unknown) — interruption is advisory, not synchronous.
+    Interrupt {
+        session: u64,
+    },
 }
 
 #[derive(Clone)]
 pub struct EngineConfig {
     pub model_path: PathBuf,
+    /// Resolved public KVMem contract carried by the daemon configure message.
+    /// None retains the existing non-public/Layerwise configuration route.
+    pub kvmem: Option<hipfire_config::kvmem::ResolvedConfig>,
     pub n_slots: usize,
     pub cap_tokens: usize,
     /// Prefill tokens taken from one slot per step. Bounds the batch scratch
@@ -207,6 +263,17 @@ impl SlotEngine {
         }
     }
 
+    /// Ask the engine to end the CURRENT pass of `session` at the next token
+    /// boundary while keeping its KV resident (think-recovery pass loop).
+    /// Fire-and-forget: the daemon observes the pass end through the request's
+    /// `Done { reason: MaxTokens }` event. Idempotent and safe to call for a
+    /// session that is already done (no-op).
+    pub fn interrupt(&self, session: u64) {
+        if let Some(tx) = self.tx.as_ref() {
+            let _ = tx.send(EngineCommand::Interrupt { session });
+        }
+    }
+
     /// Close a session synchronously. If the session is mid-generation its
     /// in-flight request is cancelled (InFlight removed, reply sender dropped,
     /// work cleared), swap forgotten and SessionTable/pool/admission closed,
@@ -284,9 +351,14 @@ impl SlotEngine {
                         // daemon reports the effective budgets and usage.
                         if let Ok(mut st) = stats_thread.lock() {
                             st.note_swap(&rig.swap);
+                            st.speculative = rig.speculative_config();
                         }
                         let _ = ready_tx.send(Ok(()));
-                        run_loop(rig, rx, stats_thread)
+                        let result = run_loop(rig, rx, stats_thread);
+                        if let Err(error) = &result {
+                            eprintln!("[serve] engine loop exited: {error}");
+                        }
+                        result
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e.clone()));
@@ -347,6 +419,9 @@ impl hipfire_runtime::serve::SlotEngineHandle for SlotEngine {
     }
     fn cancel_waiting(&self, request_tag: u64) {
         SlotEngine::cancel_waiting(self, request_tag)
+    }
+    fn interrupt(&self, session: u64) {
+        SlotEngine::interrupt(self, session)
     }
     fn close(&self, session: u64) -> Result<(), String> {
         SlotEngine::close(self, session)
@@ -456,9 +531,10 @@ struct ModelRig {
     /// Per-slot MTP spec state. None for slots that haven't started MTP yet
     /// or when MTP is off. Allocated lazily on first MTP prefill.
     mtp_states: Vec<Option<crate::mtp_spec::MtpSpecState>>,
-    /// Per-slot MTP request sampling/penalty config, installed at admit and
-    /// applied on the slot's first draft step (see [`MtpReqSampling`]).
-    mtp_req_sampling: Vec<Option<MtpReqSampling>>,
+    /// Per-slot spec request sampling/penalty config (MTP and DFlash alike),
+    /// parked at admit and applied on the slot's first draft step (see
+    /// [`MtpReqSampling`]).
+    spec_req_sampling: Vec<Option<MtpReqSampling>>,
     /// Batched scratch (+ per-row FWHT-rot buffer) for MTP head-KV prefill
     /// from the scheduler's batched prompt chunks. None when MTP is off.
     mtp_prefill_batched: Option<(crate::mtp_head::Qwen35MtpHeadBatchedScratch, GpuTensor)>,
@@ -476,6 +552,11 @@ struct ModelRig {
     /// both exist — the tape stride and graph-shape check use this uniform
     /// width).
     spec_rows: usize,
+    /// Resolved spec → AR retirement break-even line, shared with the
+    /// sequential drafter ([`hipfire_runtime::spec_retire`]). Parsed once at
+    /// load from `HIPFIRE_SPEC_RETIRE` (else the shared default); `None`
+    /// never retires. Installed per request at admit into `PendingWork`.
+    spec_retire_break_even: Option<hipfire_runtime::spec_retire::BreakEven>,
     /// Shared DFlash2 draft state (weights + hidden staging). None when
     /// DFlash is off.
     dflash: Option<crate::dflash_slot::DflashShared>,
@@ -500,63 +581,34 @@ struct ModelRig {
     /// Cross-session recurrent-state checkpoint pool (spec §4.5 C5).
     /// None when `prefix_cache` is off.
     checkpoint_pool: Option<crate::checkpoint::CheckpointPool<DeltaNetSnapshot>>,
+    /// KVMem host-offload controller. None when `HIPFIRE_KVMEM` is off (or
+    /// the crate was built without the `kvmem` feature). Owns the per-slot
+    /// host stores and the residency decision; the GPU KV stays in the paged
+    /// arenas, with unselected full pages replaced by `SPILLED_PAGE`.
+    #[cfg(feature = "kvmem")]
+    kvmem: Option<crate::kvmem_ctl::KvMemCtl>,
 }
 
-impl ModelRig {
-    /// One batched forward step across the N slots (spec §5.2). Wraps
-    /// `forward_slots::forward_batch_slots_graphed_opts` with every model
-    /// field drawn from `self`; the capture is built internally from
-    /// `any_verify`/`any_dflash_rows` so the engine loop never names model
-    /// buffers. `gpu`/`pool`/`graph`/`batch`/`lm_head_skip` are the
-    /// family-neutral engine pieces passed in by the caller.
-    fn forward_step(
-        &mut self,
-        gpu: &mut Gpu,
-        batch: &SlotBatch,
-        pool: &mut SlotPool,
-        graph: &mut SlotDecodeGraph,
-        lm_head_skip: &[bool],
-        any_verify: bool,
-        any_dflash_rows: bool,
-    ) -> rdna_compute::HipResult<()> {
-        let mut capture = (any_verify || any_dflash_rows).then(|| {
-            let tape = self
-                .spec_verify_tape
-                .as_mut()
-                .expect("spec drafts require the verify tape");
-            crate::forward_slots::SpecVerifyCapture {
-                tape,
-                verify_slots: lm_head_skip,
-                stride: self.spec_rows,
-                hidden: if any_dflash_rows {
-                    self.dflash
-                        .as_ref()
-                        .map(|d| d.hidden_capture(self.config.dim))
-                } else {
-                    None
-                },
-            }
-        });
-        crate::forward_slots::forward_batch_slots_graphed_opts(
-            gpu,
-            &self.weights,
-            &self.config,
-            batch,
-            pool,
-            &mut self.dn_states,
-            &self.k_arenas,
-            &self.v_arenas,
-            &mut self.desc_staging,
-            &self.kv_tier,
-            &self.pbs,
-            &self.scratch,
-            &self.logits_out,
-            graph,
-            self.spec_rows,
-            lm_head_skip,
-            capture.as_mut(),
-        )
+#[derive(Clone, Copy, Debug, Default)]
+struct SpecCounters {
+    requested: bool,
+    rounds: u64,
+    drafted: u64,
+    accepted: u64,
+    generated: u64,
+    fallback: u64,
+}
+
+/// 期3 G3: stable internal content group from the conversation identity.
+/// Fairness hint only (never a reuse proof); an empty convo is unknown (0).
+fn convo_group(convo: &[u64]) -> u64 {
+    if convo.is_empty() {
+        return 0;
     }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    convo.hash(&mut h);
+    h.finish()
 }
 
 struct Rig {
@@ -580,6 +632,21 @@ struct Rig {
     /// the only paged-compatible mode).
     vl_sequential: bool,
     sessions: SessionTable,
+    #[cfg(feature = "kvmem")]
+    legacy_history:
+        Option<crate::legacy_catalog::LegacyHistoryCatalog<std::rc::Rc<LegacyNativeImage>>>,
+    #[cfg(feature = "kvmem")]
+    legacy_queries: Vec<Option<LegacyQueryRun>>,
+    /// This request's Query decision is final: either a run was built, or
+    /// there is no recall to attempt. Cleared with `legacy_queries` at every
+    /// request/session lifecycle boundary.
+    #[cfg(feature = "kvmem")]
+    legacy_query_decided: Vec<bool>,
+    /// Spec kind the slot's last admitted request actually ran with. Parking a
+    /// history image uses it so MTP/DFlash draft state is captured too; a
+    /// draft-less image can only be reused by a draft-less request.
+    #[cfg(feature = "kvmem")]
+    legacy_spec_kind: Vec<SpecKind>,
     adm: AdmissionController,
     swap: SwapManager,
     stamp: SnapshotStamp,
@@ -613,6 +680,25 @@ struct Rig {
     cache_domain: Option<hipfire_runtime::serve_contract::CacheDomain>,
     /// True when cross-session prefix reuse is enabled.
     prefix_cache: bool,
+    /// P4.3: true when KVMem-native prefix sharing is enabled
+    /// (`HIPFIRE_KVMEM_PREFIX_PIN`, opt-in under KVMem). The radix stays off;
+    /// canonical prefixes freeze into the KVMem catalog and their sealed GPU
+    /// pages are PIN-shared across sessions.
+    kvmem_prefix_pin: bool,
+    /// P2.2b2: decode-side coverage DN captures (`HIPFIRE_KVMEM_PREFIX_COVERAGE`,
+    /// opt-in with PREFIX_PIN). Endpoint reuse needs a recurrent checkpoint at
+    /// the page-aligned frontier it freezes, and the live state cannot rewind.
+    kvmem_prefix_coverage: bool,
+    /// Coverage capture cadence in tokens (page-aligned; default 1024).
+    kvmem_prefix_coverage_interval: usize,
+    /// P3.2 checkpoint policy (`HIPFIRE_KVMEM_CHECKPOINT_POLICY=spread`):
+    /// `(interval, min_gap)` gating the prefill freeze cadence with the core
+    /// `CheckpointCapturePlan`. `None` = legacy (freeze every boundary).
+    kvmem_checkpoint_policy: Option<(u64, u64)>,
+    /// 期4: per-slot speculative counters (completed-request statistics,
+    /// nInfer `speculative.hpp` scope). Reset at admit, folded into
+    /// `EngineStats.speculative` at the terminal event.
+    spec_counters: Vec<SpecCounters>,
     /// The configured `serve.prefix_cache_max_bytes` ceiling. Retained on
     /// the Rig so the Reset path can re-apply it to the replacement index
     /// (`PrefixIndex::new` starts with no ceiling; losing it on reset
@@ -747,6 +833,31 @@ fn slot_snapshot_kv_tag(kv_mode: hipfire_runtime::kv_mode::KvMode) -> u32 {
 }
 
 impl Rig {
+    /// 期4: the speculative contract snapshot (schema + resolved config).
+    /// Statistics start zero and accumulate at request completion; the schema
+    /// version comes from the KVMem core contract on `kvmem` builds.
+    fn speculative_config(&self) -> hipfire_runtime::serve::SpeculativeStats {
+        let mut out = hipfire_runtime::serve::SpeculativeStats::default();
+        out.schema_version = 1;
+        #[cfg(feature = "kvmem")]
+        {
+            out.schema_version = hipfire_kvmem::speculative_schema_version();
+        }
+        if let Some(d) = self.model.dflash.as_ref() {
+            out.enabled = true;
+            out.algorithm = 3; // kvmem::SpeculativeAlgorithm::DFlash2
+                               // B verify rows = seed + (B−1) proposals.
+            out.draft_tokens = d.block_size.saturating_sub(1) as u64;
+        } else if self.model.mtp_head.is_some() && self.model.mtp_k > 0 {
+            out.enabled = true;
+            out.algorithm = 1; // kvmem::SpeculativeAlgorithm::Mtp
+            out.draft_tokens = self.model.mtp_k as u64;
+            out.adaptive = false;
+        }
+        out.ngram_draft_tokens = 0;
+        out
+    }
+
     /// Resolve the placement the slots path loads with.
     ///
     /// `Full`/`Full` returns the all-device placement with no capacity check — the
@@ -895,7 +1006,7 @@ impl Rig {
         use hipfire_runtime::tokenizer::Tokenizer;
         use rdna_compute::kv_slots::preflight_alloc;
 
-        let (session_ttl, session_max) = session_policy_from_config();
+        let (session_ttl, session_max) = serve_engine_admit::session_policy_from_config();
         let mut hfq = HfqFile::open(&cfg.model_path).map_err(|e| format!("open model: {e}"))?;
         let config = qwen35::config_from_hfq(&hfq).map_err(|e| format!("config: {e}"))?;
         let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
@@ -966,7 +1077,39 @@ impl Rig {
         .map_err(|e| format!("kv mode {kv_mode:?}: {e}"))?;
         let per_pos_bytes = kv_plan.k_bytes_per_pos;
         let per_pos_v_bytes = kv_plan.v_bytes_per_pos;
+        // Escha trellis checkpoints (wire qt 42/43) now batch prefill like every
+        // other model: the slot bodies run a grouped-GEMM escha arm (one weight
+        // read per (layer,batch)) and `qwen35_layer_batch_admissible` admits
+        // them, so the old `prefill_chunk=1` serialization workaround is gone.
         let prefill_chunk = cfg.prefill_chunk.max(1).min(cfg.cap_tokens.max(1));
+        // Reference-test override: force the engine's prefill quantum independent
+        // of the wire/CLI scratch budget. The CLI clamps `max_batch_tokens` to
+        // `prefill_chunk * n_slots`, and FairQueue requires
+        // `max_batch_tokens >= n_slots + prefill_min_tokens`, so a wire
+        // `prefill_chunk=1` (scratch 1) is an invalid serve config for ANY model.
+        // Setting HIPFIRE_PREFILL_CHUNK_OVERRIDE=1 while leaving the CLI chunk at
+        // its default keeps the wire budget valid (FairQueue passes) yet drives
+        // every prefill step at n==1 -> use_reference_decode -> the lowered
+        // per-token ladder. This is the apples-to-apples serial reference for the
+        // batched-vs-serial recall A/B (same paged KV, attention, and decode; only
+        // the prefill quantum differs). Unset => no change (batched prefill).
+        let prefill_chunk = hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_OVERRIDE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.max(1).min(cfg.cap_tokens.max(1)))
+            .unwrap_or(prefill_chunk);
+        let prefill_chunk = if let Some(kvmem) = cfg.kvmem.as_ref().filter(|c| c.enabled) {
+            let effective = prefill_chunk.min(kvmem.gen_reserve_tokens as usize);
+            if effective == 0 {
+                return Err("kvmem: normalized prefill and reserve must allow a native row".into());
+            }
+            if effective != prefill_chunk {
+                eprintln!("[kvmem-config] prefill requested={prefill_chunk} effective={effective} reason=reserve_limit");
+            }
+            effective
+        } else {
+            prefill_chunk
+        };
         // DFlash2 draft config pre-parse: the runtime block size B sets
         // `spec_rows` (verify rows per spec slot), which `max_batch` and the
         // verify tape are sized by — both allocated before the GPU-side
@@ -1007,10 +1150,96 @@ impl Rig {
         // set_seq_len errors before any kernel writes through the missing
         // page); a larger count over-subscribes physical VRAM and is the
         // operator's call.
+        // ── KVMem host offload (HIPFIRE_KVMEM=1) ───────────────────────────
+        // KVMem takes over residency for the FullAttention pages: the pool
+        // keeps a bounded per-slot working set, and the rest of each
+        // conversation's KV lives in the host store, restored on selection.
+        // Requirements: the paged Q8 pool (the spill/restore path moves the
+        // packed Q8 rows verbatim and the masked kernels are Q8-only), and
+        // the batched VL path (the legacy sequential path writes through a
+        // flat slab view that paged mode cannot honour, and its single-token
+        // forwards bypass the step batch the statistics taps follow).
+        let kvmem_on = match cfg.kvmem.as_ref() {
+            Some(config) => config.enabled,
+            None => kvmem_requested()?,
+        };
+        #[cfg(not(feature = "kvmem"))]
+        if kvmem_on {
+            return Err(
+                "KVMem was requested but this worker was built without feature kvmem".into(),
+            );
+        }
+        // 期4: KVMem + DFlash2 validation matrix (KVMem/nInfer integration
+        // pattern). Unsupported combinations are rejected at load — never a
+        // silent degrade — mirroring the backend's parse/normalize checks.
+        // The native MTP head and a DFlash2 draft are mutually exclusive
+        // (nInfer: "The main model does not load its MTP head for DFlash2");
+        // the KVMem DFlash lane is single-sequence. Split/legacy draft shapes
+        // stay legal under KVMem but only run the Legacy capped path; the
+        // Layerwise admission checks the all-sliding windowed shape per step.
+        if let Some(err) = kvmem_dflash_validation_error(
+            kvmem_on,
+            cfg.dflash_draft.is_some(),
+            cfg.mtp_k,
+            cfg.n_slots,
+        ) {
+            return Err(err);
+        }
+        let vl_sequential = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
+            .ok()
+            .is_some_and(|v| v == "1" || v == "on" || v == "true");
+        if kvmem_on {
+            // P4.4: KVMem admits every KV tier whose paged batched attention
+            // kernel carries the kv_page_present residency mask (ninfer
+            // multi-format admission pattern). Q8 + the 8 non-Q8 tiers are
+            // masked (flat f16/bf16, rotated asym/fwht, fp8 as a q8 TU variant);
+            // spill/restore is byte-opaque and mean-K is F32 pre-RoPE, so the
+            // host path is tier-generic. Per-tier head_dim / hardware constraints
+            // fail closed downstream in SlotKvTierPlan::resolve / kernel admission.
+            match kv_mode {
+                hipfire_runtime::kv_mode::KvMode::Q8
+                | hipfire_runtime::kv_mode::KvMode::Bf16
+                | hipfire_runtime::kv_mode::KvMode::F16
+                | hipfire_runtime::kv_mode::KvMode::Asym2
+                | hipfire_runtime::kv_mode::KvMode::Asym3
+                | hipfire_runtime::kv_mode::KvMode::Asym4
+                | hipfire_runtime::kv_mode::KvMode::Fwht2
+                | hipfire_runtime::kv_mode::KvMode::Fwht3
+                | hipfire_runtime::kv_mode::KvMode::Fwht4
+                | hipfire_runtime::kv_mode::KvMode::Fp8 => {}
+            }
+            if cfg.is_vl && vl_sequential {
+                return Err("HIPFIRE_KVMEM requires the batched VL path; unset \
+                     HIPFIRE_VL_SEQUENTIAL (the sequential path writes KV \
+                     outside the step batch KVMem statistics follow)"
+                    .to_string());
+            }
+        }
         // Prefix cache requires paged KV: the radix index shares physical
         // pages across sessions via PagePool refcounting, which is only
         // available in paged mode. Force it on when prefix_cache is enabled.
-        let prefix_cache = cfg.prefix_cache;
+        // KVMem forces it OFF: the radix shares sealed pages (which the
+        // residency pass must never spill) and its cross-session reuse
+        // rewinds seq_len onto pages the host store already owns — both
+        // conflict with KVMem's exclusive page ownership. Cold prefill is
+        // the correct trade; the KVMem store is the cross-request cache.
+        let prefix_cache = cfg.prefix_cache && !kvmem_on;
+        if cfg.prefix_cache && kvmem_on {
+            eprintln!(
+                "  [hipfire] prefix cache disabled: HIPFIRE_KVMEM owns page \
+                 residency (cold prefill per request)"
+            );
+        }
+        let kvmem_build = kvmem_hooks::resolve_build(cfg, kvmem_on, prefill_chunk, spec_rows)?;
+        let kvmem_prefix_pin = kvmem_build.prefix_pin;
+        let kvmem_prefix_coverage = kvmem_build.prefix_coverage;
+        let kvmem_prefix_coverage_interval = kvmem_build.prefix_coverage_interval;
+        let kvmem_checkpoint_policy = kvmem_build.checkpoint_policy;
+        let kvmem_pages = kvmem_build.pages_total();
+        #[cfg(feature = "kvmem")]
+        let kvmem_plan = kvmem_build.plan;
+        #[cfg(feature = "kvmem")]
+        let kvmem_options = kvmem_build.options;
         let paged_pages = if prefix_cache {
             let legacy_equivalent = cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
             // Cache-retained pages share the same physical pool as active slots.
@@ -1029,6 +1258,11 @@ impl Rig {
                     .map(|p| p.max(1))
                     .unwrap_or_else(|| legacy_equivalent.saturating_add(cache_headroom)),
             )
+        } else if let Some(pages) = kvmem_pages {
+            // KVMem: the pool is the resident working set (default 64 blocks
+            // per slot), not the slot cap. Everything past it lives in the
+            // host store, so a large `multi_slot_ctx` no longer costs VRAM.
+            Some(pages)
         } else {
             match hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED")
                 .ok()
@@ -1040,10 +1274,7 @@ impl Rig {
                     // forced the legacy sequential VL path — that path writes
                     // through a flat contiguous slab view which aliases every
                     // slot onto the arena prefix in paged mode.
-                    let sequential_vl = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
-                        .ok()
-                        .is_some_and(|v| v == "1" || v == "on" || v == "true");
-                    if cfg.is_vl && sequential_vl {
+                    if cfg.is_vl && vl_sequential {
                         eprintln!(
                             "  [hipfire] paged KV disabled: HIPFIRE_VL_SEQUENTIAL=1 \
                              requires contiguous KV slots"
@@ -1635,6 +1866,15 @@ impl Rig {
         let pbs = PrefillBatchScratch::new_opt(g.gpu.as_mut().unwrap(), &config, max_batch, false)
             .map_err(|e| format!("pbs: {e}"))?;
         g.pbs = Some(pbs);
+        if kvmem_on {
+            kvmem_hooks::enable_taps(
+                g.pbs.as_mut().unwrap(),
+                g.gpu.as_mut().unwrap(),
+                &config,
+                cfg,
+                max_batch,
+            )?;
+        }
         let scratch =
             Qwen35Scratch::new_with_kv_max(g.gpu.as_mut().unwrap(), &config, 64, cfg.cap_tokens)
                 .map_err(|e| format!("scratch: {e}"))?;
@@ -1685,9 +1925,6 @@ impl Rig {
         let vl_ext_devs: Vec<Option<GpuTensor>> = (0..cfg.n_slots).map(|_| None).collect();
         let vl_tower_jobs: Vec<Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob>> =
             (0..cfg.n_slots).map(|_| None).collect();
-        let vl_sequential = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
-            .ok()
-            .is_some_and(|v| v == "1" || v == "on" || v == "true");
         if vl_sequential && !matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Q8) {
             return Err(
                 "HIPFIRE_VL_SEQUENTIAL=1 writes KV through the q8-only flat slab \
@@ -1720,14 +1957,31 @@ impl Rig {
             dn_bytes,
         };
 
+        // KVMem turns KV into a fixed residency cost: the paged pool is sized
+        // once at load (the resident working set), and every logical page past
+        // it lives in the host store. A 256k-context request therefore costs
+        // the same VRAM as a 4k one. Charging upstream's full-context grant
+        // (`ctx × kv_bytes_per_token`) would demand ~9 GiB of KV credit for a
+        // 256k request on a 20 GiB card and refuse it outright — the exact
+        // configuration KVMem exists to serve. Charge the pool once (it is
+        // real, preallocated device memory, like the weights) and nothing per
+        // token; slot concurrency is bounded by the pool's slot count.
+        let (admission_weights_bytes, admission_kv_bytes_per_token) = if kvmem_on {
+            (resident_weight_bytes.saturating_add(kv_bytes), 0)
+        } else {
+            (
+                resident_weight_bytes,
+                (n_fa_layers * (per_pos_bytes + per_pos_v_bytes)) as u64,
+            )
+        };
         let mut adm = AdmissionController::new(
             ModelFootprint {
                 // `weights_bytes` is the loader's *device* number, so the VRAM
                 // charge cannot over-admit against what was really placed, and the
                 // unreclaimable `hipHostMalloc` bytes are charged to the host tier
                 // that exists for them.
-                weights_bytes: resident_weight_bytes,
-                kv_bytes_per_token: (n_fa_layers * (per_pos_bytes + per_pos_v_bytes)) as u64,
+                weights_bytes: admission_weights_bytes,
+                kv_bytes_per_token: admission_kv_bytes_per_token,
                 pinned_host_bytes,
             },
             vram_total as u64,
@@ -1769,6 +2023,27 @@ impl Rig {
         let scratch = g.scratch.take().unwrap();
         let logits_out = g.logits_out.take().unwrap();
         let out_tokens = g.out_tokens.take().unwrap();
+        // KVMem controller: host payload store + residency policy. Host-only
+        // construction (no GPU allocation); the per-slot stores are sized for
+        // this model's FullAttention geometry.
+        #[cfg(feature = "kvmem")]
+        let kvmem = kvmem_engine::build_kvmem_controller(
+            cfg,
+            &config,
+            cfg.n_slots,
+            n_fa_layers,
+            kv_mode,
+            per_pos_bytes,
+            per_pos_v_bytes,
+            max_batch,
+            mtp_head.is_some() && mtp_k > 0,
+            spec_rows,
+            prefill_chunk,
+            kvmem_plan,
+            kvmem_options,
+        )?;
+        #[cfg(not(feature = "kvmem"))]
+        let kvmem: Option<()> = None;
         // MTP head-KV prefill scratch, sized for one scheduler prompt chunk.
         // Allocated after the guard commit (transactional ownership is no
         // longer needed past this point: everything above already committed).
@@ -1817,15 +2092,17 @@ impl Rig {
         // ── Prefix cache (spec §4.1–4.6) ──────────────────────────────────
         // Build the CacheDomain ONCE from available identities. When
         // prefix_cache is off, all three are None and the existing path is
-        // bitwise unchanged.
-        let (prefix_index, checkpoint_pool, cache_domain) = if prefix_cache {
+        // bitwise unchanged. P4.3: KVMem PREFIX_PIN also needs the domain +
+        // DeltaNet checkpoint pool (cross-session reuse must restore the
+        // recurrent state); the radix index itself stays OFF under KVMem.
+        let (prefix_index, checkpoint_pool, cache_domain) = if prefix_cache || kvmem_prefix_pin {
             // `prefix_cache_max_bytes` is a hard retention ceiling including
             // hybrid snapshots; zero means NO retained cache, never
             // unlimited (spec §9.1). A zero ceiling cannot retain a
             // checkpoint, so reuse can never satisfy the hybrid resumability
             // requirement — refuse the combination instead of running a
             // churn cache that publishes pages it can never resume.
-            if cfg.prefix_cache_max_bytes == 0 {
+            if prefix_cache && cfg.prefix_cache_max_bytes == 0 {
                 return Err(
                     "serve.prefix_cache requires serve.prefix_cache_max_bytes > 0 \
                      (0 means no retained cache, never unlimited)"
@@ -1903,24 +2180,47 @@ impl Rig {
                     domain_id: "default".to_string(),
                 },
             };
-            let idx = hipfire_runtime::prefix_index::PrefixIndex::new(1 << 16);
-            // The retained-cache ceiling also bounds the KV page bytes the
-            // radix references (spec §9.1: a retention ceiling, never a
-            // permanently reserved partition — the checkpoint pool below
-            // holds its own ceiling on snapshot bytes).
-            let mut idx = idx;
-            idx.set_max_retained_bytes(cfg.prefix_cache_max_bytes as usize);
-            let pool = crate::checkpoint::CheckpointPool::<DeltaNetSnapshot>::new(
-                cfg.prefix_cache_max_bytes,
-            );
-            eprintln!(
-                "  [hipfire] prefix cache enabled: radix max {} nodes / {} MiB \
-                 retained-page ceiling, checkpoint pool {} bytes",
-                1 << 16,
-                cfg.prefix_cache_max_bytes / (1024 * 1024),
-                cfg.prefix_cache_max_bytes,
-            );
-            (Some(idx), Some(pool), Some(domain))
+            // P4.3: under KVMem PREFIX_PIN the radix index stays OFF (KVMem
+            // owns sharing through its canonical catalog); only the
+            // checkpoint pool + domain identity are built. The retained-cache
+            // ceiling also bounds the KV page bytes the radix references
+            // (spec §9.1: a retention ceiling, never a permanently reserved
+            // partition — the checkpoint pool below holds its own ceiling on
+            // snapshot bytes).
+            let idx = if prefix_cache {
+                let mut idx = hipfire_runtime::prefix_index::PrefixIndex::new(1 << 16);
+                idx.set_max_retained_bytes(cfg.prefix_cache_max_bytes as usize);
+                Some(idx)
+            } else {
+                None
+            };
+            let ckpt_ceiling = if prefix_cache {
+                cfg.prefix_cache_max_bytes
+            } else {
+                // PREFIX_PIN snapshot ceiling (DeltaNet snapshots only, no
+                // radix pages): HIPFIRE_KVMEM_PREFIX_PIN_BYTES, default 512 MiB.
+                hipfire_config::developer_var("HIPFIRE_KVMEM_PREFIX_PIN_BYTES")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|&b| b > 0)
+                    .unwrap_or(512 * 1024 * 1024)
+            };
+            let pool = crate::checkpoint::CheckpointPool::<DeltaNetSnapshot>::new(ckpt_ceiling);
+            if prefix_cache {
+                eprintln!(
+                    "  [hipfire] prefix cache enabled: radix max {} nodes / {} MiB \
+                     retained-page ceiling, checkpoint pool {} bytes",
+                    1 << 16,
+                    cfg.prefix_cache_max_bytes / (1024 * 1024),
+                    cfg.prefix_cache_max_bytes,
+                );
+            } else {
+                eprintln!(
+                    "  [hipfire] KVMem prefix PIN: checkpoint pool {} bytes (radix off)",
+                    ckpt_ceiling,
+                );
+            }
+            (idx, Some(pool), Some(domain))
         } else {
             (None, None, None)
         };
@@ -1953,6 +2253,21 @@ impl Rig {
         // therefore not a sound deadline base (spec §5.3 S3).
         let wait_queue = WaitQueue::new(cfg.wait_max_count, cfg.wait_max_bytes, u64::MAX)
             .map_err(|e| format!("wait queue: {e}"))?;
+        // Spec → AR retirement line, shared with the sequential drafter:
+        // `HIPFIRE_SPEC_RETIRE` when set, else the shared default. A malformed
+        // value turns retirement off and says so, rather than guessing a line
+        // (mirrors hipfire-generate's `spec_retire_break_even`). The slot
+        // engine states no drafter-specific measured line of its own.
+        let spec_retire_break_even = {
+            let raw = hipfire_config::developer_var("HIPFIRE_SPEC_RETIRE").ok();
+            match hipfire_runtime::spec_retire::parse_break_even(raw.as_deref()) {
+                Ok(parsed) => hipfire_runtime::spec_retire::resolve_break_even(parsed, None),
+                Err(e) => {
+                    eprintln!("[spec-retire] {e}; retirement off");
+                    None
+                }
+            }
+        };
         Ok(Rig {
             gpu,
             tokenizer,
@@ -1970,12 +2285,13 @@ impl Rig {
                 logits_out,
                 mtp_head,
                 mtp_states: (0..cfg.n_slots).map(|_| None).collect(),
-                mtp_req_sampling: (0..cfg.n_slots).map(|_| None).collect(),
+                spec_req_sampling: (0..cfg.n_slots).map(|_| None).collect(),
                 mtp_prefill_batched,
                 spec_verify_tape,
                 mtp_prefill_hidden,
                 mtp_k,
                 spec_rows,
+                spec_retire_break_even,
                 dflash,
                 dflash_states: (0..cfg.n_slots).map(|_| None).collect(),
                 vision_weights,
@@ -1983,12 +2299,38 @@ impl Rig {
                 vl_ext_devs,
                 vl_tower_jobs,
                 checkpoint_pool,
+                #[cfg(feature = "kvmem")]
+                kvmem,
             },
             out_tokens,
             sample_params,
             repeat_windows,
             vl_sequential,
             sessions: SessionTable::default(),
+            #[cfg(feature = "kvmem")]
+            legacy_history: cfg
+                .kvmem
+                .as_ref()
+                .filter(|c| c.enabled)
+                .map(|c| {
+                    // Inactive-history host ceiling for non-KV image bytes
+                    // (recurrent/conv payload + draft row images). The KV payload
+                    // itself is charged against `host_bytes`; this ceiling keeps a
+                    // DFlash/MTP draft image per session from crowding every
+                    // version out of the catalog at the default 512 MiB.
+                    let ceiling = usize::try_from(c.host_bytes / 2)
+                        .unwrap_or(usize::MAX)
+                        .max(512 * 1024 * 1024);
+                    crate::legacy_catalog::LegacyHistoryCatalog::new(c.sessions as usize, ceiling)
+                        .map_err(|e| format!("kvmem history directory: {e}"))
+                })
+                .transpose()?,
+            #[cfg(feature = "kvmem")]
+            legacy_queries: (0..cfg.n_slots).map(|_| None).collect(),
+            #[cfg(feature = "kvmem")]
+            legacy_query_decided: vec![false; cfg.n_slots],
+            #[cfg(feature = "kvmem")]
+            legacy_spec_kind: vec![SpecKind::None; cfg.n_slots],
             adm,
             swap,
             stamp,
@@ -2004,6 +2346,11 @@ impl Rig {
             prefix_index,
             cache_domain,
             prefix_cache,
+            kvmem_prefix_pin,
+            kvmem_prefix_coverage,
+            kvmem_prefix_coverage_interval,
+            kvmem_checkpoint_policy,
+            spec_counters: vec![SpecCounters::default(); cfg.n_slots],
             prefix_cache_max_bytes: if prefix_cache {
                 Some(cfg.prefix_cache_max_bytes as usize)
             } else {
@@ -2140,813 +2487,6 @@ impl Rig {
     }
 }
 
-impl ModelRig {
-    /// Borrowed Q8 KvCache viewing this slot's contiguous K/V slabs.
-    /// Sequential `forward_scratch_*` writes here; the batched path reads
-    /// the same bytes via `legacy_base`. Views are `DeviceBuffer::Borrowed`
-    /// — dropping the KvCache does not free the arenas.
-    fn slot_kv_view(&self, pool: &SlotPool, slot: SlotId) -> KvCache {
-        // Paged slots have no contiguous slab: every legacy base is 0, so this
-        // view would alias the arena prefix for ALL slots. Sequential writers
-        // (VL, MTP prefill/replay) must be gated off under paged KV at
-        // activation — if one reaches here, fail loudly rather than corrupt.
-        assert!(
-            !pool.is_paged(),
-            "slot_kv_view: flat slab view requested under a paged pool — a \
-             sequential KV writer would alias every slot onto the arena prefix"
-        );
-        assert!(
-            self.kv_tier.is_q8(),
-            "slot_kv_view: this view hardwires the q8 layout, but the engine \
-             runs the {:?} KV tier — a sequential write here would corrupt the \
-             rotated-K arena",
-            self.kv_tier.mode
-        );
-        let cap = pool.cap_tokens();
-        let per_pos_bytes = self.config.n_kv_heads * (self.config.head_dim / 32) * 34;
-        let base = pool.descriptors()[slot.0].legacy_k_base as usize;
-        let span = cap * per_pos_bytes;
-        let mut k_gpu = Vec::with_capacity(self.config.n_layers);
-        let mut v_gpu = Vec::with_capacity(self.config.n_layers);
-        let mut fa = 0usize;
-        for t in &self.config.layer_types {
-            if *t == LayerType::FullAttention {
-                k_gpu.push(self.k_arenas[fa].sub_offset(base, span));
-                v_gpu.push(self.v_arenas[fa].sub_offset(base, span));
-                fa += 1;
-            } else {
-                k_gpu.push(GpuTensor::null_for_test());
-                v_gpu.push(GpuTensor::null_for_test());
-            }
-        }
-        KvCache {
-            k_gpu,
-            v_gpu,
-            k_scales: vec![],
-            v_scales: vec![],
-            kv_dim: self.config.n_kv_heads * self.config.head_dim,
-            max_seq: cap,
-            physical_cap: cap,
-            n_kv_heads: self.config.n_kv_heads,
-            head_dim: self.config.head_dim,
-            quantized: true,
-            quant_q8: true,
-            quant_int8: false,
-            quant_hfq4: false,
-            quant_asym4: false,
-            quant_asym3: false,
-            quant_asym2: false,
-            quant_fwht: false,
-            quant_bf16: false,
-            quant_fp8: false,
-            boundary_layers: 0,
-            givens_cos: None,
-            givens_sin: None,
-            layer_is_boundary: vec![],
-            compact_offset: 0,
-            v_mode: VMode::Q8,
-        }
-    }
-}
-
-/// Sequential VL step: encode the image if needed, prefill/decode every
-/// remaining token with M-RoPE, then sample the next token from scratch.logits.
-///
-/// VL slots stay on this path for the whole request because batched 1D RoPE
-/// disagrees with M-RoPE on image tokens and on decode (`t=h=w = pos+delta`).
-impl ModelRig {
-    /// Sequential VL step: encode the image if needed, prefill/decode every
-    /// remaining token with M-RoPE, then sample the next token from
-    /// `scratch.logits`. VL slots stay on this path for the whole request
-    /// because batched 1D RoPE disagrees with M-RoPE on image tokens and on
-    /// decode (`t=h=w = pos+delta`).
-    fn vl_forward_remaining(
-        &mut self,
-        mut gpu: &mut Gpu,
-        pool: &mut SlotPool,
-        tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
-        sample_params: &mut [SlotSampleParams],
-        slot: SlotId,
-        work: &mut PendingWork,
-        image_pad_id: u32,
-        mut grammar: Option<&mut GrammarConstraint>,
-    ) -> Result<u32, String> {
-        let mut vl = work
-            .vl_prefill
-            .take()
-            .ok_or_else(|| "vl_forward_remaining: slot has no VL state".to_string())?;
-        let first_step = vl.embeddings.is_empty();
-        if first_step {
-            let weights = self
-                .vision_weights
-                .as_ref()
-                .ok_or_else(|| "VL request but model has no vision encoder".to_string())?;
-            let config = self
-                .vision_config
-                .as_ref()
-                .ok_or_else(|| "VL request but model has no vision config".to_string())?;
-            let emb = hipfire_arch_qwen35_vl::qwen35_vl::vision_forward(
-                &mut gpu,
-                weights,
-                config,
-                &vl.patches,
-                vl.grid_h,
-                vl.grid_w,
-            )
-            .map_err(|e| format!("vision_forward: {e}"))?;
-            vl.embeddings = emb;
-            vl.dim = self.config.dim;
-            vl.patches.clear();
-            hipfire_runtime::llama::reset_cpu_sampler_rng(sample_params[slot.0].seed);
-        }
-
-        let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
-        let mut pos = work.next_pos;
-        let mut kv_cache = self.slot_kv_view(pool, slot);
-        let mrope_ctx = qwen35::MropeCtx::new(
-            &self.config,
-            vl.base,
-            vl.mrope_positions.clone(),
-            vl.rope_delta,
-        );
-        let mut visual_idx = vl.visual_idx;
-        for &token in &prompt_tokens {
-            if token == image_pad_id && visual_idx < vl.n_visual_tokens {
-                let dim = vl.dim;
-                let start = visual_idx * dim;
-                let emb = vl
-                    .embeddings
-                    .get(start..start + dim)
-                    .ok_or_else(|| "VL embedding slice out of range".to_string())?;
-                qwen35::forward_scratch_embed_mrope(
-                    &mut gpu,
-                    &self.weights,
-                    &self.config,
-                    emb,
-                    pos,
-                    &mut kv_cache,
-                    &mut self.dn_states[slot.0],
-                    &self.scratch,
-                    Some(&mrope_ctx),
-                )
-                .map_err(|e| format!("VL prefill embed: {e}"))?;
-                visual_idx += 1;
-            } else {
-                qwen35::forward_scratch_mrope(
-                    &mut gpu,
-                    &self.weights,
-                    &self.config,
-                    token,
-                    pos,
-                    &mut kv_cache,
-                    &mut self.dn_states[slot.0],
-                    &self.scratch,
-                    Some(&mrope_ctx),
-                )
-                .map_err(|e| format!("VL forward: {e}"))?;
-            }
-            pos += 1;
-        }
-        vl.visual_idx = visual_idx;
-        work.next_pos = pos;
-        pool.set_seq_len(slot, pos)
-            .map_err(|e| format!("VL set_seq_len: {e}"))?;
-        work.vl_prefill = Some(vl);
-
-        let mut logits = gpu
-            .download_f32(&self.scratch.logits)
-            .map_err(|e| format!("VL download logits: {e}"))?;
-        // Hard grammar mask BEFORE the host sampler (spec §7.2 G2 — the same
-        // contract the batched path enforces on logits_out). This sequential
-        // path used to sample unconstrained: a schema-violating first token
-        // could leave the matcher accepting and sail through as a success.
-        if let Some(constraint) = grammar.as_deref_mut() {
-            let mask = constraint
-                .build_mask(&tokenizer, self.config.vocab_size)
-                .map_err(|e| format!("VL grammar mask: {e}"))?;
-            for (i, &allowed) in mask.iter().enumerate() {
-                if !allowed && i < logits.len() {
-                    logits[i] = f32::NEG_INFINITY;
-                }
-            }
-        }
-        let sp = &sample_params[slot.0];
-        let cfg = hipfire_runtime::sampler::SamplerConfig {
-            temperature: sp.temperature,
-            top_p: sp.top_p,
-            // Apply the REQUESTED penalties/min_p: this sequential path used to
-            // hardcode neutral values, silently downgrading a penalized VL
-            // request's semantics (spec §6 X2: "An optimization bypass is
-            // allowed, a silent semantic downgrade is not").
-            repeat_penalty: sp.repeat_penalty,
-            repeat_window: sp.repeat_window.max(0) as usize,
-            presence_penalty: sp.presence_penalty,
-            frequency_penalty: sp.frequency_penalty,
-            blocked_tokens: Vec::new(),
-            top_k: if sp.top_k > 0 {
-                Some(sp.top_k as u32)
-            } else {
-                None
-            },
-            min_p: (sp.min_p > 0.0).then_some(sp.min_p),
-        };
-        Ok(hipfire_runtime::sampler::sample_cpu(&mut logits, &[], &cfg))
-    }
-}
-
-/// Advance slot `s`'s batched-VL vision-tower encode by ONE layer, starting
-/// the [`VisionTowerJob`] on the first call and finishing it (merger epilogue
-/// + ext-embedding upload) on the last.
-///
-/// Why one layer at a time: this engine thread is the GPU's exclusive owner,
-/// so a monolithic `vision_forward` wedges every OTHER slot's decode step for
-/// the whole tower pass — measured ~9.7 s at a 78×78 grid (6084 patches) even
-/// on the Q-tiled attention kernel, i.e. the whole serve freezes for the
-/// duration of one big image request. One tower layer (~0.4 s at that grid)
-/// is the largest GPU chunk a VL slot adds between other slots' steps, and
-/// the scheduler already holds the VL slot's rows back until its embeddings
-/// exist (`vl_slots_waiting_on_vision_forward_are_skipped`).
-///
-/// `job` is the caller-owned per-slot job slot. Contract on return:
-/// `Ok(false)` → `job` is `Some` (encode continues next iteration);
-/// `Ok(true)` → encode finished, embeddings spliced, `job` is `None`;
-/// `Err` → the job was freed, `job` is `None`.
-impl ModelRig {
-    /// Advance slot `s`'s vision-tower job by one tower layer, creating it on
-    /// the first call from `vl.patches`. `Ok(true)` when the encode finished
-    /// and the slot's ext-embedding matrix is uploaded into
-    /// `vl_ext_devs[s]`; `Ok(false)` = still mid-encode (returns to the
-    /// scheduler so other slots keep decoding). `Err` → the job was freed.
-    fn vision_tower_step(
-        &mut self,
-        gpu: &mut Gpu,
-        s: usize,
-        vl: &mut VlPrefill,
-    ) -> Result<bool, String> {
-        let vision_weights = &self.vision_weights;
-        let vision_config = &self.vision_config;
-        let vl_ext_devs = &mut self.vl_ext_devs;
-        let config = &self.config;
-        let job = &mut self.vl_tower_jobs[s];
-        if job.is_none() {
-            let weights = vision_weights
-                .as_ref()
-                .ok_or("VL request but model has no vision encoder")?;
-            let vconfig = vision_config
-                .as_ref()
-                .ok_or("VL request but model has no vision config")?;
-            let started = hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob::new(
-                gpu,
-                weights,
-                vconfig,
-                &vl.patches,
-                vl.grid_h,
-                vl.grid_w,
-            )
-            .map_err(|e| format!("vision_forward: {e}"))?;
-            *job = Some(started);
-            // Patches now live on-device for the rest of the encode; free the
-            // host copy (~48 MB at the 2 MP budget).
-            vl.patches = Vec::new();
-        }
-        let weights = vision_weights
-            .as_ref()
-            .ok_or("VL request but model has no vision encoder")?;
-        let vconfig = vision_config
-            .as_ref()
-            .ok_or("VL request but model has no vision config")?;
-        let done = match job
-            .as_mut()
-            .expect("vision tower job present")
-            .step_layer(gpu, weights, vconfig)
-        {
-            Ok(done) => done,
-            Err(e) => {
-                let reason = format!("vision_forward: {e}");
-                if let Some(j) = job.take() {
-                    let _ = j.free(gpu);
-                }
-                return Err(reason);
-            }
-        };
-        if !done {
-            return Ok(false);
-        }
-        let j = job.take().expect("vision tower job present");
-        // `finish` consumes the job and frees its own device buffers on every
-        // error path (the tower's working set is neither pooled nor released by
-        // Drop, so a failed merger epilogue must not leak it).
-        let emb = j
-            .finish(gpu, weights, vconfig)
-            .map_err(|e| format!("vision_forward: {e}"))?;
-        let dev = gpu
-            .zeros(&[emb.len()], DType::F32)
-            .map_err(|e| format!("vl ext alloc: {e}"))?;
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len() * 4) };
-        if let Err(e) = gpu.hip.memcpy_htod(&dev.buf, bytes) {
-            let _ = gpu.free_tensor(dev);
-            return Err(format!("vl ext upload: {e}"));
-        }
-        *vl_ext_devs.get_mut(s).expect("vl_ext_devs slot") = Some(dev);
-        vl.embeddings = emb;
-        vl.dim = config.dim;
-        Ok(true)
-    }
-}
-
-/// Free slot `s`'s VL GPU state (ext-embedding matrix + any tower job still
-/// mid-encode). For every site that clears a slot's work: dropping either
-/// without freeing leaks VRAM — the buffers are neither pooled nor hipFree'd
-/// by Drop.
-impl ModelRig {
-    /// Free slot `s`'s VL GPU state (ext-embedding matrix + any tower job
-    /// still mid-encode). For every site that clears a slot's work: dropping
-    /// either without freeing leaks VRAM — the buffers are neither pooled
-    /// nor hipFree'd by Drop.
-    fn clear_slot_vl_state(&mut self, gpu: &mut Gpu, s: usize) {
-        if let Some(dev) = self.vl_ext_devs[s].take() {
-            let _ = gpu.free_tensor(dev);
-        }
-        if let Some(job) = self.vl_tower_jobs[s].take() {
-            let _ = job.free(gpu);
-        }
-    }
-}
-
-/// MTP head-KV fill for one scheduler prefill chunk, post-forward.
-///
-/// The trunk side of an MTP slot's prompt flows through the scheduler's
-/// batched chunk path like any other prefill (1D RoPE, shared forward with
-/// other slots). This runs right AFTER that forward: the chunk's hidden
-/// rows sit in `pbs.x_batch`, and the head consumes exactly
-/// `(embed(token_i), trunk_hidden(token_i))` per row, so one
-/// `mtp_head_forward_block_batched(kv_only = true)` call fills the head's
-/// private KV for the chunk. `state.prev_hidden` is left pointing at the
-/// chunk's last row — the correct draft seed hidden once the prompt drains.
-///
-/// `row_off` is the slot's first row in the step batch; `m` its row count.
-impl ModelRig {
-    fn mtp_head_prefill_chunk(
-        &mut self,
-        mut gpu: &mut Gpu,
-        slot: SlotId,
-        chunk_tokens: &[u32],
-        chunk_positions: &[i32],
-        row_off: usize,
-        m: usize,
-    ) -> Result<(), String> {
-        let head = self
-            .mtp_head
-            .as_ref()
-            .ok_or_else(|| "mtp_head_prefill_chunk: MTP head not loaded".to_string())?;
-        let Some((scratch, rot)) = self.mtp_prefill_batched.as_mut() else {
-            return Err("mtp_head_prefill_chunk: batched head scratch missing".to_string());
-        };
-        if self.mtp_states[slot.0].is_none() {
-            let state = crate::mtp_spec::MtpSpecState::new_for_components(
-                &mut gpu,
-                &self.config,
-                &self.dn_states[slot.0],
-                head,
-                self.mtp_k,
-                crate::mtp_head::MtpKvMode::Q8,
-            )
-            .map_err(|e| format!("mtp state alloc: {e}"))?;
-            self.mtp_states[slot.0] = Some(state);
-        }
-        if let Some(cvs) = head.weights.compressed_vocab_size {
-            let state = self.mtp_states[slot.0].as_mut().unwrap();
-            state
-                .ensure_compressed_lm_logits(&mut gpu, cvs)
-                .map_err(|e| format!("ensure compressed logits: {e}"))?;
-            // The draft phase reads `mtp_scratch.logits_compressed` (head-side
-            // buffer) — distinct from `mtp_lm_logits_compressed` above. Without
-            // this allocation the first draft step on a compressed head panics
-            // the engine thread (the sequential speculator was the only caller
-            // of `ensure_compressed_logits`).
-            state
-                .mtp_scratch
-                .ensure_compressed_logits(&mut gpu, cvs)
-                .map_err(|e| format!("ensure head compressed logits: {e}"))?;
-        }
-
-        let dim = self.config.dim;
-        let mut state = self.mtp_states[slot.0]
-            .take()
-            .expect("just ensured it exists");
-
-        // The head consumes POST-output-norm trunk hidden (the convention it was
-        // exported with and the one the sequential path feeds it); pbs.x_batch
-        // holds the PRE-norm residual, so norm the chunk's rows into staging.
-        let hidden_rows = self.pbs.x_batch.sub_offset(row_off * dim, m * dim);
-        let staged = self.mtp_prefill_hidden.sub_offset(0, m * dim);
-        let norm_outcome = gpu
-            .rmsnorm_batched(
-                &hidden_rows,
-                &self.weights.output_norm,
-                &staged,
-                m,
-                dim,
-                self.config.norm_eps,
-            )
-            .map_err(|e| format!("mtp prefill hidden norm: {e}"));
-
-        // Disjoint field borrows: `scratch`/`rot` from mtp_prefill_batched,
-        // `gpu`/`weights`/head separately. No closure — it would capture all of
-        // `rig` and collide with the scratch borrow.
-        let mtp_outcome = norm_outcome.and_then(|()| {
-            crate::mtp_head::mtp_head_forward_block_batched(
-                &mut gpu,
-                head,
-                scratch,
-                &mut state.mtp_kv,
-                chunk_tokens,
-                &staged,
-                chunk_positions,
-                m,
-                &self.weights,
-                Some(rot),
-                /* kv_only */ true,
-            )
-            .map_err(|e| format!("mtp head prefill: {e}"))
-        });
-        // Seed hidden for the first draft cycle: the (normed) trunk hidden of
-        // the chunk's last token — same convention as the verify-path capture.
-        let hidden_outcome = mtp_outcome.and_then(|()| {
-            gpu.hip
-                .memcpy_dtod_at(
-                    &state.prev_hidden.buf,
-                    0,
-                    &self.mtp_prefill_hidden.buf,
-                    (m - 1) * dim * 4,
-                    dim * 4,
-                )
-                .map_err(|e| format!("mtp prev_hidden capture: {e:?}"))
-        });
-        self.mtp_states[slot.0] = Some(state);
-        hidden_outcome
-    }
-}
-
-/// MTP draft phase: run K serial head-forward steps, save DN snapshot.
-///
-/// Called when `work.decoding` (subsequent MTP steps). Takes the seed from
-/// `work.remaining_prompt.last()`. Saves DN snapshot to `state.trunk_snap`
-/// for rollback during verify. Returns the draft output for the batched
-/// verify phase.
-impl ModelRig {
-    /// MTP draft phase: run K serial head-forward steps, save DN snapshot.
-    ///
-    /// Called when `work.decoding` (subsequent MTP steps). Takes the seed
-    /// from `work.remaining_prompt.last()`. Saves DN snapshot to
-    /// `state.trunk_snap` for rollback during verify. Returns the draft
-    /// output for the batched verify phase.
-    fn mtp_draft_step(
-        &mut self,
-        mut gpu: &mut Gpu,
-        slot: SlotId,
-        work: &mut PendingWork,
-        emitted: &[u32],
-    ) -> Result<crate::mtp_spec::MtpDraftOutput, String> {
-        let head = self
-            .mtp_head
-            .as_ref()
-            .ok_or_else(|| "mtp_draft_step: MTP head not loaded".to_string())?;
-
-        if self.mtp_states[slot.0].is_none() {
-            let state = crate::mtp_spec::MtpSpecState::new_for_components(
-                &mut gpu,
-                &self.config,
-                &self.dn_states[slot.0],
-                head,
-                self.mtp_k,
-                crate::mtp_head::MtpKvMode::Q8,
-            )
-            .map_err(|e| format!("mtp state alloc: {e}"))?;
-            self.mtp_states[slot.0] = Some(state);
-        }
-        let mut state = self.mtp_states[slot.0]
-            .take()
-            .expect("just ensured it exists");
-
-        if let Some(cvs) = head.weights.compressed_vocab_size {
-            if let Err(e) = state.ensure_compressed_lm_logits(&mut gpu, cvs) {
-                self.mtp_states[slot.0] = Some(state);
-                return Err(format!("ensure compressed logits: {e}"));
-            }
-            // Head-side compressed buffer for the draft phase (see the alloc
-            // comment in `mtp_head_prefill_chunk`).
-            if let Err(e) = state.mtp_scratch.ensure_compressed_logits(&mut gpu, cvs) {
-                self.mtp_states[slot.0] = Some(state);
-                return Err(format!("ensure head compressed logits: {e}"));
-            }
-        }
-
-        // Install this request's sampling/penalty config (parked by admit;
-        // a cold admit's state only exists from now on). `set_sampling`
-        // reseeds the draft RNG, so it runs exactly once per request — the
-        // per-window penalty history is rebuilt from `emitted` below instead.
-        let mut req_sampling = self.mtp_req_sampling[slot.0].take();
-        if let Some(cfg) = req_sampling.as_mut() {
-            if !cfg.applied {
-                state.set_sampling(cfg.sampling, cfg.rng_seed);
-                if cfg.sampling.penalized() {
-                    state.penalty = hipfire_runtime::spec_sampling::PenaltyHistory::new(
-                        cfg.sampling.repeat_window,
-                    );
-                    // Generation-only history: the prompt tail seeds row 0,
-                    // emitted tokens are added per window, exactly like AR's
-                    // `sess.tokens` tail window.
-                    state.penalty.set_prompt(&cfg.prompt_tail);
-                }
-                cfg.applied = true;
-            }
-            if cfg.sampling.penalized() {
-                // Row k of this window scopes `suffix_W(emitted ‖ c[..k])`.
-                state.penalty.begin_window(emitted);
-            }
-        }
-
-        let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
-        let pos = work.next_pos;
-
-        let outcome: Result<crate::mtp_spec::MtpDraftOutput, String> = (|| {
-            if prompt_tokens.is_empty() {
-                return Err("mtp_draft_step: no seed token".to_string());
-            }
-            let seed = *prompt_tokens.last().unwrap();
-
-            // Save DN snapshot for rollback during verify phase.
-            state
-                .trunk_snap
-                .save_from(&mut self.dn_states[slot.0], &mut gpu)
-                .map_err(|e| format!("mtp dn snapshot: {e}"))?;
-
-            let draft_outcome = crate::mtp_spec::mtp_draft_phase_inner(
-                &mut gpu,
-                &self.weights,
-                &self.config,
-                head,
-                &mut state,
-                pos,
-                seed,
-                self.mtp_k,
-                /* skip_proposal_graph */ true,
-            )
-            .map_err(|e| format!("mtp draft: {e}"));
-            if crate::mtp_spec::mtp_trace_enabled() {
-                eprintln!("[mtp-trace] draft done pos={pos} seed={seed}");
-            }
-            draft_outcome
-        })();
-
-        self.mtp_states[slot.0] = Some(state);
-        self.mtp_req_sampling[slot.0] = req_sampling;
-        outcome
-    }
-}
-
-/// MTP verify/accept phase: after the batched forward, run the trunk lm_head
-/// over the slot's verify rows (normed views of `pbs.x_batch`), greedy-accept,
-/// and repair the DeltaNet state on partial accepts.
-///
-/// `hidden_row_offset` is the flat row index where this slot's verify rows
-/// begin in the step batch (computed from `batch.m_per_slot` by the caller).
-/// `produced`/`max_tokens` are the in-flight request counters, used to clamp
-/// the accepted burst to what the commit path can actually keep (see
-/// `mtp_batched_verify_accept_from_batch`). Returns committed tokens
-/// (excludes seed, includes bonus).
-#[allow(clippy::too_many_arguments)]
-impl ModelRig {
-    /// MTP verify/accept phase: after the batched forward, run the trunk
-    /// lm_head over the slot's verify rows (normed views of `pbs.x_batch`),
-    /// greedy-accept, and repair the DeltaNet state on partial accepts.
-    /// `hidden_row_offset` is the flat row index where this slot's verify
-    /// rows begin in the step batch (computed from `batch.m_per_slot` by
-    /// the caller). `produced`/`max_tokens` are the in-flight request
-    /// counters, used to clamp the accept tail to the request's budget.
-    fn mtp_verify_accept_step(
-        &mut self,
-        mut gpu: &mut Gpu,
-        pool: &mut SlotPool,
-        tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
-        cap_tokens: usize,
-        slot: SlotId,
-        work: &mut PendingWork,
-        draft: crate::mtp_spec::MtpDraftOutput,
-        hidden_row_offset: usize,
-        produced: usize,
-        max_tokens: usize,
-        sess_len: usize,
-    ) -> Result<Vec<u32>, String> {
-        let mut state = self.mtp_states[slot.0]
-            .take()
-            .expect("mtp state must exist from draft phase");
-
-        let pos = work.next_pos;
-
-        // How many tokens of this burst the commit path can keep before a
-        // terminator fires: the request's remaining max_tokens budget and its
-        // remaining context room (`commit_sampled_token` stops decode when
-        // `sess.tokens.len() + 1 >= cap`, so room is `cap - len`).
-        let commit_budget = max_tokens
-            .saturating_sub(produced)
-            .min(cap_tokens.saturating_sub(sess_len))
-            .max(1);
-
-        let outcome: Result<Vec<u32>, String> = (|| {
-            let result = crate::mtp_spec::mtp_batched_verify_accept_from_batch(
-                &mut gpu,
-                &self.weights,
-                &self.config,
-                &mut self.dn_states[slot.0],
-                &self.pbs,
-                &mut state,
-                &draft,
-                hidden_row_offset,
-                self.spec_verify_tape
-                    .as_ref()
-                    .expect("MTP drafts require the verify tape"),
-                self.spec_rows,
-                slot.0,
-                tokenizer.eos_id,
-                tokenizer.eot_id,
-                commit_budget,
-            )
-            .map_err(|e| format!("mtp verify: {e}"))?;
-
-            // Update position and seq_len. Stale KV rows past the new frontier
-            // (rejected drafts) are overwritten before any later forward reads
-            // them: every subsequent write is position-ordered.
-            let new_pos = pos + result.advance;
-            work.next_pos = new_pos;
-            pool.set_seq_len(slot, new_pos)
-                .map_err(|e| format!("mtp set_seq_len: {e}"))?;
-
-            Ok(result.committed)
-        })();
-        self.mtp_states[slot.0] = Some(state);
-        outcome
-    }
-}
-
-/// DFlash2 draft phase for one slot: run the draft forward over the slot's
-/// committed context and save the DN snapshot for the verify rollback.
-///
-/// Called when `work.decoding` (subsequent spec steps). Takes the seed from
-/// `work.remaining_prompt.last()` — same protocol as `mtp_draft_step`.
-impl ModelRig {
-    fn dflash_draft_step(
-        &mut self,
-        mut gpu: &mut Gpu,
-        slot: SlotId,
-        work: &mut PendingWork,
-    ) -> Result<crate::dflash_slot::DflashSlotDraft, String> {
-        let shared = self
-            .dflash
-            .as_ref()
-            .ok_or_else(|| "dflash_draft_step: DFlash not loaded".to_string())?;
-        let mut st = self.dflash_states[slot.0]
-            .take()
-            .ok_or_else(|| "dflash_draft_step: slot state missing (admit bug)".to_string())?;
-
-        let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
-        let pos = work.next_pos;
-        let outcome: Result<crate::dflash_slot::DflashSlotDraft, String> = (|| {
-            let seed = *prompt_tokens
-                .last()
-                .ok_or_else(|| "dflash_draft_step: no seed token".to_string())?;
-            // Save DN snapshot for rollback during verify phase.
-            st.trunk_snap
-                .save_from(&mut self.dn_states[slot.0], &mut gpu)
-                .map_err(|e| format!("dflash dn snapshot: {e}"))?;
-            crate::dflash_slot::dflash_slot_draft_step(
-                &mut gpu,
-                shared,
-                &self.weights,
-                &self.config,
-                &mut st,
-                seed,
-                pos,
-            )
-        })();
-
-        self.dflash_states[slot.0] = Some(st);
-        outcome
-    }
-}
-
-/// DFlash2 verify/accept phase: norm the slot's verify rows out of
-/// `pbs.x_batch`, run the trunk lm_head, greedy-accept, repair DN state on
-/// partial accept, and commit the kept rows' extract-layer hiddens into the
-/// slot's `target_hidden` ring. Mirrors `mtp_verify_accept_step`.
-#[allow(clippy::too_many_arguments)]
-impl ModelRig {
-    /// DFlash2 verify/accept phase: norm the slot's verify rows out of
-    /// `pbs.x_batch`, run the trunk lm_head, greedy-accept, repair DN state
-    /// on partial accept, and commit the kept rows' extract-layer hiddens
-    /// into the slot's `target_hidden` ring. Mirrors `mtp_verify_accept_step`.
-    fn dflash_verify_accept_step(
-        &mut self,
-        mut gpu: &mut Gpu,
-        pool: &mut SlotPool,
-        tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
-        cap_tokens: usize,
-        slot: SlotId,
-        work: &mut PendingWork,
-        mut draft: crate::dflash_slot::DflashSlotDraft,
-        hidden_row_offset: usize,
-        produced: usize,
-        max_tokens: usize,
-        sess_len: usize,
-    ) -> Result<Vec<u32>, String> {
-        let mut st = self.dflash_states[slot.0]
-            .take()
-            .expect("dflash state must exist from draft phase");
-        let pos = work.next_pos;
-        let commit_budget = max_tokens
-            .saturating_sub(produced)
-            .min(cap_tokens.saturating_sub(sess_len))
-            .max(1);
-
-        let outcome: Result<Vec<u32>, String> = (|| {
-            let committed = crate::dflash_slot::dflash_slot_verify_accept(
-                &mut gpu,
-                self.dflash
-                    .as_ref()
-                    .expect("dflash draft requires shared state"),
-                &self.weights,
-                &self.config,
-                &mut self.dn_states[slot.0],
-                &self.pbs,
-                &mut st,
-                &mut draft,
-                pos,
-                hidden_row_offset,
-                self.spec_verify_tape
-                    .as_ref()
-                    .expect("DFlash drafts require the verify tape"),
-                self.spec_rows,
-                slot,
-                tokenizer.eos_id,
-                tokenizer.eot_id,
-                commit_budget,
-            )
-            .map_err(|e| format!("dflash verify: {e}"))?;
-
-            let new_pos = pos + committed.len();
-            work.next_pos = new_pos;
-            pool.set_seq_len(slot, new_pos)
-                .map_err(|e| format!("dflash set_seq_len: {e}"))?;
-            Ok(committed)
-        })();
-
-        // Keep the draft's device buffers for the next cycle's reuse.
-        st.draft = Some(draft);
-        self.dflash_states[slot.0] = Some(st);
-        outcome
-    }
-}
-
-/// DFlash2 prefill chunk: lazily allocate the slot's draft state, scatter
-/// this chunk's extract-layer hidden rows (captured into the shared
-/// staging during the forward) into the slot's `target_hidden` ring, and
-/// advance the thlog watermark. `chunk_pos` is the chunk's first absolute
-/// position (`batch.positions[row_off]`).
-impl ModelRig {
-    fn dflash_prefill_chunk(
-        &mut self,
-        mut gpu: &mut Gpu,
-        slot: SlotId,
-        row_off: usize,
-        m: usize,
-        chunk_pos: usize,
-    ) -> Result<(), String> {
-        if self.dflash_states[slot.0].is_none() {
-            let st = crate::dflash_slot::new_dflash_slot_state(
-                &mut gpu,
-                self.dflash
-                    .as_ref()
-                    .ok_or_else(|| "dflash prefill: shared state missing".to_string())?,
-                &self.config,
-                &self.dn_states[slot.0],
-            )
-            .map_err(|e| format!("dflash state alloc: {e}"))?;
-            self.dflash_states[slot.0] = Some(st);
-        }
-        let st = self.dflash_states[slot.0].as_mut().unwrap();
-        let shared = self.dflash.as_ref().unwrap();
-        crate::dflash_slot::scatter_staging_rows_to_interleaved(
-            &mut gpu, shared, st, row_off, chunk_pos, m,
-        )
-        .map_err(|e| format!("dflash prefill scatter: {e}"))?;
-        st.scratch.thlog.append_committed(chunk_pos, m, 0);
-        st.seeded_through = chunk_pos + m;
-        Ok(())
-    }
-}
-
 /// One slot's in-flight spec draft between the draft phase and the
 /// post-forward accept. `Mtp` carries the head's K-step chain output;
 /// `Dflash` carries the DFlash2 selector block. Both expose the verify-row
@@ -3062,13 +2602,13 @@ fn clear_work_slot(work: &mut PendingWork) {
     work.vl_prefill = None;
     work.spec = SpecKind::None;
     work.pos3_delta = 0;
-    // Adaptive-retire counters are per-REQUEST state: a request that ends
-    // mid-window must not leave its failures behind for the slot's next
-    // occupant (one bad window would sit one failure from retirement, and
-    // the next request's window mean would mix both requests' advances).
-    work.spec_cycles = 0;
-    work.spec_committed = 0;
-    work.spec_retire_fails = 0;
+    // The retirement policy is per-REQUEST state: a request that ends
+    // mid-window must not leave its cycles/failures behind for the slot's
+    // next occupant (one bad window would sit one failure from retirement,
+    // and the next request's window mean would mix both requests' advances).
+    // `reset` keeps the resolved break-even line, which is re-installed at
+    // admit anyway.
+    work.spec_retire.reset();
 }
 
 /// Release a request's prefix-cache pin on every terminal path (spec §4.4
@@ -3190,28 +2730,15 @@ fn execute_cow_copies(rig: &Rig, plan: &rdna_compute::page_pool::CowPlan) -> boo
 /// batched forward provisions `set_seq_len(max_pos + 1)` before its KV write
 /// and fails the whole step closed when that exceeds the cap, which rejects
 /// every active slot; MTP must retire before drafting instead.
-/// Rolling adaptive-retire window (cycles) before MTP may retire a slot for
-/// low acceptance, and the minimum mean advance (committed tokens per cycle)
-/// the head must sustain to stay on the spec path. An MTP cycle costs roughly
-/// twice an AR step (draft + verify over k+1 rows), so a mean advance below
-/// ~2.2 loses wall-clock (measured MTP cycle ≈ 2.3x an AR step on
-/// gfx1101/ornith-1.5-9b); code sustains ~2.8 (stays on MTP) while prose
-/// sits at ~1.9 and retires to AR.
-pub const MTP_RETIRE_WINDOW: usize = 32;
-pub const MTP_RETIRE_MIN_ADVANCE: f64 = 2.2;
-/// Consecutive failed windows required before retiring. One bad window is
-/// normal even on high-acceptance workloads (a template-y or low-confidence
-/// opening); two in a row means the head genuinely cannot pay for the cycle.
-pub const MTP_RETIRE_WINDOWS: usize = 2;
-
 fn spec_verify_fits_cap(next_pos: usize, verify_rows: usize, cap_tokens: usize) -> bool {
     verify_rows <= cap_tokens.saturating_sub(next_pos)
 }
 
-/// True when the request carries a non-neutral token penalty. Such requests
-/// decode as plain AR when MTP would otherwise be available: the verify accept
-/// compares draft tokens against a bare greedy argmax over unpenalized logits,
-/// which cannot reproduce penalize-then-argmax.
+/// True when the request carries a non-neutral token penalty. Both spec
+/// drafters (MTP and DFlash2) now honor penalties in their verify accept
+/// (exact-AR penalty prepass before acceptance), so this no longer gates
+/// admission — it is retained for the admit slot-trace and any diagnostic
+/// that needs to know whether a request's logits will be penalized.
 ///
 /// `repeat_window == 0` does NOT neutralize the penalties: OpenAI-style
 /// presence/frequency penalties are defined over the whole context, so a zero
@@ -3241,17 +2768,6 @@ fn effective_repeat_window(
     } else {
         w
     }
-}
-
-/// True when the request asks for real sampling (temperature > 0).
-///
-/// Sampled requests now run MTP through residual acceptance
-/// (`mtp_sampled_accept` with the draft nucleus), which reproduces the AR
-/// distribution. The predicate survives for the routes that still require a
-/// deterministic greedy chain: the DFlash2 slot draft, and the prefix-resume
-/// drafter plan (a resumed request's head KV is zero for the reused span).
-fn request_sampled(req: &SubmitRequest) -> bool {
-    req.temperature > 0.0
 }
 
 /// Install a request's sampling parameters (including token penalties and
@@ -3400,6 +2916,7 @@ fn publish_generated_prefix(
                 domain,
                 new_boundary as u64,
                 &tokens,
+                None, // radix path: text-only (vision is excluded from publishing)
                 &rig.model.dn_states[s],
             ) {
                 Ok(id) if id.is_some() => Some(id),
@@ -3494,6 +3011,20 @@ fn commit_sampled_token(
         // instead of a successful done (spec §7.1 G1, A17). ClientGone is
         // never overridden: the receiver is already dropped.
         lock_stats(stats).note_slot_released();
+        // 期4: fold this request's speculative counters (completed-request
+        // statistics; cancellation paths included, admission failures excluded).
+        {
+            let spec = std::mem::take(&mut rig.spec_counters[s]);
+            if spec.requested {
+                let mut st = lock_stats(stats);
+                st.speculative.requests += 1;
+                st.speculative.rounds += spec.rounds;
+                st.speculative.drafted_tokens += spec.drafted;
+                st.speculative.accepted_tokens += spec.accepted;
+                st.speculative.generated_tokens += spec.generated;
+                st.speculative.fallback_steps += spec.fallback;
+            }
+        }
         if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
             let _ = send_event(
                 &f.reply,
@@ -3521,11 +3052,28 @@ fn commit_sampled_token(
         // the fairness budget (spec §5.3 S3). Idempotent (NotFound ignored).
         let _ = rig.fair_queue.remove(session.0);
         clear_work_slot(&mut work[s]);
+        // A terminal request owns no Query lifecycle: any unfinished
+        // checkpoint source is dropped with it (never carried into the next
+        // request on this slot).
+        #[cfg(feature = "kvmem")]
+        if let Some(run) = rig.legacy_queries.get_mut(s) {
+            *run = None;
+            rig.legacy_query_decided[s] = false;
+        }
         rig.model.clear_slot_vl_state(&mut rig.gpu, s);
         if matches!(reason, DoneReason::ClientGone) {
+            // Nobody will follow up on a vanished client, so hand the slot
+            // back at once.
             rig.swap.forget(session.0);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
         } else {
+            // Keep the session resident so its next turn can extend it in
+            // place. Under KVMem that reuse is the whole KV: the trunk pages
+            // (resident plus spilled payloads and their row statistics in
+            // the host store), the DeltaNet state and the MTP head KV all
+            // stay valid, so the shared prefix is never re-prefilled. LRU
+            // eviction (which closes rather than swaps under KVMem) reclaims
+            // the slot when someone else needs it.
             rig.sessions.touch(session);
         }
     } else {
@@ -3535,6 +3083,73 @@ fn commit_sampled_token(
         }
         rig.sessions.touch(session);
     }
+}
+
+/// End a slot's current generation pass early WITHOUT closing its session.
+///
+/// Think-recovery control plane: the daemon asks for the pass to end between
+/// tokens (closed-think continuation / reasoning-loop recovery), then starts a
+/// follow-up pass whose prompt extends the accepted token stream. The mirror of
+/// `commit_sampled_token`'s terminal block, with three deliberate differences:
+///
+/// * No token is being committed (the pass ends at a boundary), so nothing is
+///   retained into the session and no `Token` event is sent.
+/// * `Done` is reported with `DoneReason::MaxTokens` and `generated =
+///   produced` — the daemon treats it as a pass boundary, not a budget stop.
+/// * The session is ALWAYS touched (never closed, even on a vanished client —
+///   that case is handled by the daemon cancelling the whole request via
+///   `Close`, not by an interrupt).
+fn finish_interrupted_pass(
+    rig: &mut Rig,
+    slots: &mut [Option<InFlight>],
+    work: &mut [PendingWork],
+    stats: &Mutex<EngineStats>,
+    s: usize,
+) {
+    let Some(f) = slots[s].as_mut() else { return };
+    let session = f.session;
+    let generated = f.produced;
+    lock_stats(stats).note_slot_released();
+    // 期4 counters: pass work is real work — fold it now. The next pass
+    // re-initialises the per-slot counters at admit.
+    {
+        let spec = std::mem::take(&mut rig.spec_counters[s]);
+        if spec.requested {
+            let mut st = lock_stats(stats);
+            st.speculative.requests += 1;
+            st.speculative.rounds += spec.rounds;
+            st.speculative.drafted_tokens += spec.drafted;
+            st.speculative.accepted_tokens += spec.accepted;
+            st.speculative.generated_tokens += spec.generated;
+            st.speculative.fallback_steps += spec.fallback;
+        }
+    }
+    let _ = send_event(
+        &f.reply,
+        Event::Done {
+            reason: DoneReason::MaxTokens,
+            generated,
+        },
+    );
+    // Publish generated-prefix pages at the pass boundary, exactly as the
+    // terminal path does: every sampled token of this pass is materialized.
+    let mut pin_ticket = std::mem::take(&mut f.pin_ticket);
+    if rig.prefix_cache {
+        publish_generated_prefix(rig, slots, s, work[s].next_pos);
+    }
+    release_pin_ticket(rig, &mut pin_ticket);
+    slots[s] = None;
+    let _ = rig.fair_queue.remove(session.0);
+    clear_work_slot(&mut work[s]);
+    #[cfg(feature = "kvmem")]
+    if let Some(run) = rig.legacy_queries.get_mut(s) {
+        *run = None;
+        rig.legacy_query_decided[s] = false;
+    }
+    rig.model.clear_slot_vl_state(&mut rig.gpu, s);
+    // Keep the session resident (and its KV/MTP head/DeltaNet state valid):
+    // the continuation pass extends exactly this session.
+    rig.sessions.touch(session);
 }
 
 /// Lock the shared stats counter, tolerating a poisoned mutex.
@@ -3602,6 +3217,17 @@ struct InFlight {
     /// that shared pages from a prefix cache hit are not re-published.
     /// 0 when prefix_cache is off.
     last_published_boundary: usize,
+    /// P4.3: last page-aligned boundary frozen into the KVMem canonical
+    /// catalog for this request. Initialized to `reused` at admit (a reused
+    /// prefix is already frozen); 0 when PREFIX_PIN is off.
+    last_frozen_boundary: usize,
+    /// P2.2b2: latest page-aligned decode frontier with a captured coverage
+    /// recurrent checkpoint (0 = none). The terminal endpoint freeze prefers
+    /// the exact aligned frontier and falls back to this anchor.
+    last_coverage_boundary: usize,
+    /// P3.2: prefill freeze cadence (.spread policy); `None` = legacy.
+    #[cfg(feature = "kvmem")]
+    checkpoint_plan: Option<hipfire_kvmem::CheckpointCapturePlan>,
     /// Per-request grammar constraint for structured output (spec §7 G1/G2).
     /// `None` for unconstrained requests. When present, a grammar mask is
     /// applied to the slot's logits row BEFORE the GPU sampler's
@@ -3926,6 +3552,11 @@ fn run_loop(
 ) -> Result<(), String> {
     let n = rig.n_slots;
     let mut slots: Vec<Option<InFlight>> = (0..n).map(|_| None).collect();
+    // Per-slot cooperative pass-interrupt flags (EngineCommand::Interrupt).
+    // Deliberately engine-local rather than a PendingWork field: the flag is
+    // transient control-plane state, and PendingWork literals are constructed
+    // in ~20 places (tests included) that must not churn for it.
+    let mut interrupts: Vec<bool> = vec![false; n];
     let mut work: Vec<PendingWork> = (0..n)
         .map(|s| PendingWork {
             slot: SlotId(s),
@@ -3934,9 +3565,7 @@ fn run_loop(
             decoding: false,
             vl_prefill: None,
             spec: SpecKind::None,
-            spec_cycles: 0,
-            spec_committed: 0,
-            spec_retire_fails: 0,
+            spec_retire: hipfire_runtime::spec_retire::SpecRetire::default(),
             pos3_delta: 0,
         })
         .collect();
@@ -3969,6 +3598,13 @@ fn run_loop(
                 rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
                 let _ = rig.fair_queue.remove(sid.0);
                 clear_work_slot(&mut work[s]);
+                // A dead session's Query checkpoint/source must not survive
+                // into the slot's next occupant (its store is being closed).
+                #[cfg(feature = "kvmem")]
+                if let Some(run) = rig.legacy_queries.get_mut(s) {
+                    *run = None;
+                    rig.legacy_query_decided[s] = false;
+                }
                 rig.model.clear_slot_vl_state(&mut rig.gpu, s);
             }
         }
@@ -3997,9 +3633,16 @@ fn run_loop(
                         .max(std::time::Duration::from_secs(1))
                 }) {
                     Some(wait) => match rx.recv_timeout(wait) {
-                        Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
+                        Ok(cmd) => handle_command(
+                            &mut rig,
+                            &mut slots,
+                            &mut work,
+                            &stats,
+                            &mut interrupts,
+                            cmd,
+                        ),
                         Err(RecvTimeoutError::Timeout) => {
-                            sweep_sessions(&mut rig);
+                            serve_engine_admit::sweep_sessions(&mut rig);
                             let mut st = stats.lock().expect("stats");
                             st.note_swap(&rig.swap);
                             drop(st);
@@ -4008,14 +3651,28 @@ fn run_loop(
                         Err(RecvTimeoutError::Disconnected) => break 'serve,
                     },
                     None => match rx.recv() {
-                        Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
+                        Ok(cmd) => handle_command(
+                            &mut rig,
+                            &mut slots,
+                            &mut work,
+                            &stats,
+                            &mut interrupts,
+                            cmd,
+                        ),
                         Err(_) => break 'serve, // all senders gone: shut down after drain
                     },
                 }
             }
             loop {
                 match rx.try_recv() {
-                    Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
+                    Ok(cmd) => handle_command(
+                        &mut rig,
+                        &mut slots,
+                        &mut work,
+                        &stats,
+                        &mut interrupts,
+                        cmd,
+                    ),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         if slots.iter().all(|s| s.is_none()) {
@@ -4037,8 +3694,13 @@ fn run_loop(
                 if let Some(pp) = rig.pool.page_pool() {
                     st.note_pool_pages(pp.free_pages(), pp.n_pages());
                 }
+                kvmem_hooks::note_stats(&rig, &mut st);
                 st.note_swap(&rig.swap);
             }
+            // P2.2b2: capture coverage recurrent checkpoints at aligned decode
+            // frontiers (opt-in HIPFIRE_KVMEM_PREFIX_COVERAGE). Soft: a refused
+            // capture only loses that endpoint anchor.
+            kvmem_hooks::coverage_capture(&mut rig, &mut slots, &work);
             // Expire timed-out waiters → typed queue timeout rejection. The
             // deadline is WALL-CLOCK (`serve.queue_timeout_ms` against the
             // enqueue Instant), not a tick count: ticks advance once per serve
@@ -4094,7 +3756,7 @@ fn run_loop(
                 };
                 let active_before = slots.iter().filter(|s| s.is_some()).count();
                 rig.pending_repark_age = Some(parked.enqueued_at);
-                admit(&mut rig, &mut slots, &mut work, &stats, parked.req);
+                serve_engine_admit::admit(&mut rig, &mut slots, &mut work, &stats, parked.req);
                 rig.pending_repark_age = None;
                 let active_after = slots.iter().filter(|s| s.is_some()).count();
                 // If admit did not place the request in a slot (it may have
@@ -4125,11 +3787,38 @@ fn run_loop(
                     .min()
                     .unwrap_or(std::time::Duration::from_millis(50));
                 match rx.recv_timeout(sleep_for) {
-                    Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
+                    Ok(cmd) => handle_command(
+                        &mut rig,
+                        &mut slots,
+                        &mut work,
+                        &stats,
+                        &mut interrupts,
+                        cmd,
+                    ),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'serve,
                 }
                 continue;
+            }
+            // ── Cooperative pass interrupts (think-recovery) ──
+            // A pending Interrupt must land BEFORE this step materializes any
+            // token: end the pass at the current boundary, report it as a
+            // MaxTokens done, and keep the session KV resident so the daemon's
+            // continuation pass finds it reusable. Placed after admission (so
+            // a freshly admitted request cannot be interrupted before its
+            // first step) and before every per-slot section below.
+            for s in 0..n {
+                if interrupts[s] {
+                    interrupts[s] = false;
+                    if slots[s].is_some() {
+                        finish_interrupted_pass(&mut rig, &mut slots, &mut work, &stats, s);
+                    }
+                }
+            }
+            if slots.iter().all(|s| s.is_none()) && rig.wait_queue.queued_count() == 0 {
+                // The last busy slot was interrupted and nothing else is
+                // ready: skip the (all-empty) scheduling sections this step.
+                continue 'serve;
             }
             // Slot occupancy for this step, after admission. Each terminal
             // below releases its slot in the stats BEFORE posting its event,
@@ -4296,11 +3985,12 @@ fn run_loop(
                         let seed = work[s].remaining_prompt.last().copied();
                         // Token penalties scope the verify rows against this
                         // request's emitted history (`sess.tokens` past the
-                        // rendered prompt); only penalized MTP requests need
-                        // it, so the others skip the copy.
+                        // rendered prompt); only penalized spec requests need
+                        // it, so the others skip the copy. MTP and DFlash share
+                        // the parked config and the same penalty prepass.
                         let emitted: Vec<u32> = match work[s].spec {
-                            SpecKind::Mtp => {
-                                let pl = rig.model.mtp_req_sampling[s]
+                            SpecKind::Mtp | SpecKind::Dflash => {
+                                let pl = rig.model.spec_req_sampling[s]
                                     .as_ref()
                                     .filter(|c| c.sampling.penalized())
                                     .map(|c| c.prompt_len);
@@ -4318,13 +4008,23 @@ fn run_loop(
                             _ => Vec::new(),
                         };
                         let outcome = match work[s].spec {
-                            SpecKind::Mtp => rig
-                                .model
-                                .mtp_draft_step(&mut rig.gpu, SlotId(s), &mut work[s], &emitted)
-                                .map(SpecDraftRows::Mtp),
+                            SpecKind::Mtp => {
+                                let session_id =
+                                    slots[s].as_ref().map(|f| f.session.0).unwrap_or(0);
+                                rig.model
+                                    .mtp_draft_step(
+                                        &mut rig.gpu,
+                                        SlotId(s),
+                                        &mut work[s],
+                                        &emitted,
+                                        session_id,
+                                        rig.cap_tokens,
+                                    )
+                                    .map(SpecDraftRows::Mtp)
+                            }
                             SpecKind::Dflash => rig
                                 .model
-                                .dflash_draft_step(&mut rig.gpu, SlotId(s), &mut work[s])
+                                .dflash_draft_step(&mut rig.gpu, SlotId(s), &mut work[s], &emitted)
                                 .map(SpecDraftRows::Dflash),
                             SpecKind::None => {
                                 unreachable!("spec.active() gate above")
@@ -4332,6 +4032,12 @@ fn run_loop(
                         };
                         match outcome {
                             Ok(draft) => {
+                                // 期4 speculative statistics: one target round,
+                                // `rows−1` proposal candidates (the seed row is
+                                // not a proposal).
+                                let rows = draft.verify_tokens().len() as u64;
+                                rig.spec_counters[s].rounds += 1;
+                                rig.spec_counters[s].drafted += rows.saturating_sub(1);
                                 spec_seeds[s] = seed;
                                 spec_drafts[s] = Some(draft);
                             }
@@ -4487,11 +4193,30 @@ fn run_loop(
                     eligible[s] = granted_ids.contains(&f.session.0);
                 }
             }
-            let sched_batch = sched.next_batch_eligible(
+            // KVMem Legacy Query capture/caps and the optional last-token hold
+            // are prepared behind the stable seam; stock scheduling is unchanged.
+            let (legacy_query_caps, legacy_contract) =
+                match kvmem_hooks::prepare_schedule(&mut rig, &slots, &work) {
+                    Ok(plan) => plan,
+                    Err(e) => {
+                        fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                        poison = Some(e);
+                        break 'serve;
+                    }
+                };
+            let hold_tail = if legacy_contract {
+                vec![false; n]
+            } else {
+                kvmem_hooks::hold_tail_mask(&rig, &work)
+            };
+            let sched_batch = kvmem_hooks::schedule_batch(
+                &mut sched,
                 &mut work,
                 remaining_for_sched,
                 prefill_min_tokens,
                 &eligible,
+                &hold_tail,
+                &legacy_query_caps,
             );
 
             // Count prefill + decode rows the scheduler emitted.
@@ -4602,6 +4327,29 @@ fn run_loop(
             if batch.is_empty() {
                 continue;
             }
+            #[cfg(feature = "kvmem")]
+            let legacy_query_reads =
+                match kvmem_engine::capture_legacy_query_rows(&mut rig, &batch, n) {
+                    Ok(rows) => rows,
+                    Err(reason) => {
+                        fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                        poison = Some(reason);
+                        break 'serve;
+                    }
+                };
+            if let Err(e) = kvmem_hooks::prepare_step(&mut rig, &slots, &work, &batch, n) {
+                fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                poison = Some(e);
+                break 'serve;
+            }
+            // P4.3: batch-time prefill snapshot for the end-of-iteration
+            // canonical freeze. The spec/emit sections flip `work[s].decoding`
+            // and advance `next_pos` mid-iteration; the freeze must see the
+            // chunk exactly as it was fed (boundary = post-chunk next_pos).
+            #[cfg(feature = "kvmem")]
+            let freeze_snapshot: Vec<(bool, usize)> = (0..n)
+                .map(|s| (!work[s].decoding, work[s].next_pos))
+                .collect();
             // Provision every slot's write frontier before any COW or kernel work.
             // If retained cache-only pages consumed the free list, evict unpinned
             // radix leaves and retry once. `forward_batch_slots` repeats this call
@@ -4889,11 +4637,55 @@ fn run_loop(
                 work[s].spec == SpecKind::Dflash
                     && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
             });
+            // 期4 speculative statistics: a decode row served as plain AR while
+            // the request asked for a drafter (retired, cap guard, or a reuse
+            // without a draft image) counts as a fallback step
+            // (speculative.hpp `fallback_steps`).
+            for s in 0..n {
+                if rig.spec_counters[s].requested
+                    && work[s].decoding
+                    && !work[s].spec.active()
+                    && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
+                {
+                    rig.spec_counters[s].fallback += 1;
+                }
+            }
             // Step span (opt-in `HIPFIRE_CPU_EXEC_TRACE` only): forward vs
             // sample vs sync/readback vs emit. Host wall around work this step
             // already runs; no new sync, no order change.
             let t_step = std::time::Instant::now();
             let t_forward = std::time::Instant::now();
+            // ── Layerwise orchestration (design §3.9g, kvmem-gated) ──────────
+            // Scoped take of the controller so the per-query carrier can borrow
+            // its slot stores while the rest of the model is borrowed by the
+            // forward (the driver must NOT live in a ModelRig field — it borrows
+            // kvmem, which is also in ModelRig ⇒ self-reference). Only an
+            // admissible single-slot text-only q8 paged decode admits Layerwise;
+            // everything else threads None (Legacy byte-neutral). The carrier is
+            // confined to the `Ok(Some)` arm: `free` consumes it, ending its
+            // borrow of the taken-out controller strictly before the counter bump
+            // and restore — mirroring the scoped `ctl.prepare_step` borrow above.
+            // The post-forward statistics feed runs after the restore, so the
+            // host store still advances this step's row.
+            #[cfg(feature = "kvmem")]
+            let fwd = match kvmem_engine::layerwise_forward(
+                &mut rig,
+                &batch,
+                &slots,
+                &work,
+                &mut graph,
+                &lm_head_skip,
+                any_verify,
+                any_dflash_rows,
+            ) {
+                Ok(fwd) => fwd,
+                Err(e) => {
+                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                    poison = Some(e);
+                    break 'serve;
+                }
+            };
+            #[cfg(not(feature = "kvmem"))]
             let fwd = rig.model.forward_step(
                 &mut rig.gpu,
                 &batch,
@@ -4902,6 +4694,7 @@ fn run_loop(
                 &lm_head_skip,
                 any_verify,
                 any_dflash_rows,
+                None,
             );
             let forward_ns = t_forward.elapsed().as_nanos() as u64;
             // ── Publication (spec §4.6 C6) ──────────────────────────────────
@@ -5020,6 +4813,7 @@ fn run_loop(
                                     domain,
                                     new_boundary as u64,
                                     &tokens,
+                                    None, // radix path: text-only
                                     &rig.model.dn_states[s],
                                 ) {
                                     Ok(id) if id.is_some() => Some(id),
@@ -5102,6 +4896,28 @@ fn run_loop(
                 poison = Some(reason);
                 break 'serve;
             }
+            if kvmem_hooks::forward_time_enabled(&rig) {
+                let _ = forward_ns;
+                eprintln!(
+                    "[kvmem-time] forward {} rows: {:.1} ms through sync",
+                    batch.total_rows(),
+                    t_forward.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            // ── KVMem Legacy Query readback ────────────────────────────────
+            // Post-sync the capture holds post-norm/pre-RoPE Q for exactly the
+            // rows masked above. Every FullAttention layer appends its rows
+            // contiguously to the slot's Query accumulation. A failure is a
+            // clean bypass (the intact first pass stays authoritative), never a
+            // partially recorded probe.
+            #[cfg(feature = "kvmem")]
+            kvmem_engine::read_legacy_query_rows(&mut rig, &legacy_query_reads);
+            if let Err(e) = kvmem_hooks::feed_step(&mut rig, &batch, &slots, &work, &spec_drafts, n)
+            {
+                fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                poison = Some(e);
+                break 'serve;
+            }
             if check_pool_invariants {
                 if let Some(pp) = rig.pool.page_pool() {
                     pp.check_invariants();
@@ -5114,6 +4930,30 @@ fn run_loop(
             // The walk is over a short pending list — cheap per step.
             if let Some(pp) = rig.pool.page_pool_mut() {
                 pp.drain_completed();
+            }
+            // ── KVMem Legacy Query replay transaction ──────────────────────
+            // After this step's accepted rows are fed, a Query whose probe is
+            // complete either publishes its score round once (no useful replay)
+            // or rewinds the slot to the pre-Query checkpoint and replays the
+            // exact client prompt suffix. Rewind is destructive from the first
+            // `start_replay`: a later failure poisons the engine instead of
+            // claiming the first pass still stands.
+            #[cfg(feature = "kvmem")]
+            let mut legacy_rewound = vec![false; n];
+            #[cfg(feature = "kvmem")]
+            if rig
+                .model
+                .kvmem
+                .as_ref()
+                .is_some_and(|ctl| ctl.legacy_config().is_some())
+            {
+                if let Err(e) =
+                    advance_legacy_query_replay(&mut rig, &slots, &mut work, &mut legacy_rewound)
+                {
+                    fail_all_active(&mut rig, &mut slots, &mut work, e.clone());
+                    poison = Some(e);
+                    break 'serve;
+                }
             }
             // Penalty windows: for each slot whose request carries non-neutral
             // token penalties, clamp the requested window to what the session
@@ -5380,6 +5220,17 @@ fn run_loop(
             let t_emit = std::time::Instant::now();
 
             for s in 0..n {
+                // A slot rewound by an admitted Query replay produced first-pass
+                // logits this iteration; they are stale. Free any drafted rows
+                // and skip ALL per-slot emission for it — the replayed prefix is
+                // the only authority from here on.
+                #[cfg(feature = "kvmem")]
+                if legacy_rewound[s] {
+                    if let Some(draft) = spec_drafts[s].take() {
+                        draft.free_gpu(&mut rig.gpu);
+                    }
+                    continue;
+                }
                 // Spec verify/accept: process slots that produced draft outputs.
                 if let Some(draft) = spec_drafts[s].take() {
                     if slots[s].is_none() {
@@ -5432,54 +5283,61 @@ fn run_loop(
                     };
                     match accept_outcome {
                         Ok(tokens) => {
-                            for tok in &tokens {
-                                commit_sampled_token(
-                                    &mut rig, &mut slots, &mut work, &stats, s, *tok,
-                                );
+                            // 期4 speculative statistics: committed outputs
+                            // include the bonus row; accepted candidates
+                            // exclude it (speculative.hpp semantics). Count
+                            // only tokens the request actually consumed — a
+                            // terminal token (EOS / cancel / cap) ends the
+                            // batch, and the rows behind it were never
+                            // delivered, so charging them would overstate
+                            // accepted/generated for the rest of the run.
+                            let mut committed = 0u64;
+                            let mut accepted = 0u64;
+                            for (row, tok) in tokens.iter().enumerate() {
                                 if slots[s].is_none() {
                                     break;
                                 }
+                                commit_sampled_token(
+                                    &mut rig, &mut slots, &mut work, &stats, s, *tok,
+                                );
+                                committed += 1;
+                                if row + 1 < tokens.len() {
+                                    accepted += 1;
+                                }
                             }
-                            // Adaptive retire: a head that cannot sustain the
-                            // minimum mean advance loses wall-clock on the spec
-                            // cycle (~2x an AR step). Fall back to plain AR for
-                            // the rest of this request. The last committed token
-                            // is already in remaining_prompt; the scheduler picks
-                            // the slot up as a regular decode row next step.
+                            rig.spec_counters[s].generated += committed;
+                            rig.spec_counters[s].accepted += accepted;
+                            // Adaptive retire (shared `SpecRetire`, the same
+                            // policy the sequential drafter uses): a head that
+                            // cannot sustain the break-even advance loses
+                            // wall-clock on the spec cycle (~2x an AR step).
+                            // Fall back to plain AR for the rest of this
+                            // request. Applies to MTP and DFlash2 alike. The
+                            // last committed token is already in
+                            // remaining_prompt; the scheduler picks the slot up
+                            // as a regular decode row next step.
                             if slots[s].is_some() && work[s].spec.active() {
-                                work[s].spec_cycles += 1;
-                                work[s].spec_committed += tokens.len();
-                                if work[s].spec_cycles >= MTP_RETIRE_WINDOW {
-                                    let mean =
-                                        work[s].spec_committed as f64 / work[s].spec_cycles as f64;
-                                    // Reset the window each time it fills; only a
-                                    // SECOND consecutive failure retires.
-                                    work[s].spec_cycles = 0;
-                                    work[s].spec_committed = 0;
-                                    if mean < MTP_RETIRE_MIN_ADVANCE {
-                                        work[s].spec_retire_fails += 1;
-                                    } else {
-                                        work[s].spec_retire_fails = 0;
-                                    }
-                                    if work[s].spec_retire_fails >= MTP_RETIRE_WINDOWS {
-                                        if rig.gpu.slot_trace() {
-                                            eprintln!(
-                                            "[slot-trace] MTP retired for slot {s}: mean advance {mean:.2} over {} consecutive windows",
-                                            MTP_RETIRE_WINDOWS
+                                let position = work[s].next_pos;
+                                let kind = work[s].spec;
+                                if work[s].spec_retire.observe(
+                                    tokens.len(),
+                                    rig.model.spec_rows,
+                                    position,
+                                ) {
+                                    if rig.gpu.slot_trace() {
+                                        eprintln!(
+                                            "[slot-trace] {kind:?} retired for slot {s} at position {position} (break-even policy)",
                                         );
-                                        }
-                                        work[s].spec = SpecKind::None;
-                                        work[s].spec_retire_fails = 0;
-                                        // Of the committed tokens only the newest
-                                        // lacks a KV row (the rest were written by
-                                        // verify) — keep just it, like the cap
-                                        // retire. The scheduler decodes it as a
-                                        // regular row next step.
-                                        if let Some(last) = work[s].remaining_prompt.last().copied()
-                                        {
-                                            work[s].remaining_prompt.clear();
-                                            work[s].remaining_prompt.push(last);
-                                        }
+                                    }
+                                    work[s].spec = SpecKind::None;
+                                    // Of the committed tokens only the newest
+                                    // lacks a KV row (the rest were written by
+                                    // verify) — keep just it, like the cap
+                                    // retire. The scheduler decodes it as a
+                                    // regular row next step.
+                                    if let Some(last) = work[s].remaining_prompt.last().copied() {
+                                        work[s].remaining_prompt.clear();
+                                        work[s].remaining_prompt.push(last);
                                     }
                                 }
                             }
@@ -5676,6 +5534,20 @@ fn run_loop(
                     // G1, A17). ClientGone is never overridden: the receiver is
                     // already dropped.
                     lock_stats(&stats).note_slot_released();
+                    // 期4: fold this request's speculative counters
+                    // (completed-request statistics; cancellation included).
+                    {
+                        let spec = std::mem::take(&mut rig.spec_counters[s]);
+                        if spec.requested {
+                            let mut st = lock_stats(&stats);
+                            st.speculative.requests += 1;
+                            st.speculative.rounds += spec.rounds;
+                            st.speculative.drafted_tokens += spec.drafted;
+                            st.speculative.accepted_tokens += spec.accepted;
+                            st.speculative.generated_tokens += spec.generated;
+                            st.speculative.fallback_steps += spec.fallback;
+                        }
+                    }
                     if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
                         let _ = send_event(
                             &f.reply,
@@ -5704,6 +5576,14 @@ fn run_loop(
                     // publish_generated_prefix never publishes a page whose
                     // rows were not written.
                     publish_generated_prefix(&mut rig, &mut slots, s, work[s].next_pos);
+                    // P2.2b2: freeze the page-aligned accepted frontier INCLUDING
+                    // the generated rows, reusing a coverage recurrent checkpoint
+                    // as its proof (ninfer endpoint capture). No-op without a
+                    // coverage anchor, resident pages, or a longer frontier.
+                    #[cfg(feature = "kvmem")]
+                    if !grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
+                        kvmem_freeze_endpoint(&mut rig, &mut slots, s);
+                    }
                     // Hand the slot back — the session stays resident for
                     // continuation, but slot occupancy must end at terminal
                     // (matching commit_sampled_token). Wave 8's unpin edit
@@ -5713,6 +5593,17 @@ fn run_loop(
                     slots[s] = None;
                     let _ = rig.fair_queue.remove(session.0);
                     clear_work_slot(&mut work[s]);
+                    // Speculative/terminal path: drop any unfinished Query
+                    // lifecycle with the request. The plain-AR terminal path
+                    // does the same in `commit_sampled_token`; without this
+                    // reset a completed short request latched
+                    // `legacy_query_decided` and suppressed the Query for the
+                    // slot's next request.
+                    #[cfg(feature = "kvmem")]
+                    if let Some(run) = rig.legacy_queries.get_mut(s) {
+                        *run = None;
+                        rig.legacy_query_decided[s] = false;
+                    }
                     rig.model.clear_slot_vl_state(&mut rig.gpu, s);
                     if matches!(reason, DoneReason::ClientGone) {
                         // Nobody will follow up on a vanished client, so hand the
@@ -5720,10 +5611,13 @@ fn run_loop(
                         rig.swap.forget(session.0);
                         rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
                     } else {
-                        // state are exactly what a follow-up turn continuing this
-                        // conversation needs; closing here is what made multi-turn
-                        // reuse impossible. LRU eviction reclaims the slot when
-                        // someone else needs it.
+                        // Keep the session resident: the trunk KV (under KVMem
+                        // including the host store's statistics and spilled
+                        // pages), DeltaNet and MTP head state are exactly what a
+                        // follow-up turn continuing this conversation needs;
+                        // closing here is what made multi-turn reuse impossible.
+                        // LRU eviction reclaims the slot when someone else needs
+                        // it (closing, not swapping, under KVMem).
                         rig.sessions.touch(session);
                     }
                 } else {
@@ -5741,6 +5635,15 @@ fn run_loop(
                     rig.sessions.touch(session);
                 }
             }
+            #[cfg(feature = "kvmem")]
+            kvmem_engine::freeze_prefill_boundaries(
+                &mut rig,
+                &mut slots,
+                &batch,
+                &freeze_snapshot,
+                n,
+                fwd.is_ok(),
+            );
             let emit_ns = t_emit.elapsed().as_nanos() as u64;
             let total_ns = t_step.elapsed().as_nanos() as u64;
             if hipfire_dispatch::moe_trace_enabled() {
@@ -5805,6 +5708,7 @@ fn run_loop(
         (None, Err(e)) => Err(e),
     }
 }
+
 fn should_retain_terminal_tok(reason: DoneReason) -> bool {
     matches!(reason, DoneReason::MaxTokens)
 }
@@ -5824,6 +5728,7 @@ fn handle_command(
     slots: &mut [Option<InFlight>],
     work: &mut [PendingWork],
     stats: &Arc<Mutex<EngineStats>>,
+    interrupts: &mut [bool],
     cmd: EngineCommand,
 ) {
     match cmd {
@@ -5860,7 +5765,7 @@ fn handle_command(
                     }
                 }
             } else {
-                admit(rig, slots, work, stats, req);
+                serve_engine_admit::admit(rig, slots, work, stats, req);
             }
         }
         EngineCommand::CancelWaiting { request_tag } => {
@@ -5903,12 +5808,33 @@ fn handle_command(
                     drop(inflight.reply);
                 }
                 clear_work_slot(&mut work[idx]);
+                #[cfg(feature = "kvmem")]
+                if let Some(run) = rig.legacy_queries.get_mut(idx) {
+                    *run = None;
+                    rig.legacy_query_decided[idx] = false;
+                }
                 rig.model.clear_slot_vl_state(&mut rig.gpu, idx);
                 let _ = rig.fair_queue.remove(session);
             }
             rig.swap.forget(session);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
             let _ = reply.send(Ok(()));
+        }
+        EngineCommand::Interrupt { session } => {
+            // Set the transient per-slot flag; the serve loop drains it at the
+            // top of the next scheduler step (before any per-slot work), so
+            // the pass ends at a token boundary with the session's KV intact.
+            // Unknown/parked sessions are a no-op: the daemon only interrupts
+            // after it has been told the session was accepted.
+            if let Some(idx) = slots.iter().position(|s| {
+                s.as_ref()
+                    .map(|f| f.session == SessionId(session))
+                    .unwrap_or(false)
+            }) {
+                if let Some(flag) = interrupts.get_mut(idx) {
+                    *flag = true;
+                }
+            }
         }
         EngineCommand::Reset { reply } => {
             if slots.iter().any(|s| s.is_some()) {
@@ -5926,6 +5852,27 @@ fn handle_command(
                 rig.swap.forget(id);
                 rig.sessions
                     .close(&mut rig.pool, &mut rig.adm, SessionId(id));
+            }
+            // Reset returns the engine to a cold empty table: parked
+            // inactive histories and any half-finished Query checkpoint go
+            // with it (their host stores belong to sessions that no longer
+            // exist).
+            #[cfg(feature = "kvmem")]
+            {
+                for run in rig.legacy_queries.iter_mut() {
+                    *run = None;
+                }
+                for decided in rig.legacy_query_decided.iter_mut() {
+                    *decided = false;
+                }
+                if let Some(catalog) = rig.legacy_history.as_mut() {
+                    if let Ok(dropped) = catalog.clear() {
+                        eprintln!(
+                            "[kvmem-legacy] HistoryReset dropped_entries={}",
+                            dropped.len()
+                        );
+                    }
+                }
             }
             // Drop prefix cache state so subsequent lookups miss (spec §4.6).
             // The radix index owns cache leases taken at publication: it
@@ -6043,1478 +5990,33 @@ fn sync_fair_needs(
     let _ = q.set_uncached_prefill(id, uncached);
 }
 
-/// Admit one request, evicting an idle session if that is what it takes.
-fn admit(
-    rig: &mut Rig,
-    slots: &mut [Option<InFlight>],
-    work: &mut [PendingWork],
-    stats: &Arc<Mutex<EngineStats>>,
-    req: SubmitRequest,
-) {
-    let busy: Vec<SessionId> = slots.iter().flatten().map(|f| f.session).collect();
-
-    if let Some(vd) = req.visual_data.as_ref() {
-        let reject = |reason: String| {
-            let _ = send_event(
-                &req.reply,
-                Event::Rejected {
-                    class: RejectClass::Validation,
-                    reason,
-                },
-            );
-            lock_stats(stats).note_rejected();
-        };
-        if rig.model.vision_weights.is_none() {
-            reject("VL request but model has no vision encoder".to_string());
-            return;
-        }
-        // Batched VL runs the paged block-table path like any slot; only the
-        // legacy sequential fallback needs a contiguous slab view.
-        if rig.pool.is_paged() && rig.vl_sequential {
-            reject("VL sequential path requires contiguous KV slots".to_string());
-            return;
-        }
-        if rig.tokenizer.special_token_id("<|image_pad|>").is_none() {
-            reject("VL tokenizer missing <|image_pad|>".to_string());
-            return;
-        }
-        if vd.n_visual_tokens == 0 {
-            reject("VL request has no visual tokens".to_string());
-            return;
-        }
-        if vd.mrope_positions.len() != req.prompt_tokens.len() {
-            reject(format!(
-                "VL mrope_positions length {} != prompt_tokens {}",
-                vd.mrope_positions.len(),
-                req.prompt_tokens.len()
-            ));
-            return;
-        }
-    }
-
-    // Bound parked-session growth before matching: close swapped/cold
-    // sessions idle past the TTL, then enforce the non-resident cap. A
-    // resident session is never a sweep victim.
-    sweep_sessions(rig);
-
-    // Multi-turn continuation. The client resends the whole conversation, so a
-    // follow-up turn is matched by its USER turns and then built by APPENDING
-    // `continuation` to the session's exact stored tokens. Appending rather
-    // than re-rendering is what makes it a strict extension: the generated
-    // turn began after an OpenThink opener that history rendering does not
-    // replay, and re-encoding the decoded reply is not guaranteed to round
-    // trip. Reuse also keeps the DeltaNet state, which is the point.
-    // Set when a matched session's snapshot was lost and restore marked it
-    // Cold: the cold path below re-prefills into that same session instead of
-    // minting a new id (which would strand the old entry).
-    let mut cold_reuse: Option<SessionId> = None;
-    if req.visual_data.is_none() && !req.continuation.tokens().is_empty() {
-        if rig.gpu.slot_trace() {
-            let shape = match &req.continuation {
-                Continuation::ToolResults { session, .. } => {
-                    format!("tool-results of session {session}")
-                }
-                _ => "new user turn".to_string(),
-            };
-            eprintln!(
-                "[slot-trace] continuation attempt ({shape}): convo={:?} suffix={} tokens",
-                req.convo,
-                req.continuation.tokens().len(),
-            );
-            for (id, sess) in rig.sessions.iter() {
-                eprintln!(
-                    "[slot-trace]   session {} convo={:?} slot={:?} residency={:?} tokens={}",
-                    id,
-                    sess.convo,
-                    sess.slot,
-                    sess.residency,
-                    sess.tokens.len()
-                );
-            }
-        }
-        // The suffix shape decides which match is legal — never both. A user
-        // turn searches for the session one turn behind; tool results confirm
-        // the session that emitted the calls being answered. Either way the
-        // suffix is appended to the session's exact stored tokens, so the KV
-        // and DeltaNet state extend strictly.
-        let matched = match &req.continuation {
-            Continuation::Cold => None,
-            Continuation::UserTurn(_) => rig.sessions.find_continuation(&req.convo, &busy),
-            Continuation::ToolResults { session, .. } => {
-                rig.sessions
-                    .confirm_reentry(SessionId(*session), &req.convo, &busy)
-            }
-        };
-        if let Some(existing) = matched {
-            let base = rig
-                .sessions
-                .get(existing)
-                .map(|s| s.tokens.clone())
-                .unwrap_or_default();
-            // A matched session may be SWAPPED. Bring it back before use --
-            // this is the half of SP6 that makes eviction worth doing, and
-            // without it evicted snapshots accumulate and their sessions are
-            // never seen again.
-            let mut slot = rig.sessions.get(existing).and_then(|s| s.slot);
-            // Resident = this session never left the slot, so the slot's
-            // trunk KV/DN state AND the MTP head's private KV (filled through
-            // this session's tokens) are still exactly right. Only a
-            // swap-restore loses the head KV — the swap snapshot does not
-            // carry it — and must reset before the suffix re-fills.
-            let mtp_head_kv_valid = slot.is_some();
-            if slot.is_none() {
-                let free = rig.pool.acquire().or_else(|| {
-                    rig.sessions
-                        .lru_idle_victim(&busy)
-                        .filter(|v| *v != existing)
-                        .and_then(|v| {
-                            if evict(rig, v, stats) {
-                                lock_stats(stats).note_eviction();
-                            }
-                            rig.pool.acquire()
-                        })
-                });
-                if let Some(target) = free {
-                    if restore(rig, existing, target, stats) {
-                        lock_stats(stats).note_restore();
-                        slot = Some(target);
-                    } else {
-                        // restore marked it Cold; its tokens survive, so the
-                        // cold path below re-prefills the same session rather
-                        // than minting a new id and stranding this entry.
-                        cold_reuse = Some(existing);
-                        rig.pool.release(target);
-                    }
-                }
-            }
-            if let Some(slot) = slot {
-                let mut extended = base;
-                extended.extend_from_slice(req.continuation.tokens());
-                // Prefill-side context-cap guard (mirrors decode hit_ctx_cap).
-                // A prompt/extension already at the KV cap overflows set_seq_len
-                // during prefill before any decode step can stop it.
-                if extended.len() >= rig.cap_tokens {
-                    // A session at the KV cap can never grow: report the
-                    // condition as a REJECTION, not a Done — a successful
-                    // empty completion here made every subsequent turn on
-                    // the session a silent no-op (it would re-enter this
-                    // guard forever while the resident session pinned its
-                    // slot). The session is closed so the slot is released;
-                    // a follow-up on the same conversation re-attempts cold
-                    // and receives the same actionable rejection.
-                    let reason = format!(
-                        "context window full: the conversation holds {} of \
-                         {} tokens and cannot extend — start a new \
-                         conversation",
-                        extended.len(),
-                        rig.cap_tokens
-                    );
-                    let _ = send_event(
-                        &req.reply,
-                        Event::Rejected {
-                            class: RejectClass::Validation,
-                            reason,
-                        },
-                    );
-                    rig.swap.forget(existing.0);
-                    rig.sessions.close(&mut rig.pool, &mut rig.adm, existing);
-                    return;
-                }
-                // vLLM-style admission belt, mirroring the daemon's cold-path
-                // belt: the extension plus the requested generation budget
-                // must fit the context. Without this, a request admitted in
-                // the (cap - max_tokens, cap) window decodes until the ctx-cap
-                // guard truncates it — a silent "length" finish the client
-                // never asked for. The SESSION is kept (it still has room to
-                // grow): only this request is rejected, so a retry with a
-                // smaller max_tokens can still continue the conversation.
-                if extended.len() + req.max_tokens.max(1) > rig.cap_tokens {
-                    let reason = format!(
-                        "context window budget: the conversation would hold {} \
-                         tokens and the request asks for {} more, beyond the {} \
-                         token context — reduce max_tokens or start a new \
-                         conversation",
-                        extended.len(),
-                        req.max_tokens.max(1),
-                        rig.cap_tokens
-                    );
-                    let _ = send_event(
-                        &req.reply,
-                        Event::Rejected {
-                            class: RejectClass::Validation,
-                            reason,
-                        },
-                    );
-                    return;
-                }
-                // Page-demand reclaim (spec §5.4 S4 row 3), mirroring the
-                // cold-admit path: the suffix plus generation budget must be
-                // backable by the pool BEFORE begin_turn mutates the table —
-                // otherwise the forward dies mid-prefill on "need N more
-                // pages". Evict radix leaves first, then LRU idle sessions;
-                // the matched session itself is never a victim.
-                if rig.pool.is_paged() {
-                    // `held` = tokens already materialized in this slot's KV.
-                    // For a RESIDENT session that is the descriptor's seq_len
-                    // (the real frontier), NOT sess.next_pos — next_pos is
-                    // only stamped at begin_turn/mark_resident and still holds
-                    // the PREVIOUS turn's reuse point, which over-counts the
-                    // suffix and evicts/rejects requests the pool could back.
-                    let held = rig
-                        .pool
-                        .descriptors()
-                        .get(slot.0)
-                        .map(|d| d.seq_len.max(0) as usize)
-                        .unwrap_or_else(|| {
-                            rig.sessions.get(existing).map(|s| s.next_pos).unwrap_or(0)
-                        });
-                    let needed_pages = extended
-                        .len()
-                        .saturating_sub(held)
-                        .saturating_add(req.max_tokens.max(1))
-                        .div_ceil(PAGE_TOKENS)
-                        .saturating_add(1);
-                    if let (Some(idx), Some(domain)) =
-                        (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
-                    {
-                        let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-                        if free < needed_pages {
-                            let page_bytes = rig
-                                .pool
-                                .page_pool()
-                                .map(|pp| pp.k_page_bytes() + pp.v_page_bytes())
-                                .unwrap_or(0);
-                            let pp = rig.pool.page_pool_mut().expect("paged pool");
-                            idx.evict_unpinned_leaves(
-                                pp,
-                                needed_pages.saturating_sub(free) * page_bytes,
-                            );
-                        }
-                        let _ = domain;
-                    }
-                    let mut exclude: Vec<SessionId> = busy.clone();
-                    exclude.push(existing);
-                    loop {
-                        let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-                        if free >= needed_pages {
-                            break;
-                        }
-                        let Some(victim) = rig.sessions.lru_idle_victim(&exclude) else {
-                            break;
-                        };
-                        if !evict(rig, victim, stats) {
-                            break;
-                        }
-                        lock_stats(stats).note_eviction();
-                    }
-                    let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-                    if free < needed_pages {
-                        // Keep the session resident — a smaller retry can
-                        // still continue it; only this request is refused.
-                        let _ = send_event(
-                            &req.reply,
-                            Event::Rejected {
-                                class: RejectClass::Overload,
-                                reason: format!(
-                                    "page demand exceeds pool: need \
-                                     {needed_pages} pages, {free} free \
-                                     after reclaim"
-                                ),
-                            },
-                        );
-                        lock_stats(stats).note_rejected();
-                        return;
-                    }
-                }
-                // Compile the JSON Schema BEFORE any session mutation (spec
-                // §7 G1/G2; P4 exit "strict requests never silently
-                // unconstrained"). A compile failure rejects the request and
-                // leaves the matched session untouched — the daemon
-                // pre-validates, so this only fires on drift between that
-                // gate and the engine's compiler.
-                let grammar_constraint = match req.json_schema.as_ref() {
-                    Some(schema) => match cached_compile_schema(rig, schema) {
-                        Ok(compiled) => Some(GrammarConstraint {
-                            matcher: grammar::json_schema::SchemaMatcher::from_compiled(&compiled),
-                            mask_buf: Vec::new(),
-                            in_think: req.started_in_think,
-                            think_open_id: rig.tokenizer.special_token_id("<think>"),
-                            think_close_id: rig.tokenizer.special_token_id("</think>"),
-                            think_tail: Vec::new(),
-                            think_budget: req.think_budget,
-                            think_tokens_used: 0,
-                            mask_cache: std::collections::HashMap::new(),
-                            mask_cache_order: std::collections::VecDeque::new(),
-                        }),
-                        Err(e) => {
-                            let _ = send_event(
-                                &req.reply,
-                                Event::Rejected {
-                                    class: RejectClass::Validation,
-                                    reason: format!("json_schema compile failed on admit: {e}"),
-                                },
-                            );
-                            lock_stats(stats).note_rejected();
-                            return;
-                        }
-                    },
-                    None => None,
-                };
-                // Resize the session's admission grant to the new turn's
-                // actual need BEFORE any mutation (spec §5.1 + §5.4 row 1:
-                // a failed grant is a pre-execution rejection, not a
-                // mid-turn shortfall). The old full-cap grant is shrunk or
-                // grown here; a growth that does not fit the budget fails
-                // this request cleanly and leaves the session untouched.
-                let turn_grant = extended
-                    .len()
-                    .saturating_add(req.max_tokens.max(1))
-                    .min(rig.cap_tokens);
-                if let Err(e) = rig
-                    .sessions
-                    .resize_grant(&mut rig.adm, existing, turn_grant)
-                {
-                    // A real budget shortfall is a capacity signal (429
-                    // Overload — retryable), not an internal fault (500).
-                    // UnknownSession/PoolFull are engine inconsistencies and
-                    // stay Internal.
-                    let class = match e {
-                        hipfire_runtime::admission::AdmitError::WouldExceedBudget { .. } => {
-                            RejectClass::Overload
-                        }
-                        _ => RejectClass::Internal,
-                    };
-                    let _ = send_event(
-                        &req.reply,
-                        Event::Rejected {
-                            class,
-                            reason: format!(
-                                "admission grant for the extended turn does not fit: {e}"
-                            ),
-                        },
-                    );
-                    lock_stats(stats).note_rejected();
-                    return;
-                }
-                match rig.sessions.begin_turn(&mut rig.pool, existing, &extended) {
-                    Ok(plan) => {
-                        if let Some(sess) = rig.sessions.get_mut(existing) {
-                            sess.tokens = extended.clone();
-                            sess.convo = req.convo.clone();
-                        }
-                        if send_event(
-                            &req.reply,
-                            Event::Accepted {
-                                session: existing.0,
-                                reused: plan.reused,
-                                prefill: extended.len() - plan.reused,
-                            },
-                        )
-                        .is_err()
-                        {
-                            // Mutated session must not remain reusable — forget swap,
-                            // close SessionTable/pool/admission so no poisoned KV/DN
-                            // state survives. Preserve typed Continuation semantics
-                            // and max-terminal-token accounting (caller retains base
-                            // for retransmission).
-                            rig.swap.forget(existing.0);
-                            rig.sessions.close(&mut rig.pool, &mut rig.adm, existing);
-                            return;
-                        }
-                        work[slot.0].remaining_prompt = extended[plan.reused..].to_vec();
-                        work[slot.0].next_pos = plan.reused;
-                        work[slot.0].decoding = false;
-                        // A text follow-up on a conversation that carries an
-                        // image turn keeps that turn's M-RoPE phase offset: KV
-                        // rows are addressed by token index, but the image
-                        // turn's keys hold compressed-grid phases, so this
-                        // turn's rows must phase-shift by the same delta.
-                        // (Image turns themselves are forced Cold and rebuild
-                        // the offset from their own table.)
-                        work[slot.0].pos3_delta = rig
-                            .sessions
-                            .get(existing)
-                            .map(|s| s.rope_delta)
-                            .unwrap_or(0);
-                        // MTP: activate if enabled. Vision continuations stay on
-                        // the sequential M-RoPE path (no MTP), matching cold
-                        // admits; sampling and penalties ride the MTP path via
-                        // `mtp_req_sampling` (see the cold-admit note). The head
-                        // KV reset is only needed
-                        // when the head KV was lost (swap-restore) or holds
-                        // another session's rows: a session resident on this slot
-                        // since its last turn keeps a head KV that matches its
-                        // committed prefix, so the suffix's head-fill extends it
-                        // in place.
-                        // Head-KV validity gates drafting: after a swap-restore
-                        // the head's private KV is reset to zeros, and the
-                        // suffix head-fill only covers NEW rows — drafting over
-                        // a zeroed prefix span collapses acceptance to ~1
-                        // (pure drafting overhead), so the turn retires to AR
-                        // instead. A session resident on this slot keeps a head
-                        // KV matching its committed prefix and drafts fine.
-                        let mtp_ok = rig.model.mtp_head.is_some()
-                            && rig.model.mtp_k > 0
-                            && req.visual_data.is_none()
-                            && req.json_schema.is_none()
-                            && mtp_head_kv_valid
-                            && rig.model.mtp_states[slot.0].is_some();
-                        // DFlash2 admit: same request-shape gates as MTP (text
-                        // only, greedy, no grammar). The draft's private state
-                        // survives on this slot across turns, so a continuation
-                        // whose reuse point equals the ring's watermark
-                        // (`seeded_through`) drafts over a fully-seeded
-                        // target_hidden — including radix-reused prefixes,
-                        // which MTP cannot do. An edit that truncates below the
-                        // watermark leaves stale ring rows: drop the state and
-                        // run AR (a partial ring would poison the draft's
-                        // context with the pre-edit suffix's hiddens).
-                        let dflash_ring_valid = rig.model.dflash_states[slot.0]
-                            .as_ref()
-                            .is_some_and(|st| st.seeded_through == plan.reused);
-                        // Legacy-mode ctx fit (sequential `spec_ctx_request_fits`
-                        // parity): the Legacy scatter writes target_hidden at the
-                        // ABSOLUTE position into a `ctx_capacity`-row buffer, so a
-                        // request that can grow past `ctx_capacity` would drive an
-                        // out-of-bounds scatter (a release `assert!` panic in
-                        // `sub_offset` — the serve-hang class). Windowed mode has
-                        // no such bound (its rings wrap), so the gate is Legacy-
-                        // only. `+ block_size` keeps the last verify window's
-                        // `advance` rows inside the buffer.
-                        let dflash_ctx_fits = rig.model.dflash.as_ref().map_or(false, |d| {
-                            d.window.is_some()
-                                || req
-                                    .prompt_tokens
-                                    .len()
-                                    .saturating_add(req.max_tokens.max(1))
-                                    .saturating_add(d.block_size)
-                                    <= d.ctx_capacity
-                        });
-                        let dflash_ok = rig.model.dflash.is_some()
-                            && req.visual_data.is_none()
-                            && !request_penalized(&req)
-                            && !request_sampled(&req)
-                            && req.json_schema.is_none()
-                            && dflash_ctx_fits
-                            && (plan.reused == 0 || dflash_ring_valid);
-                        if !dflash_ring_valid {
-                            if let Some(st) = rig.model.dflash_states[slot.0].take() {
-                                st.free_gpu(&mut rig.gpu);
-                            }
-                        }
-                        work[slot.0].spec = if mtp_ok {
-                            SpecKind::Mtp
-                        } else if dflash_ok {
-                            SpecKind::Dflash
-                        } else {
-                            SpecKind::None
-                        };
-                        rig.model.mtp_req_sampling[slot.0] = if work[slot.0].spec == SpecKind::Mtp {
-                            Some(MtpReqSampling::new(&req, &extended))
-                        } else {
-                            None
-                        };
-                        if !work[slot.0].spec.active() {
-                            if let Some(state) = rig.model.mtp_states[slot.0].as_mut() {
-                                let _ = state.reset(&mut rig.gpu);
-                            }
-                        }
-                        install_sample_params(rig, slot, &req);
-                        // Publication continuity (spec §4.6 C6): the session's
-                        // previously published boundary seeds the new InFlight so
-                        // this turn's publications start BEYOND pages the radix
-                        // already owns. Re-publishing from 0 would take a second
-                        // cache ref on already-owned pages — orphaned on release
-                        // (nothing but the index releases exactly one ref per
-                        // node page), stranding pages Sealed/CacheOnly forever:
-                        // a monotonic pool drain across turns. The boundary is
-                        // clamped to the turn's reuse point: a client edit that
-                        // truncates below it invalidates the published claim.
-                        let session_pub = rig
-                            .sessions
-                            .get(existing)
-                            .map(|s| s.published_boundary.min(plan.reused))
-                            .unwrap_or(0);
-                        if let Some(sess) = rig.sessions.get_mut(existing) {
-                            sess.published_boundary = session_pub;
-                        }
-                        let repeat_window_req = effective_repeat_window(
-                            req.repeat_window,
-                            req.repeat_penalty,
-                            req.presence_penalty,
-                            req.frequency_penalty,
-                        );
-                        slots[slot.0] = Some(InFlight {
-                            session: existing,
-                            reply: req.reply,
-                            produced: 0,
-                            max_tokens: req.max_tokens.max(1),
-                            repeat_window_req,
-                            last_published_boundary: session_pub,
-                            grammar: grammar_constraint,
-                            // Continuation reuse is session-local (convo hash),
-                            // not a radix lookup — no pin to hold.
-                            pin_ticket: PinTicket::none(),
-                        });
-                        rig.sessions.touch(existing);
-                        if rig.gpu.slot_trace() {
-                            eprintln!(
-                            "[slot-trace] continuation HIT -- session {} reused {} of {} tokens",
-                            existing.0,
-                            plan.reused,
-                            extended.len()
-                        );
-                        }
-                        // FairQueue: admit the continued request with its
-                        // remaining prefill suffix as the cache-locality weight.
-                        let uncached = work[slot.0].remaining_prompt.len() as u64;
-                        let _ = rig.fair_queue.admit(existing.0, "default", uncached);
-                        let mut st = lock_stats(stats);
-                        st.note_admitted();
-                        st.note_prefix_hit();
-                        return;
-                    }
-                    Err(e) => {
-                        // The session was restored onto a slot (or was
-                        // already resident) but its turn cannot begin —
-                        // falling through to the cold-admit path would let
-                        // lru_idle_victim close the just-restored session
-                        // (it holds a slot but is not in `busy`) and
-                        // double-occupy the slot. Reject and close instead.
-                        let _ = send_event(
-                            &req.reply,
-                            Event::Rejected {
-                                class: RejectClass::Internal,
-                                reason: format!("continuation begin_turn failed: {e}"),
-                            },
-                        );
-                        rig.swap.forget(existing.0);
-                        rig.sessions.close(&mut rig.pool, &mut rig.adm, existing);
-                        lock_stats(stats).note_rejected();
-                        return;
-                    }
-                }
-            }
-        }
-        if rig.gpu.slot_trace() {
-            eprintln!("[slot-trace] continuation MISS -- falling back to cold prefill");
-        }
-    }
-
-    // Prefill-side context-cap guard for cold admits. Rejected, not Done: a
-    // successful empty completion would read as the model choosing silence;
-    // the prompt physically cannot fit the slot's KV.
-    if req.prompt_tokens.len() >= rig.cap_tokens {
-        let reason = format!(
-            "prompt of {} tokens exceeds the slot context cap of {} tokens",
-            req.prompt_tokens.len(),
-            rig.cap_tokens
-        );
-        let _ = send_event(
-            &req.reply,
-            Event::Rejected {
-                class: RejectClass::Validation,
-                reason,
-            },
-        );
-        lock_stats(stats).note_rejected();
-        return;
-    }
-
-    // Try to open; when admission refuses, park the LRU idle resident session
-    // to swap and retry — bounded by how many idle residents there are.
-    //
-    // Admission is scoped to GPU residency (#776): parking a session returns
-    // its slot AND its grant while its snapshot stays restorable (restore
-    // re-takes the grant first). So one remedy covers both shortages —
-    // PoolFull (a slot is missing) and WouldExceedBudget (grant bytes are
-    // missing). Swapped and Cold sessions hold neither, so they are never
-    // victims here. Only IDLE sessions are touched — never an active one.
-    //
-    // The grant is the REQUEST's maximum remaining growth (prompt +
-    // max_tokens, clamped to the context cap), not the whole cap (spec
-    // §5.1). A full-cap grant charged ~1.7 GiB of KV credit per session on
-    // a big-cap deployment: after trunk weights, the SECOND concurrent
-    // request's grant did not fit and it parked behind the first until its
-    // session closed — slots serialized for long generations even though
-    // both had free pages and free rows.
-    let grant_tokens = req
-        .prompt_tokens
-        .len()
-        .saturating_add(req.max_tokens.max(1))
-        .min(rig.cap_tokens);
-    let mut opened = admit_cold(rig, &mut cold_reuse, grant_tokens);
-    while opened.is_err() {
-        // Re-derive the victim each pass: the previous park consumed it.
-        let Some(victim) = rig.sessions.lru_idle_victim(&busy) else {
-            break;
-        };
-        if !evict(rig, victim, stats) {
-            let _ = send_event(
-                &req.reply,
-                Event::Rejected {
-                    class: RejectClass::Internal,
-                    reason: "eviction failed".to_string(),
-                },
-            );
-            lock_stats(stats).note_rejected();
-            return;
-        }
-        lock_stats(stats).note_eviction();
-        opened = admit_cold(rig, &mut cold_reuse, grant_tokens);
-    }
-    let id = match opened {
-        Ok(id) => id,
-        Err(e) => {
-            // Every idle resident is already parked, so what grant bytes
-            // remain belong to generating sessions. With none generating the
-            // request can never fit — reject it as Overload at once rather
-            // than burn the queue timeout. Otherwise it waits below: a
-            // finishing generation turns idle and the retry can park it.
-            if matches!(e, AdmitError::WouldExceedBudget { .. }) && busy.is_empty() {
-                let _ = send_event(
-                    &req.reply,
-                    Event::Rejected {
-                        class: RejectClass::Overload,
-                        reason: format!("admission budget exhausted: {e}"),
-                    },
-                );
-                lock_stats(stats).note_rejected();
-                return;
-            }
-            // R-A4 replacement (spec §5.3 S3): when every resident session
-            // is generating and no idle victim can make room, enqueue the
-            // request in the bounded WaitQueue instead of rejecting
-            // immediately. The request is parked and retried when a slot
-            // frees; a per-waiter tick deadline drives timeout expiry.
-            if should_wait_instead_of_reject(true, rig.wait_queue.max_count() > 0) {
-                let waiter_id = rig.next_waiter_id;
-                rig.next_waiter_id += 1;
-                // queue_bytes is the canonical pending-input bytes from the
-                // HTTP admission queue (spec §5.3). Fall back to 1 so a
-                // request that bypassed the byte-bounded queue still has a
-                // non-zero byte charge (WaitQueue enforces a non-zero byte
-                // cap but a zero-byte waiter would never trip it).
-                let bytes = req.queue_bytes.max(1);
-                // Preserve the retrying request's ORIGINAL admission age (see
-                // the drain loop's `pending_repark_age` handoff); a fresh
-                // submission is stamped now.
-                let enqueued_at = rig
-                    .pending_repark_age
-                    .take()
-                    .unwrap_or_else(std::time::Instant::now);
-                match rig.wait_queue.try_enqueue(waiter_id, bytes, rig.tick) {
-                    Ok(()) => {
-                        rig.parked_requests
-                            .insert(waiter_id, ParkedRequest { req, enqueued_at });
-                        return;
-                    }
-                    Err(we) => {
-                        // Queue full or byte cap exceeded: surface as a
-                        // typed overload rejection (HTTP 429 at the front
-                        // end). The request is not parked.
-                        let _ = send_event(
-                            &req.reply,
-                            Event::Rejected {
-                                class: RejectClass::Overload,
-                                reason: format!("serve queue full: {we}"),
-                            },
-                        );
-                        lock_stats(stats).note_rejected();
-                        return;
-                    }
-                }
-            }
-            // WaitQueue disabled (should not happen — Rig::build refuses
-            // zero caps): fall back to the original immediate reject.
-            let _ = send_event(
-                &req.reply,
-                Event::Rejected {
-                    class: RejectClass::Internal,
-                    reason: format!("{e:?}"),
-                },
-            );
-            lock_stats(stats).note_rejected();
-            return;
-        }
-    };
-
-    let slot = match rig.sessions.get(id).and_then(|s| s.slot) {
-        Some(s) => s,
-        None => {
-            let _ = send_event(
-                &req.reply,
-                Event::Rejected {
-                    class: RejectClass::Internal,
-                    reason: "admitted session holds no slot".to_string(),
-                },
-            );
-            lock_stats(stats).note_rejected();
-            return;
-        }
-    };
-
-    // Reset the slot's recurrent state before reusing it. `seq_len = 0` clears
-    // the KV, but DeltaNet state lives OUTSIDE the KV arena, so without this a
-    // new conversation inherits the previous occupant's recurrent state --
-    // which shows up as degenerate or echoed output on every request after the
-    // first. Same trap as the swap unit: KV alone is not the whole state.
-    if let Err(e) = rig.model.dn_states[slot.0].reset(&mut rig.gpu) {
-        let _ = send_event(
-            &req.reply,
-            Event::Rejected {
-                class: RejectClass::Internal,
-                reason: format!("state reset failed: {e}"),
-            },
-        );
-        rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
-        lock_stats(stats).note_rejected();
-        return;
-    }
-
-    // Reset MTP head KV for the new conversation (stale positions from the
-    // previous occupant would poison the first draft step).
-    if let Some(state) = rig.model.mtp_states[slot.0].as_mut() {
-        let _ = state.reset(&mut rig.gpu);
-    }
-
-    // Drop the previous occupant's DFlash2 draft state: its target_hidden
-    // ring and draft KV are conversation-scoped, and the next request
-    // re-allocates lazily on its first prefill chunk.
-    if let Some(st) = rig.model.dflash_states[slot.0].take() {
-        st.free_gpu(&mut rig.gpu);
-    }
-
-    // ── Prefix cache lookup (spec §4.5–4.6) ──────────────────────────────
-    // Cross-session prefix reuse: consult the radix index for reusable KV
-    // pages and the checkpoint pool for recurrent state. This is SEPARATE
-    // from the session-local continuation path (convo hashes) — the radix
-    // index is keyed by exact token sequences across sessions. Vision
-    // requests skip the radix entirely (spec X2: Vision+prefix reuse OFF).
-    let mut prefix_reused: usize = 0;
-    let mut prefix_hit = false;
-    // The lookup's pin on the matched radix path. Held until the request
-    // terminates (released by release_pin_ticket on every exit path) or
-    // released immediately below when the hit does not convert.
-    let mut pin_ticket = PinTicket::none();
-    if should_lookup_prefix(rig.prefix_cache, req.visual_data.is_some()) {
-        rig.lookup_count += 1;
-        let domain = rig.cache_domain.as_ref().unwrap();
-        let (lookup_result, hit_handles, ticket) = {
-            let pp = rig
-                .pool
-                .page_pool()
-                .expect("prefix_cache requires paged pool");
-            rig.prefix_index.as_mut().unwrap().lookup_with_pages(
-                domain,
-                &req.prompt_tokens,
-                pp,
-                None,
-            )
-        };
-        pin_ticket = ticket;
-        if let PrefixLookupResult::Hit(lookup) = &lookup_result {
-            let ckpt_pool = rig.model.checkpoint_pool.as_mut().unwrap();
-            // Truthful drafter decision (spec §4.5, made before execution):
-            // there is no drafter checkpoint in the pool, so a resumed
-            // request that will run MTP brings the head up via the existing
-            // reseed path (head KV refills during the suffix prefill);
-            // everything else takes AR.
-            let mtp_will_be_active = rig.model.mtp_head.is_some()
-                && rig.model.mtp_k > 0
-                && req.visual_data.is_none()
-                && !request_penalized(&req)
-                && !request_sampled(&req)
-                && req.json_schema.is_none();
-            let drafter = if mtp_will_be_active {
-                DrafterDecision::Reseed
-            } else {
-                DrafterDecision::Ar
-            };
-            match plan_resume(ckpt_pool, domain, &req.prompt_tokens, lookup, drafter) {
-                Ok(plan) => {
-                    let boundary = plan.boundary as usize;
-                    if reused_tokens_from_plan(boundary, req.prompt_tokens.len()) > 0 {
-                        let n_pages = boundary / PAGE_TOKENS;
-                        let phys_pages: Vec<u32> = hit_handles
-                            .iter()
-                            .take(n_pages)
-                            .map(|h| h.handle.phys)
-                            .collect();
-                        if n_pages > 0 && phys_pages.len() == n_pages {
-                            // Restore the recurrent state FIRST and
-                            // fail-closed (spec §5.4 S4): the slot's
-                            // DeltaNetState was just reset, so a failed
-                            // restore must not leave shared KV paired with
-                            // zeroed recurrent state — that silently
-                            // corrupts the suffix. On failure we fall back
-                            // to the cold path below (begin_turn resets the
-                            // table; the DN state is still the reset one).
-                            let restore_ok = ckpt_pool
-                                .peek(
-                                    domain,
-                                    boundary as u64,
-                                    crate::checkpoint::prefix_fingerprint(
-                                        &req.prompt_tokens[..boundary],
-                                    ),
-                                )
-                                .map(|snapshot| {
-                                    snapshot
-                                        .restore_to(&mut rig.model.dn_states[slot.0], &mut rig.gpu)
-                                        .is_ok()
-                                })
-                                .unwrap_or(false);
-                            let shared_ok = restore_ok
-                                && rig.pool.share_published_pages(slot, &phys_pages).is_ok();
-                            if shared_ok {
-                                prefix_reused = boundary;
-                                prefix_hit = true;
-                                if rig.gpu.slot_trace() {
-                                    eprintln!(
-                                        "[slot-trace] prefix cache HIT: \
-                                         reused {}/{} tokens",
-                                        boundary,
-                                        req.prompt_tokens.len()
-                                    );
-                                }
-                            } else {
-                                // Fail-closed on BOTH halves of the pairing
-                                // (spec §5.4 S4): a failed restore may have
-                                // advanced the DN state part-way to
-                                // S_boundary, and a failed share leaves it at
-                                // S_boundary. Either way a cold prefill from
-                                // position 0 on top of that state corrupts
-                                // the suffix silently — reset to the initial
-                                // state before falling through.
-                                let _ = rig.model.dn_states[slot.0].reset(&mut rig.gpu);
-                                eprintln!(
-                                    "[prefix-cache] hit at boundary {boundary} did not \
-                                     convert (restore_ok={restore_ok}) — cold prefill"
-                                );
-                            }
-                        }
-                    }
-                    // The plan pinned this boundary against eviction; the
-                    // restore attempt is over (or was skipped) either way,
-                    // so release it on every Ok(plan) exit path.
-                    if plan.boundary > 0 {
-                        ckpt_pool.unpin(
-                            domain,
-                            plan.boundary,
-                            crate::checkpoint::prefix_fingerprint(
-                                &req.prompt_tokens[..plan.boundary as usize],
-                            ),
-                        );
-                    }
-                }
-                Err(_) => {} // No checkpoint at any boundary: cold prefill
-            }
-        }
-        // Release the pin when the hit did not convert — a miss means we
-        // won't use those pages, so the path must be evictable again.
-        if !prefix_hit {
-            release_pin_ticket(rig, &mut pin_ticket);
-        }
-    }
-
-    // ── Cache reclaim under page pressure (spec §4.4 C4) ────────────────
-    // Running work has priority over cache-only residency: before this
-    // request's prefill starts allocating, make sure the pool can back the
-    // suffix plus the generation budget. If free pages are short, evict
-    // oldest unpinned radix leaves (their cache-only pages return to the
-    // free list) rather than letting a mid-prefill provision fail.
-    if rig.prefix_cache {
-        let suffix_tokens = req.prompt_tokens.len().saturating_sub(prefix_reused);
-        let needed_pages = suffix_tokens
-            .saturating_add(req.max_tokens.max(1))
-            .div_ceil(PAGE_TOKENS)
-            .saturating_add(1);
-        let page_bytes = rig
-            .pool
-            .page_pool()
-            .map(|pp| pp.k_page_bytes() + pp.v_page_bytes())
-            .unwrap_or(0);
-        let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-        if page_bytes > 0 && free < needed_pages {
-            let evict_bytes = needed_pages.saturating_sub(free) * page_bytes;
-            let evicted = if let (Some(idx), Some(_domain)) =
-                (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
-            {
-                let pp = rig.pool.page_pool_mut().expect("paged pool");
-                idx.evict_unpinned_leaves(pp, evict_bytes)
-            } else {
-                Vec::new()
-            };
-            if !evicted.is_empty() && rig.gpu.slot_trace() {
-                eprintln!(
-                    "[slot-trace] reclaimed {} cache-only pages under admission pressure",
-                    evicted.len()
-                );
-            }
-        }
-    }
-
-    // ── Idle-session reclaim under page pressure (spec §5.4 S4 row 3) ──
-    // Radix-leaf eviction only frees cache-only pages. Pages held by idle
-    // resident sessions' table refs are neither free nor radix-evictable,
-    // so a shortfall here means the forward WILL fail mid-prefill with
-    // "need N more pages". Evict LRU idle sessions (snapshot to swap, or
-    // cold on snapshot failure) until the demand is backed; if no victim
-    // remains, reject at admit instead of letting the forward die.
-    if rig.pool.is_paged() {
-        let suffix_tokens = req.prompt_tokens.len().saturating_sub(prefix_reused);
-        let needed_pages = suffix_tokens
-            .saturating_add(req.max_tokens.max(1))
-            .div_ceil(PAGE_TOKENS)
-            .saturating_add(1);
-        // The just-opened session holds a slot but is not in `busy` —
-        // exclude it explicitly so it is never its own eviction victim.
-        let mut exclude: Vec<SessionId> = busy.clone();
-        exclude.push(id);
-        loop {
-            let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-            if free >= needed_pages {
-                break;
-            }
-            let Some(victim) = rig.sessions.lru_idle_victim(&exclude) else {
-                break;
-            };
-            if !evict(rig, victim, stats) {
-                break;
-            }
-            lock_stats(stats).note_eviction();
-            if rig.gpu.slot_trace() {
-                eprintln!(
-                    "[slot-trace] evicted idle session {victim:?} for page demand \
-                     ({free} free < {needed_pages} needed)"
-                );
-            }
-        }
-        let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
-        if free < needed_pages {
-            let _ = send_event(
-                &req.reply,
-                Event::Rejected {
-                    class: RejectClass::Overload,
-                    reason: format!(
-                        "page demand exceeds pool: need {needed_pages} pages, \
-                         {free} free after reclaim"
-                    ),
-                },
-            );
-            release_pin_ticket(rig, &mut pin_ticket);
-            rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
-            lock_stats(stats).note_rejected();
-            return;
-        }
-    }
-
-    // Session-local prefix reuse (convo hash continuation) OR prefix cache
-    // hit. When the prefix cache hit, begin_turn is skipped because it
-    // would reset seq_len to 0, undoing the shared pages.
-    let reused = if prefix_hit {
-        if let Some(sess) = rig.sessions.get_mut(id) {
-            sess.next_pos = prefix_reused;
-        }
-        prefix_reused
-    } else {
-        // Prefix reuse: a fresh session reuses nothing, a continued one
-        // reuses its common prefix. Either way the suffix is what gets
-        // prefilled.
-        let plan = match rig
-            .sessions
-            .begin_turn(&mut rig.pool, id, &req.prompt_tokens)
-        {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = send_event(
-                    &req.reply,
-                    Event::Rejected {
-                        class: RejectClass::Internal,
-                        reason: e,
-                    },
-                );
-                rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
-                lock_stats(stats).note_rejected();
-                return;
-            }
-        };
-        plan.reused
-    };
-    if let Some(sess) = rig.sessions.get_mut(id) {
-        sess.tokens = req.prompt_tokens.clone();
-        sess.convo = req.convo.clone();
-        // An image turn defines the conversation's M-RoPE phase offset for
-        // every later text continuation; a text-only conversation stays 0
-        // (fresh sessions are, but this path also serves continuation-miss
-        // re-prefills, which must not inherit anything stale).
-        sess.rope_delta = req
-            .visual_data
-            .as_ref()
-            .map(|vd| vd.rope_delta)
-            .unwrap_or(0);
-        // Sticky image marker: `rope_delta` is 0 for a thin (single-row/col)
-        // image, so it cannot stand in for "this conversation carries an
-        // image turn". `has_image` is the publish/lookup gate for the prefix
-        // cache (spec §6 X2).
-        sess.has_image = sess.has_image || req.visual_data.is_some();
-    }
-
-    if send_event(
-        &req.reply,
-        Event::Accepted {
-            session: id.0,
-            reused: reused,
-            prefill: req.prompt_tokens.len() - reused,
-        },
-    )
-    .is_err()
-    {
-        // A prefix hit still holds its PinTicket — release it before
-        // closing so the path does not pin the radix forever.
-        release_pin_ticket(rig, &mut pin_ticket);
-        rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
-        return;
-    }
-
-    work[slot.0].decoding = false;
-    // Built before `req.visual_data` is moved out below; SlotSampleParams is
-    // Copy so this is a plain host-side struct build.
-    let penalized = request_penalized(&req);
-    let sample_params = SlotSampleParams {
-        temperature: req.temperature,
-        top_p: req.top_p,
-        top_k: req.top_k,
-        seed: req.seed,
-        repeat_window: effective_repeat_window(
-            req.repeat_window,
-            req.repeat_penalty,
-            req.presence_penalty,
-            req.frequency_penalty,
-        ) as i32,
-        repeat_penalty: req.repeat_penalty,
-        presence_penalty: req.presence_penalty,
-        frequency_penalty: req.frequency_penalty,
-        min_p: req.min_p,
-    };
-    // Compile the JSON Schema (if present) into a per-request SchemaMatcher
-    // cursor (spec §7 G1/G2). The schema was already validated in
-    // validate_generate_caps; recompile here to build the per-request
-    // mutable cursor. CompiledSchema is immutable and Send+Sync; the
-    // SchemaMatcher is request-local mutable state (spec §7.2 G2).
-    let grammar_constraint = req.json_schema.as_ref().and_then(|schema| {
-        match cached_compile_schema(rig, schema) {
-            Ok(compiled) => Some(GrammarConstraint {
-                matcher: grammar::json_schema::SchemaMatcher::from_compiled(&compiled),
-                mask_buf: Vec::new(),
-                in_think: req.started_in_think,
-                think_open_id: rig.tokenizer.special_token_id("<think>"),
-                think_tail: Vec::new(),
-                think_close_id: rig.tokenizer.special_token_id("</think>"),
-                think_budget: req.think_budget,
-                think_tokens_used: 0,
-                mask_cache: std::collections::HashMap::new(),
-                mask_cache_order: std::collections::VecDeque::new(),
-            }),
-            Err(e) => {
-                // Should not happen (validated at submit), but fail closed.
-                let _ = send_event(
-                    &req.reply,
-                    Event::Rejected {
-                        class: RejectClass::Validation,
-                        reason: format!("json_schema compile failed on admit: {e}"),
-                    },
-                );
-                release_pin_ticket(rig, &mut pin_ticket);
-                rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
-                lock_stats(stats).note_rejected();
-                return None;
-            }
-        }
-    });
-    // If compilation failed and we already sent Rejected, bail out.
-    if req.json_schema.is_some() && grammar_constraint.is_none() {
-        return;
-    }
-    let grammar_constrained = grammar_constraint.is_some();
-    if let Some(vd) = req.visual_data {
-        work[slot.0].remaining_prompt = req.prompt_tokens.clone();
-        work[slot.0].next_pos = 0;
-        work[slot.0].pos3_delta = 0; // phases come from the VL table below
-                                     // Drop any previous request's vision state: the new request's
-                                     // embeddings are not produced until its first batched chunk, and the
-                                     // scheduler holds the slot's rows until then. Free the old matrix +
-                                     // job explicitly — dropping them unfreed leaks VRAM (the buffers are
-                                     // neither pooled nor hipFree'd by Drop).
-        rig.model.clear_slot_vl_state(&mut rig.gpu, slot.0);
-        work[slot.0].vl_prefill = Some(VlPrefill {
-            patches: vd.patches,
-            grid_h: vd.grid_h,
-            grid_w: vd.grid_w,
-            n_visual_tokens: vd.n_visual_tokens,
-            embeddings: Vec::new(),
-            dim: rig.model.config.dim,
-            visual_idx: 0,
-            image_pad_id: rig
-                .tokenizer
-                .special_token_id("<|image_pad|>")
-                .unwrap_or(u32::MAX),
-            mrope_positions: vd.mrope_positions,
-            rope_delta: vd.rope_delta,
-            base: 0,
-        });
-        work[slot.0].spec = SpecKind::None;
-    } else {
-        work[slot.0].remaining_prompt = req.prompt_tokens[reused..].to_vec();
-        work[slot.0].next_pos = reused;
-        work[slot.0].vl_prefill = None;
-        work[slot.0].pos3_delta = 0; // fresh session: no image-turn offset
-                                     // Activate MTP for text-only requests when the head is loaded.
-                                     // Sampling and token penalties ride the MTP path: the
-                                     // request's `MtpSamplingConfig` (parked in
-                                     // `mtp_req_sampling`) makes verify use residual acceptance
-                                     // against the penalized target nucleus, reproducing the AR
-                                     // distribution. Grammar-constrained requests stay on AR:
-                                     // constrained MTP requires joint verification (applying
-                                     // grammar masks before acceptance, not only after a bad token
-                                     // has advanced state), which does not yet exist (spec §6 X2:
-                                     // "MTP + grammar → AR selected before execution until exact
-                                     // joint acceptance is implemented and validated").
-                                     // Radix-reuse retires drafting: the head's private KV is zero for
-                                     // the reused span (shared pages carry only trunk KV), and drafting
-                                     // over a zeroed prefix collapses acceptance to ~1 — pure overhead
-                                     // on exactly the turns reuse was meant to accelerate. AR produces
-                                     // identical output without the overhead.
-        let mtp_ok = rig.model.mtp_head.is_some()
-            && rig.model.mtp_k > 0
-            && !grammar_constrained
-            && reused == 0;
-        // DFlash2 admit on the new-session arm: same request-shape gates as
-        // MTP, including the reused==0 rule — a radix hit's reused span was
-        // never forwarded this turn, so its extract-layer hiddens are not
-        // captured and the ring would carry uninitialized rows for
-        // 0..reused (the append_committed gap guard). Continuations are the
-        // exception: their ring survives on the slot and the continuation
-        // arm checks its watermark.
-        // Legacy-mode ctx fit (sequential `spec_ctx_request_fits` parity):
-        // the Legacy scatter writes target_hidden at the ABSOLUTE position
-        // into a `ctx_capacity`-row buffer, so a request that can grow past
-        // `ctx_capacity` would drive an out-of-bounds scatter (a release
-        // `assert!` panic in `sub_offset` — the serve-hang class). Windowed
-        // mode has no such bound (its rings wrap), so the gate is Legacy-only.
-        let dflash_ctx_fits = rig.model.dflash.as_ref().map_or(false, |d| {
-            d.window.is_some()
-                || req
-                    .prompt_tokens
-                    .len()
-                    .saturating_add(req.max_tokens.max(1))
-                    .saturating_add(d.block_size)
-                    <= d.ctx_capacity
-        });
-        let dflash_ok = rig.model.dflash.is_some()
-            && !penalized
-            && !request_sampled(&req)
-            && !grammar_constrained
-            && dflash_ctx_fits
-            && reused == 0;
-        work[slot.0].spec = if mtp_ok {
-            SpecKind::Mtp
-        } else if dflash_ok {
-            SpecKind::Dflash
-        } else {
-            SpecKind::None
-        };
-        rig.model.mtp_req_sampling[slot.0] = if work[slot.0].spec == SpecKind::Mtp {
-            Some(MtpReqSampling::new(&req, &req.prompt_tokens))
-        } else {
-            None
-        };
-        if rig.gpu.slot_trace() {
-            eprintln!(
-                "[slot-trace] admit(cold) slot {} spec={:?} temp={} top_k={} top_p={} \
-                 penalized={} reused={} prompt={}",
-                slot.0,
-                work[slot.0].spec,
-                req.temperature,
-                req.top_k,
-                req.top_p,
-                penalized,
-                reused,
-                req.prompt_tokens.len()
-            );
-        }
-    }
-    rig.sample_params[slot.0] = sample_params;
-    // A prefix-cache hit's shared pages are already radix-owned up to
-    // `reused`; seed both the session and the InFlight so this request's
-    // publications start beyond them (spec §4.6 C6, see the continuation
-    // admit for the re-publication leak this prevents).
-    if prefix_hit {
-        if let Some(sess) = rig.sessions.get_mut(id) {
-            sess.published_boundary = reused;
-        }
-    }
-    let repeat_window_req = effective_repeat_window(
-        req.repeat_window,
-        req.repeat_penalty,
-        req.presence_penalty,
-        req.frequency_penalty,
-    );
-    slots[slot.0] = Some(InFlight {
-        session: id,
-        reply: req.reply,
-        produced: 0,
-        max_tokens: req.max_tokens.max(1),
-        repeat_window_req,
-        last_published_boundary: reused,
-        grammar: grammar_constraint,
-        pin_ticket,
-    });
-    if rig.gpu.slot_trace() {
-        eprintln!(
-            "[slot-trace] cold ADMIT session {} slot={} prompt={} tokens",
-            id.0,
-            slot.0,
-            req.prompt_tokens.len()
-        );
-    }
-    // FairQueue: admit the cold request with its prefill suffix as the
-    // cache-locality weight (0 for a fully-reused prefix-cache hit).
-    let uncached = work[slot.0].remaining_prompt.len() as u64;
-    let _ = rig.fair_queue.admit(id.0, "default", uncached);
-    if prefix_hit {
-        lock_stats(stats).note_reused_tokens(prefix_reused);
-    }
-    lock_stats(stats).note_admitted();
-}
-
-/// Read the session sweep policy from the process config. The engine already
-/// reads developer config directly; these two keys are process-scoped policy,
-/// like the swap budgets.
-fn session_policy_from_config() -> (Option<std::time::Duration>, usize) {
-    let process = hipfire_config::active_or_local_process_config();
-    let value = |key: &str| {
-        process.values.get(key).and_then(|value| match value {
-            hipfire_config::ConfigValue::Integer(i) => u64::try_from(*i).ok(),
-            _ => None,
-        })
-    };
-    let ttl = value("serve.multi_slot_session_ttl_secs").unwrap_or(3600);
-    let max = value("serve.multi_slot_max_sessions").unwrap_or(0);
-    (
-        if ttl == 0 {
-            None
-        } else {
-            Some(std::time::Duration::from_secs(ttl))
-        },
-        usize::try_from(max).unwrap_or(usize::MAX),
-    )
-}
-
-/// Close parked sessions that aged out and enforce the hard cap. The table
-/// owns the age/limit policy inputs; the engine drops their swap entries.
-///
-/// The TTL is wall-clock and the cap is generous (16 parked conversations per
-/// slot, at least 64): a parked session is only a cache entry, so closing one
-/// costs a cold re-prefill, never correctness.
-fn sweep_sessions(rig: &mut Rig) {
-    const CAP_MIN: usize = 64;
-    const PER_SLOT: usize = 16;
-    let ttl = rig.session_ttl.unwrap_or(std::time::Duration::MAX);
-    let cap = if rig.session_max == 0 {
-        rig.n_slots.saturating_mul(PER_SLOT).max(CAP_MIN)
-    } else {
-        rig.session_max
-    };
-    let closed = rig.sessions.sweep_expired(
-        &mut rig.pool,
-        &mut rig.adm,
-        std::time::Instant::now(),
-        ttl,
-        cap,
-    );
-    if closed.is_empty() {
-        return;
-    }
-    if let Ok(mut ids) = rig.closed_sessions.lock() {
-        ids.extend(closed.iter().map(|id| id.0));
-    }
-    if rig.gpu.slot_trace() {
-        eprintln!(
-            "[slot-trace] swept {} parked session(s) (ttl {ttl:?}, cap {cap})",
-            closed.len()
-        );
-    }
-    for id in closed {
-        rig.swap.forget(id.0);
-        // The session is gone; drop any fairness grant it still holds. (The
-        // normal Close command does the same.)
-        let _ = rig.fair_queue.remove(id.0);
-    }
-}
-
-/// Admit the cold path's session. When a matched session's snapshot was lost,
-/// restore marked that session Cold; reopen the same id (it still owns the
-/// conversation identity) instead of minting a new one, which would strand the
-/// old entry in the table forever.
-fn admit_cold(
-    rig: &mut Rig,
-    reuse: &mut Option<SessionId>,
-    grant_tokens: usize,
-) -> Result<SessionId, AdmitError> {
-    if let Some(id) = *reuse {
-        match rig
-            .sessions
-            .reopen_cold(&mut rig.pool, &mut rig.adm, id, grant_tokens)
-        {
-            Ok(id) => return Ok(id),
-            Err(AdmitError::UnknownSession(_)) => *reuse = None,
-            Err(e) => return Err(e),
-        }
-    }
-    rig.sessions.open(&mut rig.pool, &mut rig.adm, grant_tokens)
-}
-
-/// Capture an idle session's state, park it, and free its slot.
-///
-/// Returns false if anything went wrong, in which case the session is marked
-/// `Cold`: its tokens survive, so it re-prefills next time. Slow, never wrong.
-fn evict(rig: &mut Rig, victim: SessionId, stats: &Arc<Mutex<EngineStats>>) -> bool {
-    let Some(sess) = rig.sessions.get(victim) else {
-        return false;
-    };
-    let Some(slot) = sess.slot else { return false };
-    let tokens = sess.tokens.clone();
-
-    let dn_refs = dn_buffers(&rig.model.dn_states[slot.0]);
-    let snap = capture_slot(
-        &mut rig.gpu,
-        &rig.pool,
-        slot,
-        &rig.model.k_arenas,
-        &rig.model.v_arenas,
-        &dn_refs,
-        &tokens,
-        rig.stamp,
-    );
-    drop(dn_refs);
-
-    let evicted = match snap {
-        Ok(snap) => match rig.swap.park(victim.0, snap) {
-            Ok(()) => {
-                rig.sessions
-                    .mark_swapped(&mut rig.pool, &mut rig.adm, victim);
-                true
-            }
-            Err(e) => {
-                warn_once(
-                    &SWAP_PARK_WARNED,
-                    &format!(
-                        "swap park failed for session {}: {e}; the session is Cold and will re-prefill",
-                        victim.0
-                    ),
-                );
-                rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, victim);
-                true
-            }
-        },
-        Err(e) => {
-            warn_once(
-                &SWAP_PARK_WARNED,
-                &format!(
-                    "swap snapshot capture failed for session {}: {e}; the session is Cold and will re-prefill",
-                    victim.0
-                ),
-            );
-            rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, victim);
-            true
-        }
-    };
-    lock_stats(stats).note_swap(&rig.swap);
-    evicted
-}
-
-/// Restore a previously swapped session into `slot`. Any failure marks it
-/// `Cold` so the caller re-prefills from tokens.
-fn restore(rig: &mut Rig, id: SessionId, slot: SlotId, stats: &Arc<Mutex<EngineStats>>) -> bool {
-    // A swapped session gave its VRAM admission back on eviction; take it
-    // again before its state re-enters the GPU. If the budget cannot cover it
-    // the snapshot is dropped and the session goes Cold (re-prefill path).
-    if let Err(e) = rig.sessions.readmit(&mut rig.adm, id) {
-        warn_once(
-            &SWAP_RESTORE_WARNED,
-            &format!(
-                "swap restore failed for session {} ({e}); the session is Cold and will re-prefill",
-                id.0
-            ),
-        );
-        rig.swap.forget(id.0);
-        rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
-        lock_stats(stats).note_swap(&rig.swap);
-        return false;
-    }
-    match rig.swap.unpark(id.0) {
-        Ok(snap) => {
-            let dn_refs = dn_buffers(&rig.model.dn_states[slot.0]);
-            let r = restore_slot(
-                &mut rig.gpu,
-                &mut rig.pool,
-                slot,
-                &rig.model.k_arenas,
-                &rig.model.v_arenas,
-                &dn_refs,
-                &snap,
-                rig.stamp,
-            );
-            drop(dn_refs);
-            // MTP head KV is per-generation, not per-session. Reset it so
-            // the restored session starts a fresh MTP prefill.
-            if let Some(state) = rig.model.mtp_states[slot.0].as_mut() {
-                let _ = state.reset(&mut rig.gpu);
-            }
-            // DFlash2 draft state is likewise per-generation: the restored
-            // session re-seeds target_hidden from its suffix forward.
-            if let Some(st) = rig.model.dflash_states[slot.0].take() {
-                st.free_gpu(&mut rig.gpu);
-            }
-            match r {
-                Ok(()) => {
-                    rig.sessions.mark_resident(id, slot, snap.seq_len);
-                    lock_stats(stats).note_swap(&rig.swap);
-                    true
-                }
-                Err(e) => {
-                    warn_once(
-                        &SWAP_RESTORE_WARNED,
-                        &format!(
-                            "swap restore failed for session {} ({e}); the session is Cold and will re-prefill",
-                            id.0
-                        ),
-                    );
-                    rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
-                    lock_stats(stats).note_swap(&rig.swap);
-                    false
-                }
-            }
-        }
-        Err(e) => {
-            warn_once(
-                &SWAP_RESTORE_WARNED,
-                &format!(
-                    "swap restore failed for session {} ({e}); the session is Cold and will re-prefill",
-                    id.0
-                ),
-            );
-            rig.sessions.mark_cold(&mut rig.pool, &mut rig.adm, id);
-            lock_stats(stats).note_swap(&rig.swap);
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_continuation_requires_the_complete_accepted_prefix() {
+        // Stand-ins for system/user/assistant/tool/pending-token positions.
+        let accepted = [10, 20, 30, 40, 50];
+        assert!(legacy_continuation_matches(
+            &accepted,
+            &[10, 20, 30, 40, 50, 60]
+        ));
+        assert!(!legacy_continuation_matches(
+            &accepted,
+            &[10, 20, 31, 40, 50, 60]
+        ));
+        assert!(!legacy_continuation_matches(
+            &accepted,
+            &[10, 20, 30, 41, 50, 60]
+        ));
+        assert!(!legacy_continuation_matches(
+            &accepted,
+            &[10, 20, 30, 40, 51, 60]
+        ));
+        assert!(!legacy_continuation_matches(&accepted, &[10, 20, 30, 40]));
+        assert!(!legacy_continuation_matches(&[], &[10, 20]));
+    }
 
     #[test]
     fn slot_snapshot_kv_tags_are_stable_and_unique() {
@@ -7669,7 +6171,7 @@ mod tests {
     /// exact joint acceptance is implemented and validated").
     #[test]
     fn grammar_constrained_requests_select_ar_not_mtp() {
-        // The admit() path now sets `grammar_constrained = true` when
+        // The serve_engine_admit::admit() path now sets `grammar_constrained = true` when
         // req.json_schema is Some. This test documents the invariant: a
         // grammar-constrained request must NOT activate MTP.
         let grammar_constrained = true;
@@ -8322,5 +6824,51 @@ mod mtp_spill_decline_tests {
         assert_eq!(slot_mtp_k(MtpMode::Auto, 4, true), 4);
         assert_eq!(slot_mtp_k(MtpMode::On, 4, false), 4);
         assert_eq!(slot_mtp_k(MtpMode::On, 0, false), 0);
+    }
+}
+
+#[cfg(all(test, feature = "kvmem"))]
+mod speculative_contract_tests {
+    /// 期4: the core `speculative.hpp` is the single source of algorithm
+    /// names; the engine ordinal mapping must equal the shim's.
+    #[test]
+    fn algorithm_names_match_core() {
+        for a in 0..=3u32 {
+            assert_eq!(
+                hipfire_runtime::serve::speculative_algorithm_name(a),
+                hipfire_kvmem::speculative_algorithm_name(a),
+                "ordinal {a}"
+            );
+        }
+    }
+
+    /// The engine folds per-request counters; pin that the shim's C mirror
+    /// round-trips the core `SpeculativeStatistics::add`.
+    #[test]
+    fn statistics_add_round_trips_through_core() {
+        let mut dst = hipfire_kvmem::speculative_statistics_reset();
+        dst.requests = 2;
+        dst.drafted_tokens = 10;
+        let mut src = hipfire_kvmem::speculative_statistics_reset();
+        src.requests = 1;
+        src.drafted_tokens = 5;
+        src.accepted_tokens = 2;
+        hipfire_kvmem::speculative_statistics_add(&mut dst, &src);
+        assert_eq!(dst.requests, 3);
+        assert_eq!(dst.drafted_tokens, 15);
+        assert_eq!(dst.accepted_tokens, 2);
+    }
+}
+
+#[cfg(test)]
+mod convo_group_tests {
+    /// 期3 G3: the conversation-lineage hash is stable per convo and empty is
+    /// the unknown group (independent, never merged).
+    #[test]
+    fn convo_group_is_stable_and_empty_is_unknown() {
+        assert_eq!(super::convo_group(&[]), 0);
+        let a = vec![1u64, 2, 3, 4];
+        assert_eq!(super::convo_group(&a), super::convo_group(&a));
+        assert_ne!(super::convo_group(&a), super::convo_group(&[1, 2, 3, 5]));
     }
 }

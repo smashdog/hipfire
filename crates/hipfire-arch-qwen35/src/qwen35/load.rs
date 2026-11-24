@@ -6531,10 +6531,7 @@ fn load_escha_moe_ffn(
             )),
             gate: None,
             up: None,
-            down: projection_source(
-                format!("{p}.mlp.experts.{x}.down_proj.weight"),
-                &e.down,
-            ),
+            down: projection_source(format!("{p}.mlp.experts.{x}.down_proj.weight"), &e.down),
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
@@ -6546,16 +6543,17 @@ fn load_escha_moe_ffn(
         dim,
         &fingerprint,
     )?;
-    let (expert_execution_plan, expert_table, expert_binding) = super::weights::build_expert_binding(
-        records,
-        router_source,
-        Vec::new(),
-        layer_idx as usize,
-        config.n_layers,
-        super::weights::ExpertBindingTarget::Single {
-            physical_device: gpu.device_id,
-        },
-    )?;
+    let (expert_execution_plan, expert_table, expert_binding) =
+        super::weights::build_expert_binding(
+            records,
+            router_source,
+            Vec::new(),
+            layer_idx as usize,
+            config.n_layers,
+            super::weights::ExpertBindingTarget::Single {
+                physical_device: gpu.device_id,
+            },
+        )?;
 
     Ok(MoeFfnWeights {
         router,

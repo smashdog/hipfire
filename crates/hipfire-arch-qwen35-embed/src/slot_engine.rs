@@ -563,6 +563,7 @@ mod tests {
 
     fn config() -> SlotEngineConfig {
         SlotEngineConfig {
+            kvmem: None,
             model_path: PathBuf::from("/models/embed"),
             n_slots: 6,
             cap_tokens: 8192,

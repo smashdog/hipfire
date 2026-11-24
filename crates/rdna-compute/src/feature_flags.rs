@@ -1082,6 +1082,14 @@ pub struct FeatureFlags {
     /// picks MW8. Parsed on unless the value is exactly `0` (kill switch);
     /// acted on for exact gfx1100 only (`mq6_resid_port_gfx1100_enabled`).
     pub mq6_resid_port_gfx1100: bool,
+    /// `HIPFIRE_MQV2_MQ3_MW`: exact gfx1100 MQ3G256V2 prefill weight reuse.
+    /// Admits the generic MW-LDS weight-staging kernels for bits 3
+    /// (gate/up + residual, plus the qkvza/qkv instantiations) and the BT
+    /// batch-tile arms for qkvza/qkv. Parsed on unless the value is exactly
+    /// `0` (kill switch: restores the base WMMA kernels byte-identically).
+    /// MW/BT outputs are bit-identical to base (parity screens + full-shape
+    /// bench); acted on for exact gfx1100 only (`mqv2_mq3_mw_enabled`).
+    pub mqv2_mq3_mw: bool,
     /// `HIPFIRE_QWEN4_QSA_HG4_Q8_LITE`: the q8 grouped prefill attention
     /// (`indexed_attention_attention_q8_batched_hg4`) runs its bit-identical
     /// low-LDS twin `..._hg4_lite`. Parsed on unless the value is exactly `0`
@@ -1817,6 +1825,7 @@ impl FeatureFlags {
                 .ok()
                 .as_deref()
                 != Some("0"),
+            mqv2_mq3_mw: value("HIPFIRE_MQV2_MQ3_MW").ok().as_deref() != Some("0"),
             qwen4_qsa_hg4_q8_lite: value("HIPFIRE_QWEN4_QSA_HG4_Q8_LITE").ok().as_deref()
                 != Some("0"),
             qwen4_hc_mix_fill80_gfx1100: value("HIPFIRE_QWEN4_HC_MIX_FILL80_GFX1100")
@@ -1967,6 +1976,13 @@ impl FeatureFlags {
     /// (`HIPFIRE_MQ6_RESID_PM_GFX1100`) or hipcc MW8. Bit-identical output.
     pub fn mq6_resid_port_gfx1100_enabled(&self) -> bool {
         self.mq6_resid_port_gfx1100 && self.arch == "gfx1100"
+    }
+
+    /// Exact gfx1100 MQ3G256V2 prefill weight reuse (`HIPFIRE_MQV2_MQ3_MW`):
+    /// default on; `=0` is the kill switch restoring the base WMMA kernels
+    /// (byte-identical outputs either way).
+    pub fn mqv2_mq3_mw_enabled(&self) -> bool {
+        self.mqv2_mq3_mw && self.arch == "gfx1100"
     }
 
     /// q8 grouped prefill attention low-LDS twin
@@ -2748,6 +2764,7 @@ impl FeatureFlags {
             qwen4_qsa_extent_sync: false,
             qwen4_qsa_code_check: false,
             mq6_resid_port_gfx1100: false,
+            mqv2_mq3_mw: false,
             qwen4_qsa_hg4_q8_lite: false,
             qwen4_hc_mix_fill80_gfx1100: false,
         }
@@ -3218,6 +3235,36 @@ mod tests {
         }
         // for_test zeroes every default-on flag.
         assert!(!FeatureFlags::for_test("gfx1100").mq6_resid_port_gfx1100_enabled());
+    }
+
+    /// MQ3 prefill weight reuse is default on for exact gfx1100 only; exactly
+    /// `0` is the kill switch and every other value keeps it on.
+    #[test]
+    fn mqv2_mq3_mw_defaults_on_exact_gfx1100_and_zero_opts_out() {
+        for arch in [
+            "gfx906", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1201",
+        ] {
+            let flags = |raw: Option<&str>| {
+                FeatureFlags::from_lookup(arch, |name| match raw {
+                    Some(v) if name == "HIPFIRE_MQV2_MQ3_MW" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            let exact = arch == "gfx1100";
+            assert!(flags(None).mqv2_mq3_mw, "{arch}: unset");
+            assert_eq!(flags(None).mqv2_mq3_mw_enabled(), exact, "{arch}");
+            assert!(!flags(Some("0")).mqv2_mq3_mw, "{arch}: 0");
+            assert!(!flags(Some("0")).mqv2_mq3_mw_enabled(), "{arch}: 0");
+            for raw in ["1", "", "true", "on", " 0", "0 ", "00"] {
+                assert!(flags(Some(raw)).mqv2_mq3_mw, "{arch}: {raw:?}");
+                assert_eq!(
+                    flags(Some(raw)).mqv2_mq3_mw_enabled(),
+                    exact,
+                    "{arch}: {raw:?}"
+                );
+            }
+        }
+        assert!(!FeatureFlags::for_test("gfx1100").mqv2_mq3_mw_enabled());
     }
 
     /// The q8 hg4 lite twin is default on for exact gfx1100 only; exactly `0`

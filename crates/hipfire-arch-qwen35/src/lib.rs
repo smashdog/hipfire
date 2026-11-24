@@ -104,6 +104,87 @@ pub mod gguf_map;
 /// as `DType::Ggml*` weights with the exporter's data edits undone.
 #[cfg(feature = "deltanet")]
 pub mod gguf_source;
+/// KVMem host-offload controller: per-slot paged-page residency
+/// (spill/restore via `SPILLED_PAGE` sentinels), block-statistics feeding
+/// and retrieval selection for the multi-slot serve engine. Enabled with
+/// `HIPFIRE_KVMEM=1`; requires the paged Q8 pool.
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+pub mod kvmem_ctl;
+/// G7 multimodal × KVMem Stage A: vision spans as indivisible prefix groups
+/// (nInfer `layerwise_media_replay_begin` + core `prefix_anchor`). Pure host
+/// logic; no engine call site yet (additive, byte-neutral).
+#[cfg(feature = "kvmem")]
+pub mod kvmem_media;
+/// P4.3 KVMem-native prefix sharing: immutable canonical source + checkpoint
+/// catalog (host model; ninfer-aligned provenance). Additive sibling to
+/// `kvmem_ctl`; an empty catalog (the default, PREFIX_PIN off) allocates
+/// nothing and mutates nothing, keeping the Legacy serve byte-neutral.
+#[cfg(feature = "kvmem")]
+pub mod kvmem_prefix;
+/// KVMem host-offload statistics taps: post-norm/pre-RoPE Q/K copies taken
+/// between k_norm and RoPE in each FullAttention layer. Owned by
+/// `PrefillBatchScratch::kvmem_taps`; `None` (the default) launches nothing.
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+pub mod kvmem_taps;
+/// Per-layer layerwise recall driver (Phase 3.2 ②-D3): the GPU scorer bridge
+/// (Rust→HIP), packed composite arena and core `LayerwiseQueryRequest`
+/// orchestration. Clean sibling to the legacy copy-only `AttentionTap` path;
+/// gated on `RecallStrategy::Layerwise` so the default Legacy serve is untouched.
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+pub mod layerwise_driver;
+/// Layerwise Q8 packed-page layout adapter (Phase 3.2 ①地基): bridges hipfire Q8
+/// geometry to the core generic `PayloadLayout` manifest + the crate-agnostic
+/// packed arena. Clean sibling to `kvmem_ctl`; not wired into live serve in ①.
+#[cfg(feature = "kvmem")]
+pub mod layerwise_layout;
+/// Layerwise MTP history policy + auxiliary-selection binding primitives
+/// (Phase 4.1 ① mtp-foundation). Pure-host mirror of the core
+/// `layerwise_mtp.hpp` policy enum/parse/validate and ninfer's
+/// `bind_auxiliary_selection` guard + FirstLayer source rule. Additive sibling
+/// to `layerwise_layout`/`layerwise_driver`; NOT wired into live serve in ①
+/// (② binds the head plan, ③ adds the UpstreamGlobal private probe), so the
+/// default Legacy serve never constructs it and stays byte-neutral.
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+pub mod layerwise_mtp;
+/// P4.1③ UpstreamGlobal MTP head-history private-probe selection: the global
+/// Mean-K reduction over the trunk carrier's captured activation Q tapes
+/// (core `LayerwiseProbeSelection`). Additive sibling to `layerwise_mtp`; only
+/// the UpstreamGlobal policy reaches it, so Legacy/FirstLayer stay byte-neutral.
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+pub mod layerwise_probe;
+/// NInfer-backed immutable inactive-history directory (no GPU page ownership).
+#[cfg(feature = "kvmem")]
+pub mod legacy_catalog;
+/// Native Legacy MTP/DFlash images paired with the target's recovery frontier.
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+pub mod legacy_draft;
+/// Host-only bounded user Query capture and single-use Legacy replay state.
+#[cfg(feature = "kvmem")]
+pub mod legacy_query;
+/// Threaded Layerwise forward handle (Phase 3.2 ②-D4b). With `kvmem` it carries
+/// the per-query driver+staging bundle through the shared forward spine exactly
+/// like `SpecVerifyCapture`; without it, a zero-sized placeholder so the
+/// default (deltanet-only) build compiles unchanged and stays byte-neutral.
+/// The legacy spine only threads this opaque handle and branches on it — all
+/// Layerwise logic lives in `layerwise_driver`.
+///
+/// Two independent lifetimes mirror `Option<&mut SpecVerifyCapture<'_>>`: `'a`
+/// is the borrow of the handle, `'b` the query's own store borrow. Keeping them
+/// separate lets the spine reborrow (`as_deref_mut`) for a warm-up call and then
+/// move the handle into the capture call — a single shared lifetime would make
+/// `&'a mut LayerwiseQuery<'a>` invariant and pin the reborrow for all of `'a`.
+///
+/// The no-kvmem placeholder is `&'a mut PhantomData<&'b ()>` rather than
+/// `&'a mut ()` so that `'b` stays *used* in both modes: downstream carriers
+/// (`Qwen35Bindings<'a, 'b>`) name both lifetimes unconditionally, and a bare
+/// `()` pointee would leave `'b` unconstrained → E0392 in the default build.
+/// `PhantomData` is zero-sized, covariant in `'b`, and `DerefMut`-transparent,
+/// so `None` / `is_some()` / `as_deref_mut()` behave identically to the kvmem
+/// alias while carrying no runtime data.
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+pub(crate) type LayerwiseFwd<'a, 'b> = Option<&'a mut layerwise_driver::LayerwiseQuery<'b>>;
+#[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+pub(crate) type LayerwiseFwd<'a, 'b> = Option<&'a mut core::marker::PhantomData<&'b ()>>;
 #[cfg(feature = "deltanet")]
 pub(crate) mod layer_driver;
 #[cfg(feature = "deltanet")]

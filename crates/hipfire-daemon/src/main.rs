@@ -96,6 +96,7 @@ mod npu_route;
 mod process_init;
 mod request_guards;
 mod slots;
+mod think_recovery;
 mod vision_ladder;
 mod weight_host_tenant;
 use vision_ladder::{apply_vision_mode_gate, resolve_vision_ladder};
@@ -793,10 +794,19 @@ fn report_gpu_init_failure(err: &hip_bridge::HipError) {
 /// the KFD topology before any GPU runtime initializes. `claim` reserves each
 /// resolved card as part of that same step.
 fn install_process_config(
-    config: hipfire_config::ProcessConfig,
+    mut config: hipfire_config::ProcessConfig,
     claim: &mut hipfire_config::devices::ClaimFn<'_>,
 ) -> Result<(), String> {
-    config.validate().map_err(|error| error.to_string())?;
+    // Older clients carry only developer values. Resolve that snapshot, never
+    // ambient env, before native initialization; env-only Layerwise stays None.
+    config
+        .resolve_missing_kvmem()
+        .map_err(|error| error.to_string())?;
+    if config.kvmem.as_ref().is_some_and(|kvmem| kvmem.enabled) && !cfg!(feature = "kvmem") {
+        return Err(
+            "UNSUPPORTED: enabled KVMem requires a daemon built with the kvmem feature".into(),
+        );
+    }
     let selection = hipfire_config::devices::apply_device_visibility(&config, claim)
         .map_err(|error| error.to_string())?;
     match &selection {
@@ -1080,8 +1090,9 @@ fn main() {
     if acknowledge_config {
         writeln!(
             stdout,
-            r#"{{"type":"configured","schema_version":{}}}"#,
-            hipfire_config::CONFIG_SCHEMA_VERSION
+            r#"{{"type":"configured","schema_version":{},"kvmem_contract_version":{}}}"#,
+            hipfire_config::CONFIG_SCHEMA_VERSION,
+            hipfire_config::kvmem::CONTRACT_VERSION
         )
         .unwrap_or_else(|error| {
             eprintln!("FATAL: failed to acknowledge process configuration: {error}");
@@ -1350,6 +1361,20 @@ fn main() {
                     .and_then(|p| p.get("experimental_multi_slot"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                if hipfire_config::active_or_local_process_config()
+                    .kvmem
+                    .as_ref()
+                    .is_some_and(|config| config.enabled)
+                    && !experimental_multi_slot
+                {
+                    emit_uncorrelated_error(
+                        &mut stdout, None,
+                        "UNSUPPORTED: enabled Legacy KVMem requires the multi-slot native owner; standard load cannot consume this policy",
+                        "validation", false, false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 // Omitted max_seq is resolved from model metadata and card
                 // capacity by source admission. Explicit zero still refuses
                 // before teardown (the fixed slot owner retains its 4096 default).
@@ -4370,53 +4395,120 @@ fn main() {
                     };
                     let request_seed =
                         request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
-                    hipfire_generate::batch::arm_promotion(
-                        vmm_route && batch_scheduler.is_some(),
-                        &msg,
-                        m,
-                        continuous_batch_size,
-                        serve_continuous_batch,
-                        pflash_active,
-                        max_tokens,
-                        max_think_tokens,
-                        client_seed,
-                        assistant_prefix,
-                    );
-                    generate(
-                        m,
-                        &mut gpu,
-                        pflash_drafter_gpu.as_mut(),
-                        &mut stdout,
-                        id,
-                        prompt,
-                        system,
-                        user_explicit_sampling,
-                        temp,
-                        top_p,
-                        top_k,
-                        min_p,
-                        cactus_delta,
-                        max_tokens,
-                        repeat_penalty,
-                        repeat_window,
-                        presence_penalty,
-                        frequency_penalty,
-                        budget_alert_at_tok,
-                        &budget_alert_text,
-                        max_think_tokens,
-                        assistant_prefix,
-                        pflash_state.as_mut(),
-                        pf_cfg_owned.as_ref(),
-                        tools_json.as_deref(),
-                        messages_history.as_deref(),
-                        think_mode,
-                        &stop_seqs, // hunt3 M-F
-                        min_tokens,
-                        reasoning_effort_jinja.as_deref(),
-                        enable_thinking_jinja,
-                        logprobs_top_k,
-                        request_seed,
-                    );
+                    // ── Sequential #728: one low-effort restart on a loop ──
+                    // `generate` returns before staging any terminal when its
+                    // reasoning-loop detector fires; the restart swaps the
+                    // xhigh effort sentence for the low one, raises the
+                    // sampling floors (temp >= 1.0, presence >= 1.5), keeps
+                    // the same request id and spends only the remaining
+                    // budget. Reference parity: one recovery per request.
+                    let mut seq_prompt: std::borrow::Cow<'_, str> =
+                        std::borrow::Cow::Borrowed(prompt);
+                    let mut seq_effort: Option<String> = reasoning_effort_jinja.clone();
+                    let mut seq_temp = temp;
+                    let mut seq_presence = presence_penalty;
+                    let mut seq_budget = max_tokens;
+                    let mut seq_seed = request_seed;
+                    let mut seq_base = 0usize;
+                    let mut seq_mode = developer_var("HIPFIRE_REASONING_LOOP_RECOVERY")
+                        .ok()
+                        .and_then(|v| {
+                            hipfire_runtime::reasoning_loop::LoopMode::from_config_value(&v)
+                        })
+                        .unwrap_or(hipfire_runtime::reasoning_loop::LoopMode::Recover);
+                    // Pass-2+ continuation state: the recovered pass re-renders
+                    // the prompt under the low-effort sentence (the render is
+                    // what carries the splice) and replays every generated id
+                    // after it, so the model continues its own thoughts.
+                    let mut seq_carry: Vec<u32> = Vec::new();
+                    let mut seq_pass = 0usize;
+                    loop {
+                        seq_pass += 1;
+                        let mut recovery =
+                            hipfire_generate::ar::SequentialRecovery::new(seq_mode, seq_base);
+                        recovery.suppress_route_start = seq_pass > 1;
+                        recovery.suffix = seq_carry.clone();
+                        hipfire_generate::batch::arm_promotion(
+                            vmm_route && batch_scheduler.is_some(),
+                            &msg,
+                            m,
+                            continuous_batch_size,
+                            serve_continuous_batch,
+                            pflash_active,
+                            max_tokens,
+                            max_think_tokens,
+                            client_seed,
+                            assistant_prefix,
+                        );
+                        generate(
+                            m,
+                            &mut gpu,
+                            pflash_drafter_gpu.as_mut(),
+                            &mut stdout,
+                            id,
+                            seq_prompt.as_ref(),
+                            system,
+                            user_explicit_sampling,
+                            seq_temp,
+                            top_p,
+                            top_k,
+                            min_p,
+                            cactus_delta,
+                            seq_budget,
+                            repeat_penalty,
+                            repeat_window,
+                            seq_presence,
+                            frequency_penalty,
+                            budget_alert_at_tok,
+                            &budget_alert_text,
+                            max_think_tokens,
+                            assistant_prefix,
+                            pflash_state.as_mut(),
+                            pf_cfg_owned.as_ref(),
+                            tools_json.as_deref(),
+                            messages_history.as_deref(),
+                            think_mode,
+                            &stop_seqs, // hunt3 M-F
+                            min_tokens,
+                            seq_effort.as_deref(),
+                            enable_thinking_jinja,
+                            logprobs_top_k,
+                            seq_seed,
+                            Some(&mut recovery),
+                        );
+                        if !recovery.requested {
+                            if let Some((at, cov)) = recovery.trip {
+                                if recovery.stopped {
+                                    eprintln!(
+                                        "[think-recover] sequential loop: coverage={cov:.3} at n={at}; ending as length"
+                                    );
+                                } else if let Some(why) = recovery.unavailable {
+                                    eprintln!(
+                                        "[think-recover] sequential loop: coverage={cov:.3} at n={at}; recovery unavailable ({why}); continuing"
+                                    );
+                                }
+                            }
+                            break;
+                        }
+                        eprintln!(
+                            "[think-recover] sequential loop: coverage={:.3} at n={}; restarting with the low-effort sentence",
+                            recovery.coverage,
+                            seq_base + recovery.generated
+                        );
+                        seq_base += recovery.generated;
+                        seq_carry.extend_from_slice(&recovery.emitted);
+                        seq_budget = max_tokens.saturating_sub(seq_base).max(1);
+                        seq_prompt = std::borrow::Cow::Owned(seq_prompt.replacen(
+                            think_recovery::HIGH_EFFORT_INSTRUCTION,
+                            think_recovery::LOW_EFFORT_INSTRUCTION,
+                            1,
+                        ));
+                        seq_effort = Some("low".to_string());
+                        seq_temp = seq_temp.max(1.0);
+                        seq_presence = seq_presence.max(1.5);
+                        seq_seed = seq_seed.wrapping_add(1);
+                        seq_mode = hipfire_runtime::reasoning_loop::LoopMode::Off;
+                    }
                     if let Some(drive_res) = hipfire_generate::batch::drive_promoted(
                         batch_scheduler.as_mut(),
                         &mut gpu,

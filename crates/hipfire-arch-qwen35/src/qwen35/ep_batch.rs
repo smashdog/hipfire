@@ -2894,6 +2894,10 @@ pub fn forward_ep(
                 precomputed_attn_x_rot: false,
                 fa_output_prerotated: false,
                 defer_routed_combine: false,
+                paged: None,
+                tap: None,
+                fa_layer_idx: 0,
+                layerwise: None,
             });
         }
         hipfire_runtime::ep::run_layer_program_ep(

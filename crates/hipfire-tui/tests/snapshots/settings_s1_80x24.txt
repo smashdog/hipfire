@@ -13,7 +13,7 @@
  │  Thinking                      on                      default             │
  │  Thinking effort               ● low                   you                 │
  │  Thinking cap                  med                     default             │
- └─────────────────────────────────────────────────────────── rows 1–6 of 8 ↓ ┘
+ └────────────────────────────────────────────────────────── rows 1–6 of 12 ↓ ┘
  ┌ Prompt processing ─────────────────────────────────────────────────────────┐
  │How the model reads your prompt before it starts to answer.                 │
  │Accurate: 43% closer to the full model, prompts 1.6× slower.                │

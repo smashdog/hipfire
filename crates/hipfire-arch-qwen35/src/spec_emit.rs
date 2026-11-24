@@ -618,6 +618,51 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
         let in_think = currently_in_think(raw_str, self.open_think_prefix);
         self.think_budget.window_cap(in_think)
     }
+
+    /// Whether the stream currently sits inside an unclosed think span. The
+    /// think router's flag is authoritative: a held-back PARTIAL close marker
+    /// keeps the span open (the close has not been consumed), which matches
+    /// PolyStrata's `parser.state == "reasoning"` with a non-empty buffer.
+    fn open_think_now(&self) -> bool {
+        self.think_router.in_think()
+    }
+
+    /// Clean token boundary: neither the byte filter nor the think router is
+    /// holding back bytes (a partial EOT prefix or a partial think marker).
+    /// The recovery decision (#728) may only be taken at such a boundary.
+    fn at_clean_boundary(&self) -> bool {
+        !self.filter.has_pending() && !self.think_router.has_pending()
+    }
+
+    /// The family's think-close text, for the daemon's #1053 injection. This
+    /// is the same string `think_budget_stop` splices, so the injected close
+    /// is byte-identical to what a budget force-close would have produced.
+    fn think_close_text(&self) -> Option<&str> {
+        Some(&self.think_close)
+    }
+
+    /// Feed a daemon-injected token (the think-close splice, either the
+    /// #1053 repair or the multi-slot budget close) through the emission
+    /// pipeline as pure STATE REPAIR: bytes are decoded and routed through
+    /// the think router / content router exactly as if generated, but no
+    /// `Committed` event is posted, no grammar cursor moves, and neither the
+    /// EOT filter nor the stop matcher observes the bytes — an injected
+    /// close must never arm a terminator or stop sequence. Each injected
+    /// token also discharges one queued budget-close token: the splice
+    /// delivers them without an `observe` call, and a stale `closing` count
+    /// would swallow the continuation's first tokens.
+    fn observe_injected(&mut self, token: u32) -> Vec<ClientEvent> {
+        let mut events = Vec::new();
+        self.think_budget.consume_closing(1);
+        let fed = self.stream_bytes.len();
+        self.tokenizer
+            .decode_token_bytes_into(token, &mut self.stream_bytes);
+        let text = std::str::from_utf8(&self.stream_bytes[fed..])
+            .unwrap_or("")
+            .to_string();
+        self.route_filter_text(&text, &mut events);
+        events
+    }
 }
 
 // ── Deterministic non-GPU producer tests ────────────────────────────────────
@@ -1358,5 +1403,137 @@ mod tests {
             assert!(emit.observe(id).stop.is_none());
             assert_eq!(emit.window_cap(), None);
         }
+    }
+
+    /// #1053 state repair: the daemon feeds "\n" + think_close through the same router the generated
+    /// stream uses. The pre-close newline is reasoning, the close marker is consumed, the trailing
+    /// newlines are stripped from the answer, and no `Committed` event (nor grammar/terminator
+    /// state) is touched by the injected ids.
+    #[test]
+    fn injected_think_close_repairs_the_span_without_client_trace() {
+        let tok = test_tokenizer();
+        let mut emit = Qwen35Emit::from_ctx_recover(SpecEmitCtx {
+            tokenizer: &tok,
+            eos: 9,
+            im_end: Some(1),
+            tools: Some(&[]),
+            enable_grammar: true,
+            stop: Vec::new(),
+            min_tokens: 0,
+            max_think: 0,
+            max_tokens: 256,
+            assistant_prefix: AssistantPrefix::OpenThink,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::Low,
+            decoded_vocab: None,
+        });
+        // The prompt opened the span: reasoning is live and the boundary is clean.
+        assert!(emit.open_think_now());
+        assert_eq!(emit.think_close_text(), Some("</think>\n\n"));
+        let mut first = true;
+        let mut stream = Vec::new();
+        for id in tok.encode("plan") {
+            let out = if first {
+                first = false;
+                emit.begin(id)
+            } else {
+                emit.observe(id)
+            };
+            stream.extend(out.events);
+        }
+        assert!(!reasoning_text(&stream).is_empty());
+        assert!(emit.open_think_now(), "still inside the span");
+        assert!(emit.at_clean_boundary());
+
+        // The injection, byte for byte what `slots.rs` encodes.
+        let mut injected = Vec::new();
+        for id in tok.encode("\n</think>\n\n") {
+            injected.extend(emit.observe_injected(id));
+        }
+        assert!(
+            reasoning_text(&injected).contains('\n'),
+            "pre-close newline is reasoning"
+        );
+        assert!(
+            !emit.open_think_now(),
+            "the close token flipped the span state"
+        );
+        assert!(
+            injected
+                .iter()
+                .all(|ev| !matches!(ev, ClientEvent::Committed { .. })),
+            "injected tokens never post Committed"
+        );
+        assert!(
+            tokens_text(&injected).trim().is_empty(),
+            "the post-close newlines are stripped from the answer"
+        );
+
+        // The continuation pass resumes as visible content.
+        let mut visible = String::new();
+        for id in tok.encode("Hello") {
+            visible.push_str(&tokens_text(&emit.observe(id).events));
+        }
+        assert_eq!(visible, "Hello");
+    }
+
+    /// `max_think_tokens` on the emitter (the multi-slot budget close): the
+    /// trip token queues the family close text, the daemon-routed splice
+    /// discharges the queued count, and a span re-opened afterwards spends
+    /// the budget once more before it is a hard `ThinkCap` stop.
+    #[test]
+    fn think_budget_queues_the_family_close_and_stops_on_reopen() {
+        let tok = test_tokenizer();
+        let mut emit = Qwen35Emit::from_ctx_recover(SpecEmitCtx {
+            tokenizer: &tok,
+            eos: 9,
+            im_end: Some(1),
+            tools: Some(&[]),
+            enable_grammar: true,
+            stop: Vec::new(),
+            min_tokens: 0,
+            max_think: 2,
+            max_tokens: 256,
+            assistant_prefix: AssistantPrefix::OpenThink,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::Low,
+            decoded_vocab: None,
+        });
+        // Two reasoning tokens spend the budget; the second one trips.
+        let mut forced = Vec::new();
+        for id in tok.encode("ab") {
+            let out = emit.observe(id);
+            assert!(out.stop.is_none(), "inside the span: no hard stop yet");
+            forced.extend(emit.take_forced());
+        }
+        assert_eq!(forced, tok.encode("</think>\n\n"));
+        assert!(
+            emit.take_forced().is_empty(),
+            "forced payload is taken once"
+        );
+        // The daemon routes those tokens as an in-turn splice.
+        for id in &forced {
+            emit.observe_injected(*id);
+        }
+        assert!(!emit.open_think_now());
+        assert!(
+            emit.take_forced().is_empty(),
+            "the splice never re-queues a close"
+        );
+        // The continuation streams as visible content...
+        let mut visible = String::new();
+        for id in tok.encode("OK") {
+            visible.push_str(&tokens_text(&emit.observe(id).events));
+        }
+        assert_eq!(visible, "OK");
+        // ...and a re-opened span spends the same budget once more; a second
+        // exhaustion is the hard stop instead of another splice.
+        let reopen = tok.encode("<think>");
+        assert_eq!(reopen.len(), 1);
+        assert!(emit.observe(reopen[0]).stop.is_none());
+        let out = emit.observe(tok.encode("x")[0]);
+        assert_eq!(out.stop, Some(StopReason::ThinkCap));
+        assert!(
+            emit.take_forced().is_empty(),
+            "a second exhaustion never splices again"
+        );
     }
 }

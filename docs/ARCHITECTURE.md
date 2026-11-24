@@ -41,6 +41,7 @@ crates/
 ├── hipfire-arch-llama/       # facade for dense LLaMA/Mistral/plain Qwen3 (ids 0/1)
 ├── hipfire-arch-qwen2/       # Qwen2 text (id 7)
 ├── hipfire-arch-qwen35/      # Qwen3.5/3.6/3.8 hybrid DeltaNet, dense and MoE (ids 5/6)
+├── hipfire-kvmem/            # optional standalone C ABI adapter over the portable KVMem host library (excluded from the root workspace)
 ├── hipfire-arch-qwen35-vl/   # vision tower attached to Qwen3.5 ids 5/6
 ├── hipfire-arch-qwen4/       # Qwen3.8-Flash-Next / Qwen4 (id 16)
 ├── hipfire-arch-dots-ocr/    # dots.ocr (id 8)

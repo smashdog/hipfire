@@ -49,6 +49,34 @@ pub struct VisualData {
     pub rope_delta: i32,
 }
 
+impl VisualData {
+    /// G7: stable content digest of this media turn (FNV-1a over the vision
+    /// patch tensor, grid, visual-token count and rope delta). Content-only:
+    /// the per-prompt M-RoPE phase table is deliberately excluded — it depends
+    /// on the surrounding text length, while two requests carrying the SAME
+    /// image must share an identity. A token proof cannot distinguish two
+    /// images (identical `image_pad` ids), so prefix reuse requires this digest
+    /// to match whenever a checkpoint covers a media span.
+    pub fn media_digest(&self) -> u64 {
+        const OFFSET: u64 = 0xcbf29ce484222325;
+        const PRIME: u64 = 0x100000001b3;
+        let mut h = OFFSET;
+        let mut mix = |bytes: &[u8]| {
+            for &b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(PRIME);
+            }
+        };
+        mix(&(self.grid_h as u64).to_le_bytes());
+        mix(&(self.grid_w as u64).to_le_bytes());
+        mix(&(self.n_visual_tokens as u64).to_le_bytes());
+        mix(&self.rope_delta.to_le_bytes());
+        let patch_bytes: Vec<u8> = self.patches.iter().flat_map(|f| f.to_le_bytes()).collect();
+        mix(&patch_bytes);
+        h
+    }
+}
+
 /// One request handed to the engine.
 ///
 /// `reply` is the client's own channel: the engine streams this request's
@@ -57,6 +85,14 @@ pub struct VisualData {
 pub struct SubmitRequest {
     /// Full cold render of the conversation. Used when nothing is reusable.
     pub prompt_tokens: Vec<u32>,
+    /// 期2.3: frontend-proven span of the current user question inside
+    /// `prompt_tokens` (original coordinates `[begin, end)`). The frontend
+    /// derives it from the rendered prompt; `None` when it cannot prove the
+    /// span (tool continuations, VL, template transforms). Layerwise import
+    /// uses it to tell a NEW query from one whose KV/score is already
+    /// effective at the source checkpoint (KVMem/nInfer
+    /// `layerwise_query_at_source`); `None` keeps the historical behaviour.
+    pub query: Option<(u64, u64)>,
     /// Hashes of the conversation's user turns, in order. Identity for
     /// continuation matching — see `Session::convo`.
     pub convo: Vec<u64>,
@@ -203,6 +239,138 @@ pub fn send_event(tx: &Sender<Event>, e: Event) -> Result<(), String> {
         .map_err(|_| "client receiver dropped".to_string())
 }
 
+/// KVMem host-offload telemetry, refreshed from the live controller once per
+/// engine step. All fields are scalars (the snapshot is `Copy`) and every
+/// counter is monotonic since engine start. `enabled == false` carries zeros
+/// and the gateway exports no KVMem series for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct KvMemStats {
+    pub enabled: bool,
+    /// Layerwise recall strategy active (per-layer selection) vs Legacy.
+    pub layerwise: bool,
+    /// Host KV storage charged bytes (live + sealed payload + metadata).
+    pub host_charged_bytes: u64,
+    /// Host KV storage spilled to the disk tier.
+    pub disk_bytes: u64,
+    /// Packed KV payload bytes held by the per-slot host stores.
+    pub payload_bytes: u64,
+    /// Logical blocks / tokens across every slot's policy store.
+    pub blocks: u64,
+    pub tokens: u64,
+    /// Paged spill/restore volume since start (pages and packed bytes).
+    pub spill_pages: u64,
+    pub restore_pages: u64,
+    pub spill_bytes: u64,
+    pub restore_bytes: u64,
+    /// P4.3 frozen-prefix catalog: entries, pinned GPU pages, and the
+    /// freeze/lookup/eviction counters that explain a hit ratio.
+    pub prefix_entries: u64,
+    pub prefix_pinned_pages: u64,
+    /// Host bytes charged to the catalog for retention. `prefix_host_bytes`
+    /// charges a snapshot origin shared across entries once (inherited
+    /// origins, patch 39); `_gross` repeats it per entry.
+    pub prefix_host_bytes: u64,
+    pub prefix_host_bytes_gross: u64,
+    pub prefix_freezes: u64,
+    pub prefix_hits: u64,
+    pub prefix_misses: u64,
+    pub prefix_evictions: u64,
+    /// Admission-pressure residency demotions: the entry stays cataloged and
+    /// only its pinned pages are dropped (Layerwise restores them later).
+    pub prefix_demotions: u64,
+    /// Hot catalog hits (no pack read) and reuse conversions that restored a
+    /// page-less (demoted/restart) entry from the sealed archive.
+    pub prefix_catalog_hits: u64,
+    pub prefix_restore_hits: u64,
+    /// 期4: DFlash2 draft conditioning images captured with prefix
+    /// checkpoints, restored on reuse, and missing/unrestorable (reseed).
+    pub draft_images: u64,
+    pub draft_image_hits: u64,
+    pub draft_image_misses: u64,
+    /// 期3 G3: distinct content groups retained in the prefix directory.
+    pub content_groups: u64,
+    /// Entries retired by the group-aware publication plan.
+    pub content_retirements: u64,
+    /// 期3 G3-SSD: content-cache account bytes (charged) and its disk tier.
+    pub content_cache_bytes: u64,
+    pub content_cache_disk_bytes: u64,
+    /// 期3 G3 P1.1: persistent pack files and their bytes; cold pack hits.
+    pub content_packs: u64,
+    pub content_pack_bytes: u64,
+    pub cold_pack_hits: u64,
+    /// Cold pack matches that were rejected / failed to load.
+    pub cold_pack_misses: u64,
+}
+
+/// Speculative-decoding telemetry (期4, KVMem/nInfer `speculative.hpp`
+/// parity): the schema version + configuration the engine resolved, plus the
+/// completed-request statistics the contract defines. Statistics accumulate
+/// when a generation finishes (cancellation paths included) and exclude
+/// admission failures; `drafted_tokens` excludes internal replay proposals,
+/// `accepted_tokens` excludes correction/bonus rows, `rounds` counts target
+/// verifications that carried proposals and `fallback_steps` counts ordinary
+/// decode steps with no proposal available.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SpeculativeStats {
+    pub schema_version: u32,
+    pub enabled: bool,
+    /// `kvmem::SpeculativeAlgorithm` ordinal (1 mtp, 2 dflash, 3 dflash2).
+    pub algorithm: u32,
+    pub draft_tokens: u64,
+    pub adaptive: bool,
+    pub ngram_draft_tokens: u64,
+    pub requests: u64,
+    pub rounds: u64,
+    pub drafted_tokens: u64,
+    pub accepted_tokens: u64,
+    pub generated_tokens: u64,
+    pub fallback_steps: u64,
+}
+
+impl SpeculativeStats {
+    /// accepted / drafted, or `None` before any draft.
+    pub fn acceptance_rate(&self) -> Option<f64> {
+        (self.drafted_tokens != 0).then(|| self.accepted_tokens as f64 / self.drafted_tokens as f64)
+    }
+}
+
+/// Canonical `speculative.hpp` algorithm name for an ordinal.
+pub fn speculative_algorithm_name(algorithm: u32) -> &'static str {
+    match algorithm {
+        1 => "mtp",
+        2 => "dflash",
+        3 => "dflash2",
+        _ => "none",
+    }
+}
+
+/// Think-recovery counters (#1053 / #728 / #606) folded into the multi-slot
+/// `done.engine_stats` snapshot; the serve gateway exports them on `/metrics`.
+/// Cumulative since daemon start. A daemon built without the pass loop always
+/// reports zeros.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ThinkRecoveryStats {
+    /// #1053: `\n` + think-close injections that continued the turn in-place.
+    pub close_injections: usize,
+    /// #728 recover mode: passes restarted with the low-effort sentence.
+    pub loop_recoveries: usize,
+    /// #728 stop mode: reasoning loops ended as `length`.
+    pub loop_stops: usize,
+    /// #606: same-token runs that ended the pass as `length`.
+    pub repeat_run_stops: usize,
+    /// `max_think_tokens` on a non-schema turn: budget closes spliced and
+    /// continued cold.
+    pub budget_closes: usize,
+    /// Periodic #728 checks that declined, by reason. "below threshold" is
+    /// the normal case and is not counted.
+    pub loop_skips_already_recovered: usize,
+    pub loop_skips_vision: usize,
+    pub loop_skips_budget_exhausted: usize,
+}
+
 /// Serialized as the `engine_stats` object of every multi-slot `done` event;
 /// the serve gateway exports it on `/metrics`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -241,6 +409,12 @@ pub struct EngineStats {
     pub swap_disk_used: u64,
     pub swap_host_budget: u64,
     pub swap_disk_budget: u64,
+    /// KVMem host-offload snapshot (zeroed when the engine runs without it).
+    pub kvmem: KvMemStats,
+    /// Speculative-decoding contract snapshot (期4; zeroed when off).
+    pub speculative: SpeculativeStats,
+    /// Think-recovery counters, patched in by the daemon (zeroed elsewhere).
+    pub think_recovery: ThinkRecoveryStats,
 }
 
 impl EngineStats {
@@ -275,6 +449,13 @@ impl EngineStats {
         self.active_slots = self.active_slots.saturating_sub(1);
     }
 
+    /// Refresh the live KVMem snapshot (cheap integer reads from the host
+    /// stores; no allocation, no device work). Engines without KVMem leave
+    /// the default zero snapshot, whose series the gateway suppresses.
+    pub fn note_kvmem(&mut self, kvmem: KvMemStats) {
+        self.kvmem = kvmem;
+    }
+
     /// Refresh the swap-tier snapshot from the live manager. Cheap: reads
     /// counters and three integers, no allocation.
     pub fn note_swap(&mut self, swap: &crate::swap::SwapManager) {
@@ -296,9 +477,9 @@ impl EngineStats {
 // single arch-erased surface `handle_generate` drives; the concrete engine
 // (e.g. `hipfire_arch_qwen35::serve_engine::SlotEngine`) implements it.
 //
-// `SlotEngineConfig` is the family-neutral spawn record — every field is a
-// primitive/`PathBuf`/`String`/`Option`, so a carrier can map it onto its
-// own engine config without seeing arch types. It mirrors
+// `SlotEngineConfig` is the family-neutral spawn record — fields are
+// primitives or shared hipfire-config types, never architecture types, so a
+// carrier can map it onto its own engine config. It mirrors
 // `hipfire_arch_qwen35::serve_engine::EngineConfig` field-for-field; keep
 // them in lock-step (the qwen35 carrier maps them 1:1).
 
@@ -306,9 +487,12 @@ impl EngineStats {
 /// the daemon from serve.* config keys + the load request, then handed to
 /// `Carrier::spawn_slot_engine`, which adapts it into the concrete engine's
 /// own config. Field-for-field with the qwen35 `EngineConfig`; a second
-/// engine family may ignore fields it does not implement.
+/// engine family must refuse enabled KVMem if it has no consumer.
 #[derive(Debug, Clone)]
 pub struct SlotEngineConfig {
+    /// Strict Legacy policy from the process-start envelope. Native consumers
+    /// must not reparse these fields from env. None preserves env-only Layerwise.
+    pub kvmem: Option<hipfire_config::kvmem::ResolvedConfig>,
     pub model_path: PathBuf,
     pub n_slots: usize,
     /// Per-slot generation cap (tokens) used by the paged-KV budget.
@@ -468,6 +652,14 @@ pub trait SlotEngineHandle: Send + Sync {
     fn submit(&self, req: SubmitRequest) -> Result<(), String>;
     /// Cancel a QUEUED request by submitter tag. Idempotent; tag 0 is a no-op.
     fn cancel_waiting(&self, request_tag: u64);
+    /// Ask the engine to end the CURRENT generation pass of `session` at the
+    /// next token boundary while keeping the session's KV resident, so a
+    /// follow-up request can continue the accepted token stream without a
+    /// cold prefill (think-recovery pass loop, both #1053 continuation and
+    /// #728 loop recovery). Fire-and-forget: the pass end is observed through
+    /// the request's `Done { reason: MaxTokens }` event. Default is a no-op
+    /// for engines without pass semantics (the embedding engines).
+    fn interrupt(&self, _session: u64) {}
     /// Close a session synchronously, cancelling any in-flight request and
     /// releasing its session/pool/swap state. Never silently ignored.
     fn close(&self, session: u64) -> Result<(), String>;

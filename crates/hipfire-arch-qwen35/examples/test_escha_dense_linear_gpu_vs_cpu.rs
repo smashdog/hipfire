@@ -20,8 +20,9 @@
 //! `proj` defaults to `mlp.gate_proj` on layer 0; pass e.g.
 //! `linear_attn.in_proj_qkv` to check another.
 
-use hipfire_arch_qwen35::qwen35::escha::{EschaProj,
-    escha_dense_leaf, escha_dense_linear_forward, load_escha_dense_linear, EschaWeightStore,
+use hipfire_arch_qwen35::qwen35::escha::{
+    escha_dense_leaf, escha_dense_linear_forward, load_escha_dense_linear, EschaProj,
+    EschaWeightStore,
 };
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::{DType, Gpu};
@@ -62,7 +63,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         other => panic!("{proj}: quant_type {other} is not escha (42/43)"),
     };
     let dims: Vec<usize> = code_info.shape.iter().map(|&d| d as usize).collect();
-    assert_eq!(dims.len(), 3, "{proj}: escha_code should be 3-D, got {dims:?}");
+    assert_eq!(
+        dims.len(),
+        3,
+        "{proj}: escha_code should be 3-D, got {dims:?}"
+    );
     let (ic, oc) = (dims[0] * 16, dims[1] * 16);
     println!("{proj}: ic={ic} oc={oc} K={k}");
 
@@ -201,7 +206,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── GPU ──────────────────────────────────────────────────────────────
     // F16 store: the decode to fp16 is exact, so any difference is the
     // forward path rather than a re-quantisation. Q8_0 is reported after.
-    for store in [EschaWeightStore::F16, EschaWeightStore::Native, EschaWeightStore::Q8_0] {
+    for store in [
+        EschaWeightStore::F16,
+        EschaWeightStore::Native,
+        EschaWeightStore::Q8_0,
+    ] {
         let lin = load_escha_dense_linear(&hfq, &mut gpu, p, &proj, ic, oc, store, candidates)?;
         let xg = gpu.upload_f32(&x, &[ic])?;
         let xh = gpu.alloc_tensor(&[ic], DType::F32)?;
@@ -283,13 +292,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // up as a bad PPL much later.
     {
         let lin = load_escha_dense_linear(
-            &hfq, &mut gpu, p, &proj, ic, oc, EschaWeightStore::Native, candidates)?;
+            &hfq,
+            &mut gpu,
+            p,
+            &proj,
+            ic,
+            oc,
+            EschaWeightStore::Native,
+            candidates,
+        )?;
         let ep = EschaProj {
-            rin: lin.rin, rout: lin.rout, ptr0: lin.ptr0.expect("native has ptr0"),
+            rin: lin.rin,
+            rout: lin.rout,
+            ptr0: lin.ptr0.expect("native has ptr0"),
         };
         for slots in [1usize, 4] {
             let mut xb = Vec::with_capacity(slots * ic);
-            for _ in 0..slots { xb.extend_from_slice(&x); }
+            for _ in 0..slots {
+                xb.extend_from_slice(&x);
+            }
             let xg = gpu.upload_f32(&xb, &[slots * ic])?;
             let ids = gpu.upload_f32(&vec![f32::from_bits(0); slots], &[slots])?;
             let xh = gpu.alloc_tensor(&[slots * ic], DType::F32)?;
@@ -298,11 +319,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Exercise BOTH shapes: the per-slot GEMV and, above 1 slot, the
             // grouped WMMA GEMM that batched prefill uses.
             let off_bytes: Vec<u8> = [0i32, slots as i32]
-                .iter().flat_map(|v| v.to_le_bytes()).collect();
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
             let offsets = gpu.upload_raw(&off_bytes, &[2])?;
             let iota: Vec<f32> = (0..slots).map(|i| f32::from_bits(i as u32)).collect();
             let iota = gpu.upload_f32(&iota, &[slots])?;
-            let grouped = if slots > 1 { Some((&offsets, &iota)) } else { None };
+            let grouped = if slots > 1 {
+                Some((&offsets, &iota))
+            } else {
+                None
+            };
             ep.forward(&mut gpu, &lin.w, &ids, &xg, &xh, &mid, &yg, slots, grouped)?;
             let y = gpu.download_f32(&yg)?;
             // Every slot fed the same x, so every slot must equal y_ref
@@ -313,7 +340,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let got = y[sl * oc + o] as f64;
                     let want = y_ref[o] as f64 - bias_ref[o] as f64;
                     let d = (got - want).abs() / (want.abs().max(1e-3));
-                    if d > worst { worst = d; }
+                    if d > worst {
+                        worst = d;
+                    }
                 }
             }
             println!("  BATCHED slots={slots}: worst_rel {worst:.3e}");

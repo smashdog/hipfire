@@ -1561,7 +1561,7 @@ fn mtp_accept_stats_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("HIPFIRE_MTP_ACCEPT_STATS")
+        hipfire_config::developer_var("HIPFIRE_MTP_ACCEPT_STATS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
@@ -2016,6 +2016,39 @@ pub trait SpecEmit {
     /// `None` = no limit (the default).
     fn window_cap(&self) -> Option<usize> {
         None
+    }
+
+    /// True while the emitter's think state is INSIDE a reasoning span
+    /// (`<think>` opened, close not yet consumed). Think-recovery uses this to
+    /// detect "EOS fell on an open think" (#1053). Default false: emitters
+    /// without think routing never open a span.
+    fn open_think_now(&self) -> bool {
+        false
+    }
+
+    /// True when no held-back bytes are pending in the emitter — byte filter,
+    /// stop matcher and think router all sit on a clean token boundary. A
+    /// recovery decision may only be taken at such a boundary (#728 clean
+    /// gate); default true for emitters that never hold anything back.
+    fn at_clean_boundary(&self) -> bool {
+        true
+    }
+
+    /// The model family's think-close text (e.g. `</think>`), when the emitter
+    /// routes thinking. The daemon splices it into the continuation injection
+    /// so the close text always matches what the live emitter would consume.
+    fn think_close_text(&self) -> Option<&str> {
+        None
+    }
+
+    /// Feed a daemon-injected token through the emitter WITHOUT generation
+    /// semantics: no grammar advance, no EOS/stop checks, no loop counters —
+    /// this is state repair of the accepted stream (the injected think-close
+    /// must render and flip the think router exactly as if the model had
+    /// sampled it), not a commitment of sampled output. Returns the client
+    /// events to render. Default: no rendering, no state change.
+    fn observe_injected(&mut self, _token: u32) -> Vec<ClientEvent> {
+        Vec::new()
     }
 }
 

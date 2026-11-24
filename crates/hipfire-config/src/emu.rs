@@ -692,6 +692,7 @@ mod tests {
         ProcessConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
             values,
+            kvmem: None,
         }
     }
 

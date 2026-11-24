@@ -524,6 +524,77 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::GEMV_MQ4G256V2_Q8X_V3_B5_RES_SRC,
             ["mq4v2_q8x_v3_b5_res", "mq4v2_q8x_v3_b5_res_multi"]
         );
+        // MQ3G256V2 (qt49, 3-bit) q8x verify twins; reuse mq4v2_q8x_quant above.
+        add!(
+            "mq3v2_q8x_v4_b2",
+            kernels::GEMV_MQ3G256V2_Q8X_V4_B2_SRC,
+            ["mq3v2_q8x_v4_b2", "mq3v2_q8x_v4_b2_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v4_b2_res",
+            kernels::GEMV_MQ3G256V2_Q8X_V4_B2_RES_SRC,
+            ["mq3v2_q8x_v4_b2_res", "mq3v2_q8x_v4_b2_res_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v4_b3",
+            kernels::GEMV_MQ3G256V2_Q8X_V4_B3_SRC,
+            ["mq3v2_q8x_v4_b3", "mq3v2_q8x_v4_b3_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v4_b3_res",
+            kernels::GEMV_MQ3G256V2_Q8X_V4_B3_RES_SRC,
+            ["mq3v2_q8x_v4_b3_res", "mq3v2_q8x_v4_b3_res_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v4_b4",
+            kernels::GEMV_MQ3G256V2_Q8X_V4_B4_SRC,
+            ["mq3v2_q8x_v4_b4", "mq3v2_q8x_v4_b4_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v4_b4_res",
+            kernels::GEMV_MQ3G256V2_Q8X_V4_B4_RES_SRC,
+            ["mq3v2_q8x_v4_b4_res", "mq3v2_q8x_v4_b4_res_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b2",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B2_SRC,
+            ["mq3v2_q8x_v3_b2", "mq3v2_q8x_v3_b2_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b2_res",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B2_RES_SRC,
+            ["mq3v2_q8x_v3_b2_res", "mq3v2_q8x_v3_b2_res_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b3",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B3_SRC,
+            ["mq3v2_q8x_v3_b3", "mq3v2_q8x_v3_b3_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b3_res",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B3_RES_SRC,
+            ["mq3v2_q8x_v3_b3_res", "mq3v2_q8x_v3_b3_res_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b4",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B4_SRC,
+            ["mq3v2_q8x_v3_b4", "mq3v2_q8x_v3_b4_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b4_res",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B4_RES_SRC,
+            ["mq3v2_q8x_v3_b4_res", "mq3v2_q8x_v3_b4_res_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b5",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B5_SRC,
+            ["mq3v2_q8x_v3_b5", "mq3v2_q8x_v3_b5_multi"]
+        );
+        add!(
+            "mq3v2_q8x_v3_b5_res",
+            kernels::GEMV_MQ3G256V2_Q8X_V3_B5_RES_SRC,
+            ["mq3v2_q8x_v3_b5_res", "mq3v2_q8x_v3_b5_res_multi"]
+        );
     }
     if matches!(arch, "gfx906" | "gfx942") {
         add!(
@@ -1831,6 +1902,19 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "attention_verify_wmma_reduce_gfx1100"
             ]
         );
+        // Paged (KVMem) variant: same body over the block-table-addressed
+        // arenas, symbols renamed. Launched by
+        // `Gpu::attention_verify_wmma_q8_gfx1100_paged` for paged slots.
+        add!(
+            "attention_verify_wmma_gfx1100_paged",
+            kernels::attention_verify_wmma_paged_source(),
+            [
+                "attention_verify_wmma_q8_qt1_paged_gfx1100",
+                "attention_verify_wmma_q8_qt2_paged_gfx1100",
+                "attention_verify_wmma_q8_qt3_paged_gfx1100",
+                "attention_verify_wmma_reduce_gfx1100"
+            ]
+        );
         add!(
             "attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100",
             kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_DEC_GFX1100_SRC,
@@ -1843,8 +1927,21 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         );
         add!(
             "attention_flash_q8_0_tile_gqa_gfx1100",
-            kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC,
+            // The body `#include`s kv_slot_desc.h (shared with its paged
+            // twin); the JIT cache has no -I to kernels/src, so the registry
+            // must hand the preloader the assembled source, exactly like the
+            // lazy `ensure_givens4_kernel` route builds it.
+            assemble_asym(kernels::ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC),
             ["attention_flash_q8_0_tile_gqa_gfx1100"]
+        );
+        // Paged (KVMem) twin of the GQA-shared decode tile: same body over
+        // block-table-addressed arenas. Launched by
+        // `Gpu::attention_flash_q8_0_gqa_decode_paged` for single-row paged
+        // decode.
+        add!(
+            "attention_flash_q8_0_tile_gqa_paged_gfx1100",
+            kernels::attention_flash_q8_0_tile_gqa_paged_source(),
+            ["attention_flash_q8_0_tile_gqa_paged_gfx1100"]
         );
         add!(
             "attention_q8_0_fa2_gqa_gfx1100",
@@ -2054,7 +2151,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_mq5g256v2_residual_wmma_gfx11_mw4_lds",
                 "gemm_mq5g256v2_residual_wmma_gfx11_mw8_lds",
                 "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds",
-                "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
+                "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds",
+                "gemm_qkvza_mq3g256v2_wmma_gfx11_mw4_lds",
+                "gemm_qkvza_mq3g256v2_wmma_gfx11_mw8_lds",
+                "gemm_qkv_mq3g256v2_wmma_gfx11_mw4_lds",
+                "gemm_qkv_mq3g256v2_wmma_gfx11_mw8_lds"
             ]
         );
         add!(
@@ -2377,7 +2478,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_mq5g256v2_residual_wmma_gfx11_mw4_lds",
                 "gemm_mq5g256v2_residual_wmma_gfx11_mw8_lds",
                 "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds",
-                "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
+                "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds",
+                "gemm_qkvza_mq3g256v2_wmma_gfx11_mw4_lds",
+                "gemm_qkvza_mq3g256v2_wmma_gfx11_mw8_lds",
+                "gemm_qkv_mq3g256v2_wmma_gfx11_mw4_lds",
+                "gemm_qkv_mq3g256v2_wmma_gfx11_mw8_lds"
             ]
         );
         add!(
@@ -6437,7 +6542,11 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
     add!(
         "escha_bare_to_outmajor",
         kernels::ESCHA_BARE_TO_OUTMAJOR_SRC,
-        ["escha_bare_to_q8_0", "escha_bare_to_f32", "escha_bare_to_f16"]
+        [
+            "escha_bare_to_q8_0",
+            "escha_bare_to_f32",
+            "escha_bare_to_f16"
+        ]
     );
     add!(
         "escha_moe_gemv_k8_indexed",

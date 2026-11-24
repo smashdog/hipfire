@@ -62,6 +62,34 @@
 
 #include <hip/hip_runtime.h>
 
+// Paged (multi-slot / KVMem) build selector. The default route compiles this
+// file with no descriptor header at all; the slot engine's paged module
+// prepends `kv_slot_desc_paged.h` (which defines HIPFIRE_KV_SLOT_PAGED). In
+// that build the K/V fill helpers resolve through the slot descriptor's block
+// table and mask absent (spilled) pages; every other build preprocesses to
+// the identical program it always had.
+#ifdef HIPFIRE_KV_SLOT_PAGED
+#define FA2_PAGED 1
+// Thread a slot's per-tile page map through the shared helpers without
+// forking their signatures in the default build (which has no KvSlotDesc at
+// all). FA2_KV_PASS takes (64-bit page base, page-present flag); the helpers
+// keep `k_cache`/`v_cache` first so the call text is shared with the
+// contiguous build.
+#define FA2_KV_PASS(koff, present) koff, present,
+#define FA2_KV_PASS1(present) present,
+// Paged fills address a tile RELATIVE to its own base: the helper receives
+// in-tile bounds (start 0, length min(seq_len - tile_base, KT)) so the
+// clamped legacy address shape survives, with only the base changing.
+#define FA2_KT0(kt) 0
+#define FA2_KTLEN(kmap) (kmap).rel,
+#else
+#define FA2_PAGED 0
+#define FA2_KV_PASS(koff, present)
+#define FA2_KV_PASS1(present)
+#define FA2_KT0(kt) (kt)
+#define FA2_KTLEN(kmap) seq_len,
+#endif
+
 // K-cache mode, selected at JIT time (kernels.rs concat define):
 //   0 = standard Q8 K (34 B blocks, f16 scale + 32 int8 codes).
 //   3 = fwht3 K (100 B/head: f32 cnorm + 96 B of 3-bit codes, K stored
@@ -143,6 +171,62 @@ __device__ __forceinline__ int fa2_swiz(int c)
     return 2 * r;
 }
 
+constexpr int FA2_ROW_B = 4 * (256 / 32) * 34;
+
+#if FA2_PAGED
+// ---- Paged KV translation, hoisted to the key-tile level ----------------
+// `page_tokens` is a multiple of the KT key tile in every Q8 pool the slot
+// engine serves (PAGE_TOKENS = 128 against KT 32/64; the paged entry rejects
+// any other geometry), so all KT keys of a tile share ONE page: resolve the
+// block-table entry once per tile into a byte base, and each key's address is
+// `base + (gk - ktile) * FA2_ROW_B`. Resolving per key instead costs three
+// divergent integer divisions per staged 34-B block (presence, K offset,
+// both V keys); those sequences both slow the fill and triple this kernel's
+// code size, which measurably cost the paged launch ~40% of its prefill
+// speed. The helpers take the precomputed base and presence flag (not the
+// descriptor) so they register-allocate exactly like the contiguous twins.
+struct Fa2KvTile {
+    unsigned long long kbase;  // byte offset of key `tpos` in the K arena
+    unsigned long long vbase;  // same for V (paged mode: identical layout)
+    bool present;              // tile's page resident
+    int rel;                   // in-tile causal bound: min(seq_len - tpos, KT)
+                               // (>= 1; an absent tile uses 1 so every key
+                               // resolves to row 0 of the arena and masks out)
+};
+
+__device__ __forceinline__ Fa2KvTile fa2_kv_tile(const KvSlotDesc& d, int tpos,
+                                                 int seq_len)
+{
+    Fa2KvTile t;
+    if (d.block_table != nullptr) {
+        const int pg = tpos / d.page_tokens;
+        const int phys = d.block_table[pg];
+        t.present = phys >= 0;
+        t.kbase = (unsigned long long)(phys >= 0 ? phys : 0)
+                        * (unsigned long long)d.page_tokens
+                        * (unsigned long long)FA2_ROW_B
+                + (unsigned long long)(tpos - pg * d.page_tokens)
+                        * (unsigned long long)FA2_ROW_B;
+        t.vbase = t.kbase;
+    } else {
+        t.present = true;
+        t.kbase = d.legacy_k_base + (unsigned long long)tpos * FA2_ROW_B;
+        t.vbase = d.legacy_v_base + (unsigned long long)tpos * FA2_ROW_B;
+    }
+    if (!t.present) {
+        // Absent page: never dereference it. Point every key at arena row 0
+        // (memory-safe, contents ignored) and mask all of them off.
+        t.kbase = 0;
+        t.vbase = 0;
+        t.rel = 1;
+    } else {
+        const int rem = seq_len - tpos;
+        t.rel = rem < HIPFIRE_FA2_KT ? rem : HIPFIRE_FA2_KT;
+    }
+    return t;
+}
+#endif  // FA2_PAGED
+
 #if FA2_FILL
 // ---- Warp-specialized fill (FA2_FILL) ----
 // Waves 0..5 compute, waves 6..7 own every K/V fill after tile 0. Per tile
@@ -169,7 +253,6 @@ typedef union {
 constexpr int FA2_FILL_HT = 64;               // helper threads (2 waves)
 constexpr int FA2_FILL_HK = 32 * 8 / 64;      // K slots per helper lane
 constexpr int FA2_FILL_HV = 32 * 16 / 64;     // V slots per helper lane
-constexpr int FA2_ROW_B = 4 * (256 / 32) * 34;
 
 // Two biased codes (bytes picked by `sel` from tb, interleaved with 0x64)
 // times the f16 scale pair s2: RNE(s*c) per half.
@@ -186,15 +269,34 @@ __device__ __forceinline__ uint32_t fa2_pk_deq2(uint32_t tb, uint32_t sel, uint3
 // K slot idx = k*8+b: scale (low 16 bits) + the block's 8 code dwords.
 // Out-of-range keys read the (valid) last row and stage zeros, exactly
 // the incumbent's null-pointer zero fill.
+//
+// Paged build: every key resolves through its slot descriptor's per-tile
+// page map. A key past the causal bound OR whose page the KV working-set
+// manager has spilled is staged as zeros and NEVER dereferenced (an absent
+// page's block-table entry is -1, so resolving through it would read a wild
+// offset). The resident path — every page present — is byte-identical to the
+// contiguous one above.
 __device__ __forceinline__ void fa2_fill_k_load(
+#if FA2_PAGED
+    unsigned long long kv_koff, bool kv_present,
+#endif
     const unsigned char* k_cache, int ktile, int seq_len, int kv_blk, int idx,
     uint32_t& su, uint32_t* uc)
 {
     const int gk = ktile + (idx >> 3);
+#if FA2_PAGED
+    // Same clamped, branch-free address shape as the contiguous twin, with
+    // the tile base folded into the pointer; `kv_present` only masks.
+    const bool ok = gk < seq_len && kv_present;
+    const unsigned char* blk = k_cache + kv_koff
+        + (unsigned long long)min(gk, seq_len - 1) * (unsigned long long)FA2_ROW_B
+        + (unsigned long long)(kv_blk + (idx & 7)) * 34ULL;
+#else
     const bool ok = gk < seq_len;
     const unsigned char* blk = k_cache
         + (unsigned long long)min(gk, seq_len - 1) * (unsigned long long)FA2_ROW_B
         + (unsigned long long)(kv_blk + (idx & 7)) * 34ULL;
+#endif
     const uint32_t s = (uint32_t)blk[0] | ((uint32_t)blk[1] << 8);
     su = ok ? s : 0u;
 #pragma unroll
@@ -228,7 +330,14 @@ __device__ __forceinline__ void fa2_fill_k_store(uint32_t* Kdw, int idx, uint32_
 // V slot = ((m*8+b)<<2) | wq: key pair m, block b, code dwords 2wq, 2wq+1
 // of both keys. Raw = packed scales (s0 | s1<<16), u[0..1] (key 2m),
 // u[2..3] (key 2m+1).
+//
+// Paged build: each key of the pair resolves independently through the
+// tile's page map; a key that is past the causal bound or lives in a spilled
+// page contributes zeros and is never dereferenced (see fa2_fill_k_load).
 __device__ __forceinline__ void fa2_fill_v_load(
+#if FA2_PAGED
+    unsigned long long kv_voff, bool kv_present,
+#endif
     const unsigned char* v_cache, int ktile, int seq_len, int kv_blk, int slot,
     uint32_t& s01, uint32_t* u)
 {
@@ -236,12 +345,23 @@ __device__ __forceinline__ void fa2_fill_v_load(
     const int w_base = (slot & 3) * 2;
     const int k0 = ktile + 2 * (pair >> 3);
     const unsigned long long boff = (unsigned long long)(kv_blk + (pair & 7)) * 34ULL;
+#if FA2_PAGED
+    const bool ok0 = k0 < seq_len && kv_present;
+    const bool ok1 = k0 + 1 < seq_len && kv_present;
+    const unsigned char* blk0 = v_cache + kv_voff
+        + (unsigned long long)min(k0, seq_len - 1) * (unsigned long long)FA2_ROW_B
+        + boff;
+    const unsigned char* blk1 = v_cache + kv_voff
+        + (unsigned long long)min(k0 + 1, seq_len - 1) * (unsigned long long)FA2_ROW_B
+        + boff;
+#else
     const bool ok0 = k0 < seq_len;
     const bool ok1 = k0 + 1 < seq_len;
     const unsigned char* blk0 = v_cache
         + (unsigned long long)min(k0, seq_len - 1) * (unsigned long long)FA2_ROW_B + boff;
     const unsigned char* blk1 = v_cache
         + (unsigned long long)min(k0 + 1, seq_len - 1) * (unsigned long long)FA2_ROW_B + boff;
+#endif
     const uint32_t s0 = ok0 ? ((uint32_t)blk0[0] | ((uint32_t)blk0[1] << 8)) : 0u;
     const uint32_t s1 = ok1 ? ((uint32_t)blk1[0] | ((uint32_t)blk1[1] << 8)) : 0u;
     s01 = s0 | (s1 << 16);
@@ -426,6 +546,9 @@ __device__ __forceinline__ void fa2_fill_qk(
 }
 
 __device__ __forceinline__ void fa2_fill_softmax_pv(
+#if FA2_PAGED
+    bool kv_present,
+#endif
     const uint32_t* Vdw, const int* __restrict__ positions, float scale_attn,
     int ktile, int gmin, bool do0, bool do1, float8_t sacc0, float8_t sacc1,
     bool qok_ml, int qr_ml, int ml, int half, float& m_old, float& l_val,
@@ -439,11 +562,22 @@ __device__ __forceinline__ void fa2_fill_softmax_pv(
         float8_t sacc = (sub == 0) ? sacc0 : sacc1;
         const int kt_sub = ktile + sub * 16;
         const bool full = (kt_sub + 15) <= gmin;
+        // KVMem residency: `page_tokens` is a multiple of the 16-key subtile
+        // (PAGE_TOKENS = 128 in every Q8 pool), so one per-subtile presence
+        // test covers all 16 keys. An absent key's V plane entry is zeroed by
+        // the fill; masking its probability to -INF keeps it out of m/l
+        // unconditionally. Legacy descriptors test true, folding away.
+        const bool sub_present =
+#if FA2_PAGED
+            kv_present;
+#else
+            true;
+#endif
         const int pos_ml = (!full && qok_ml) ? positions[qr_ml] : 0;
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
             const int key_g = kt_sub + 2 * j + half;
-            const bool ok = qok_ml && (full || key_g <= pos_ml);
+            const bool ok = qok_ml && sub_present && (full || key_g <= pos_ml);
             sacc[j] = ok ? sacc[j] * scale_attn : -INFINITY;
         }
         float mx = -INFINITY;
@@ -529,7 +663,11 @@ __device__ __forceinline__ void fa2_gqa_body(
     int kv_h,
     int q_base,
     int split,
-    int n_splits)
+    int n_splits
+#if FA2_PAGED
+    , const KvSlotDesc& desc
+#endif
+)
 {
     constexpr int KT = HIPFIRE_FA2_KT;
     constexpr int KT_SUBS = KT / 16;
@@ -637,15 +775,22 @@ __device__ __forceinline__ void fa2_gqa_body(
     // tile count and two barriers per tile, so the barriers pair up.
     const bool fill_compute = __builtin_amdgcn_readfirstlane(wave) < 6;
     const int hl = tid - 6 * 32;
+#if FA2_PAGED
+    // Tile 0's page map (uniform: same page for all KT keys of the tile).
+    const Fa2KvTile kmap0 = fa2_kv_tile(desc, tile0 * KT, seq_len);
+    const unsigned long long kb0 = kmap0.kbase;
+    const unsigned long long vb0 = kmap0.vbase;
+    const bool tp0 = kmap0.present;
+#endif
     uint32_t rv_s[FA2_FILL_HV];
     uint32_t rv_u[FA2_FILL_HV * 4];
     if (!fill_compute) {
 #pragma unroll
         for (int s = 0; s < FA2_FILL_HV; ++s)
 #if FA2_R3
-            fa2_fill_v_load(v_cache, tile0 * KT, seq_len, kv_blk, fa2_r3_vslot(hl, s),
+            fa2_fill_v_load(FA2_KV_PASS(vb0, tp0) v_cache, FA2_KT0(tile0 * KT), FA2_KTLEN(kmap0) kv_blk, fa2_r3_vslot(hl, s),
 #else
-            fa2_fill_v_load(v_cache, tile0 * KT, seq_len, kv_blk, hl + s * FA2_FILL_HT,
+            fa2_fill_v_load(FA2_KV_PASS(vb0, tp0) v_cache, FA2_KT0(tile0 * KT), FA2_KTLEN(kmap0) kv_blk, hl + s * FA2_FILL_HT,
 #endif
                             rv_s[s], rv_u + s * 4);
     }
@@ -653,7 +798,7 @@ __device__ __forceinline__ void fa2_gqa_body(
     {
         uint32_t su;
         uint32_t uc[8];
-        fa2_fill_k_load(k_cache, tile0 * KT, seq_len, kv_blk, tid, su, uc);
+        fa2_fill_k_load(FA2_KV_PASS(kb0, tp0) k_cache, FA2_KT0(tile0 * KT), FA2_KTLEN(kmap0) kv_blk, tid, su, uc);
         fa2_fill_k_store(Kdw, tid, su, uc);
     }
     __syncthreads();
@@ -662,6 +807,9 @@ __device__ __forceinline__ void fa2_gqa_body(
             const int ktile = tile * KT;
             if (PARTIAL ? tile >= tile1 : ktile >= seq_len)
                 break;
+#if FA2_PAGED
+            const bool tp = fa2_kv_tile(desc, ktile, seq_len).present;
+#endif
             const bool do0 = ktile <= gmax;
             const bool do1 = ktile + 16 <= gmax;
             float8_t sacc0, sacc1;
@@ -669,7 +817,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                 fa2_fill_qk(q16, Kdw, qq_base, qok_ml, ml, do0, do1, sacc0, sacc1);
             __syncthreads();  // B1: V(t) in plane; K(t) consumed
             if (do0 || do1)
-                fa2_fill_softmax_pv(Vdw, positions, scale_attn, ktile, gmin, do0, do1,
+                fa2_fill_softmax_pv(FA2_KV_PASS1(tp) Vdw, positions, scale_attn, ktile, gmin, do0, do1,
                                     sacc0, sacc1, qok_ml, qr_ml, ml, half, m_old,
                                     l_val, Ofr);
             __syncthreads();  // B2: K(t+1) in plane; V(t) consumed
@@ -699,9 +847,14 @@ __device__ __forceinline__ void fa2_gqa_body(
                 break;
             const bool next = PARTIAL ? tile + 1 < tile1 : ktile + KT < seq_len;
             if (next) {
+#if FA2_PAGED
+                const Fa2KvTile kmap_next = fa2_kv_tile(desc, ktile + KT, seq_len);
+                const unsigned long long kb_next = kmap_next.kbase;
+                const bool tp_next = kmap_next.present;
+#endif
 #pragma unroll
                 for (int t = 0; t < FA2_FILL_HK; ++t)
-                    fa2_fill_k_load(k_cache, ktile + KT, seq_len, kv_blk,
+                    fa2_fill_k_load(FA2_KV_PASS(kb_next, tp_next) k_cache, FA2_KT0(ktile + KT), FA2_KTLEN(kmap_next) kv_blk,
 #if FA2_R3
                                     fa2_r3_kslot(hl, t), rk_s[t], rk_u + t * 8);
 #else
@@ -717,9 +870,14 @@ __device__ __forceinline__ void fa2_gqa_body(
 #endif
             __syncthreads();  // B1
             if (next) {
+#if FA2_PAGED
+                const Fa2KvTile kmap_next = fa2_kv_tile(desc, ktile + KT, seq_len);
+                const unsigned long long vb_next = kmap_next.vbase;
+                const bool tp_next = kmap_next.present;
+#endif
 #pragma unroll
                 for (int s = 0; s < FA2_FILL_HV; ++s)
-                    fa2_fill_v_load(v_cache, ktile + KT, seq_len, kv_blk,
+                    fa2_fill_v_load(FA2_KV_PASS(vb_next, tp_next) v_cache, FA2_KT0(ktile + KT), FA2_KTLEN(kmap_next) kv_blk,
 #if FA2_R3
                                     fa2_r3_vslot(hl, s), rv_s[s], rv_u + s * 4);
 #else
@@ -766,6 +924,13 @@ __device__ __forceinline__ void fa2_gqa_body(
         const bool have_pf = (tile > tile0);
 #else
         constexpr bool have_pf = false;
+#endif
+#if FA2_PAGED
+        // Current tile's page map (uniform: one block-table entry per tile).
+        const Fa2KvTile kmap_cur = fa2_kv_tile(desc, ktile, seq_len);
+        const unsigned long long kb_cur = kmap_cur.kbase;
+        const unsigned long long vb_cur = kmap_cur.vbase;
+        const bool tp_cur = kmap_cur.present;
 #endif
 
         // ---- Transition 2: cooperative KT fill (all eight waves) ----
@@ -945,13 +1110,24 @@ __device__ __forceinline__ void fa2_gqa_body(
             const int idx = tid + t * WG_THREADS;
             const int k = idx >> 3;
             const int b = idx & 7;
+#if FA2_PAGED
+            // Tile-relative bounds: same clamped address shape as the
+            // contiguous twin, base folded into the pointer.
+            const int rel = kmap_cur.rel;
+            const bool ok = (k < rel) && tp_cur;
+            const unsigned char* blk = k_cache + kb_cur
+                + (unsigned long long)min(k, rel - 1) * (unsigned long long)FA2_ROW_B
+                + (unsigned long long)(kv_blk + b) * 34ULL;
+#else
             const int gk = ktile + k;
-            const unsigned char* blk = (gk < seq_len)
+            const bool ok = gk < seq_len;
+            const unsigned char* blk = ok
                 ? k_cache + (unsigned long long)gk * (unsigned long long)row_stride
                     + (unsigned long long)(kv_blk + b) * 34ULL
                 : nullptr;
+#endif
             uint16_t su = 0;
-            if (blk != nullptr)
+            if (ok)
                 su = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
             _Float16 s = ((fa2_dw_t){.u = (uint32_t)su}).h[0];
             const float sf = (float)s;
@@ -963,7 +1139,7 @@ __device__ __forceinline__ void fa2_gqa_body(
             // memcpy emits a correct unaligned load either way).
             for (int w = 0; w < 8; ++w) {
                 uint32_t u = 0;
-                if (blk != nullptr)
+                if (ok)
                     __builtin_memcpy(&u, blk + 2 + w * 4, 4);
                 const float c0 = (float)(int8_t)u;
                 const float c1 = (float)(int8_t)(u >> 8);
@@ -987,20 +1163,34 @@ __device__ __forceinline__ void fa2_gqa_body(
             const int w_base = FA2_Q16 ? (slot & 3) * 2 : 0;
             const int m = pair >> 3;
             const int b = pair & 7;
+#if FA2_PAGED
+            const int rel = kmap_cur.rel;
+            const bool ok0 = (2 * m < rel) && tp_cur;
+            const bool ok1 = (2 * m + 1 < rel) && tp_cur;
+            const unsigned char* blk0 = v_cache + vb_cur
+                + (unsigned long long)min(2 * m, rel - 1) * (unsigned long long)FA2_ROW_B
+                + (unsigned long long)(kv_blk + b) * 34ULL;
+            const unsigned char* blk1 = v_cache + vb_cur
+                + (unsigned long long)min(2 * m + 1, rel - 1) * (unsigned long long)FA2_ROW_B
+                + (unsigned long long)(kv_blk + b) * 34ULL;
+#else
             const int k0 = ktile + 2 * m;
-            const unsigned char* blk0 = (k0 < seq_len)
+            const bool ok0 = k0 < seq_len;
+            const bool ok1 = k0 + 1 < seq_len;
+            const unsigned char* blk0 = ok0
                 ? v_cache + (unsigned long long)k0 * (unsigned long long)row_stride
                     + (unsigned long long)(kv_blk + b) * 34ULL
                 : nullptr;
-            const unsigned char* blk1 = (k0 + 1 < seq_len)
+            const unsigned char* blk1 = ok1
                 ? v_cache + (unsigned long long)(k0 + 1) * (unsigned long long)row_stride
                     + (unsigned long long)(kv_blk + b) * 34ULL
                 : nullptr;
+#endif
             uint16_t s0u = 0;
             uint16_t s1u = 0;
-            if (blk0 != nullptr)
+            if (ok0)
                 s0u = (uint16_t)blk0[0] | ((uint16_t)blk0[1] << 8);
-            if (blk1 != nullptr)
+            if (ok1)
                 s1u = (uint16_t)blk1[0] | ((uint16_t)blk1[1] << 8);
             _Float16 s0 = ((fa2_dw_t){.u = (uint32_t)s0u}).h[0];
             _Float16 s1 = ((fa2_dw_t){.u = (uint32_t)s1u}).h[0];
@@ -1009,9 +1199,9 @@ __device__ __forceinline__ void fa2_gqa_body(
 #pragma unroll 1
             for (int w = w_base; w < w_base + (FA2_Q16 ? 2 : 8); ++w) {
                 uint32_t u0 = 0, u1 = 0;
-                if (blk0 != nullptr)
+                if (ok0)
                     __builtin_memcpy(&u0, blk0 + 2 + w * 4, 4);
-                if (blk1 != nullptr)
+                if (ok1)
                     __builtin_memcpy(&u1, blk1 + 2 + w * 4, 4);
 #pragma unroll
                 for (int c = 0; c < 4; ++c) {
@@ -1040,6 +1230,11 @@ __device__ __forceinline__ void fa2_gqa_body(
         {
             const int ktile_next = ktile + KT;
             if (PARTIAL ? tile + 1 < tile1 : ktile_next < seq_len) {
+#if FA2_PAGED
+                const Fa2KvTile kmap_next = fa2_kv_tile(desc, ktile_next, seq_len);
+                const unsigned long long kb_next = kmap_next.kbase;
+                const bool tp_next = kmap_next.present;
+#endif
 #if HIPFIRE_FA2_KMODE == 3
 #pragma unroll 1
                 for (int t = 0; t < KT_KITERS; ++t) {
@@ -1092,19 +1287,29 @@ __device__ __forceinline__ void fa2_gqa_body(
                     const int idx = tid + t * WG_THREADS;
                     const int k = idx >> 3;
                     const int b = idx & 7;
+#if FA2_PAGED
+                    // Tile-relative bounds, clamped address (see the fill).
+                    const int rel = kmap_next.rel;
+                    const bool ok = (k < rel) && tp_next;
+                    const unsigned char* blk = k_cache + kb_next
+                        + (unsigned long long)min(k, rel - 1) * (unsigned long long)FA2_ROW_B
+                        + (unsigned long long)(kv_blk + b) * 34ULL;
+#else
                     const int gk = ktile_next + k;
-                    const unsigned char* blk = (gk < seq_len)
+                    const bool ok = gk < seq_len;
+                    const unsigned char* blk = ok
                         ? k_cache + (unsigned long long)gk * (unsigned long long)row_stride
                             + (unsigned long long)(kv_blk + b) * 34ULL
                         : nullptr;
+#endif
                     uint16_t su = 0;
-                    if (blk != nullptr)
+                    if (ok)
                         su = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
                     pf_ks[t] = su;
 #pragma unroll 1
                     for (int w = 0; w < 8; ++w) {
                         uint32_t u = 0;
-                        if (blk != nullptr)
+                        if (ok)
                             __builtin_memcpy(&u, blk + 2 + w * 4, 4);
                         pf_kc[t * 8 + w] = u;
                     }
@@ -1219,6 +1424,14 @@ __device__ __forceinline__ void fa2_gqa_body(
                     // loaded once per subtile (masked path only).
                     const int pos_ml =
                         (!full && qok_ml) ? positions[qr_ml] : 0;
+                    // KVMem residency: PAGE_TOKENS is a multiple of this
+                    // subtile's 16 keys, so one presence test covers them all
+                    // (an absent page's V plane entry is zero-filled below).
+#if FA2_PAGED
+                    const bool sub_present = tp_cur;
+#else
+                    const bool sub_present = true;
+#endif
 
                     // Mask + row max. The mx chain serializes the unrolled
                     // rows; the other key parity sits in lane ml^16 and is
@@ -1227,7 +1440,7 @@ __device__ __forceinline__ void fa2_gqa_body(
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
                         const int key_g = kt_sub + 2 * j + half;
-                        const bool ok = qok_ml && (full || key_g <= pos_ml);
+                        const bool ok = qok_ml && sub_present && (full || key_g <= pos_ml);
                         const float x = ok ? sacc[j] * scale_attn : -INFINITY;
                         // NOTE: max-accumulation happens in the second pass
                         // below; this pass only masks into sacc.
@@ -1380,10 +1593,16 @@ __device__ __forceinline__ void fa2_gqa_body(
                 // rows; the other key parity sits in lane ml^16 and is
                 // combined with one shuffle, so both pair members share
                 // the same m_new and alpha.
+#if FA2_PAGED
+                const bool sub_present = tp_cur;
+#else
+                const bool sub_present = true;
+#endif
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
                     const int key_g = kt_sub + 2 * j + half;
-                    const bool ok = qok_ml && (full || key_g <= pos_ml);
+                    const bool ok =
+                        qok_ml && sub_present && (full || key_g <= pos_ml);
                     const float x = ok ? sacc[j] * scale_attn : -INFINITY;
                     // NOTE: max-accumulation happens in the second pass
                     // below; this pass only masks into sacc.
@@ -1544,7 +1763,11 @@ __device__ __forceinline__ void fa2_gqa_body(
 // deterministic near-miss on both cards (near-uniform softmax hides the
 // missing rotation to ~1e-3), not an op-order race. Distinct symbols make
 // each launcher resolve its own module's build.
-#if HIPFIRE_FA2_KMODE == 3
+#if FA2_PAGED
+// Paged module: distinct entry names so the function cache (keyed by symbol)
+// never binds a paged launch to the default-route build or vice versa.
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_gfx1100_paged
+#elif HIPFIRE_FA2_KMODE == 3
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht3_gfx11
 #elif HIPFIRE_FA2_KMODE == 4
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht4_gfx11
@@ -1639,6 +1862,10 @@ extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SY
 
 // Body entries take pre-converted f16 Q at kernarg offset 0 (same slot, same
 // size as the old f32 Q pointer, so the pointer-array blob ABI is unchanged).
+// The default-route entry exists only in the descriptor-less build; the paged
+// build below exports ONLY paged entries, so a shared function-cache symbol
+// can never bind one build's launch to the other's.
+#if !FA2_PAGED
 #if FA2_R3
 #define HIPFIRE_FA2_BODY_SYM attention_q8_0_fa2_gqa_gfx1100
 #else
@@ -1676,8 +1903,63 @@ extern "C" __global__ __launch_bounds__(HIPFIRE_FA2_Q16 ? 256 : 128, 1) void HIP
     fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
                         scale_attn, kv_h, q_base, 0, 1);
 }
+#endif  // !FA2_PAGED
 
-#if HIPFIRE_FA2_KMODE == 0 && FA2_R3
+#if FA2_PAGED
+// Paged multi-slot entry: grid [n_tiles, 4, 1], n_tiles from
+// kv_slots::build_tiles(_, 16) — the same 16-row tile shape the query-tiled
+// `_wmma_slots` kernel uses. `tile_slot[t]` selects the slot's descriptor
+// (K/V base + block table), `tile_qbase[t]` is the flat row where this tile's
+// q/out/positions start; `tile_row0` is ABI-reserved and unread (positions[]
+// is authoritative for the causal bound, exactly as in the scalar port).
+//
+// With every page resident and an identity block table the descriptor
+// resolves to base 0 + pos*row_stride, so all arithmetic below is the
+// default-route FA2 body verbatim and the output is bit-identical to
+// `attention_q8_0_fa2_gqa_gfx1100`.
+extern "C" __global__ __launch_bounds__(HIPFIRE_FA2_Q16 ? 256 : 128, 1) void attention_q8_0_fa2_gqa_gfx1100_paged(
+    const _Float16* __restrict__ q16,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn,
+    const KvSlotDesc* __restrict__ slot_descs,
+    const int* __restrict__ tile_slot,
+    const int* __restrict__ tile_row0,
+    const int* __restrict__ tile_qbase)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    const int q_tile = (int)blockIdx.x;
+    const int kv_h = (int)blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int slot = (tile_slot != nullptr) ? tile_slot[q_tile] : 0;
+    (void)tile_row0;
+    const int q_base =
+        (tile_qbase != nullptr) ? tile_qbase[q_tile] : q_tile * 16;
+    if (q_base >= batch_size)
+        return;
+    const KvSlotDesc desc =
+        (slot_descs != nullptr) ? slot_descs[slot] : kv_slot_legacy(0, 0);
+    // The per-tile page map requires one page per KT-key tile (page_tokens a
+    // multiple of KT); every Q8 pool the slot engine serves uses 128. A
+    // caller that hands over any other paged geometry fails closed here
+    // instead of having one tile straddle two pages.
+    if (desc.block_table != nullptr &&
+        (desc.page_tokens <= 0 || (desc.page_tokens % HIPFIRE_FA2_KT) != 0))
+        return;
+    fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
+                        scale_attn, kv_h, q_base, 0, 1, desc);
+}
+#endif  // FA2_PAGED
+
+#if !FA2_PAGED && HIPFIRE_FA2_KMODE == 0 && FA2_R3
 extern "C" __global__ __launch_bounds__(256, 1) void attention_q8_0_fa2_gqa_partial_gfx1100(
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,

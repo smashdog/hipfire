@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "hipfire-kvmem"
+version = "0.4.7"
+edition = "2021"
+license = "Apache-2.0"
+description = "KVMem host-offload adapter for hipfire (C ABI over the portable kvmem library)"
+links = "kvmem_hipfire_shim"
+
+[lib]
+name = "hipfire_kvmem"
+path = "src/lib.rs"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"
+sha2 = "0.10"

@@ -10,6 +10,10 @@ description = "Qwen3.5 architecture (dense + MoE) for hipfire"
 # because qwen35 is a hybrid arch (DeltaNet + FullAttention layers).
 default = ["deltanet"]
 deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+# KVMem host-offload controller (paged SlotPool only). Builds the portable
+# KVMem host library from the checkout at `KVMEM_ROOT` (default: the sibling
+# `../kvmem` directory) — a plain C++17 build, no GPU dependency.
+kvmem = ["dep:hipfire-kvmem"]
 flash-attn-ck = ["hipfire-dispatch/flash-attn-ck", "rdna-compute/flash-attn-ck"]
 moe-oracle = []
 # GPU bring-up probes (host-mapped/offloaded weights); build with `--features lab`.
@@ -24,6 +28,7 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 railgun = { path = "../railgun" }
 hipfire-reap = { path = "../hipfire-reap", default-features = false }
+hipfire-kvmem = { path = "../hipfire-kvmem", optional = true }
 saddle-core = { path = "../saddle-core" }
 sha2.workspace = true
 serde = { workspace = true, features = ["derive"] }

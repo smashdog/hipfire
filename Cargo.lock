@@ -1465,6 +1465,7 @@ dependencies = [
  "hipfire-config",
  "hipfire-cpu",
  "hipfire-dispatch",
+ "hipfire-kvmem",
  "hipfire-quantize",
  "hipfire-reap",
  "hipfire-runtime",
@@ -1755,6 +1756,14 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hipfire-kvmem"
+version = "0.4.7"
+dependencies = [
+ "cc",
+ "sha2",
 ]
 
 [[package]]

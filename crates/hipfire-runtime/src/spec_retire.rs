@@ -135,6 +135,15 @@ pub struct SpecRetire {
     retired_at: Option<usize>,
 }
 
+impl Default for SpecRetire {
+    /// A never-retiring state, for slots/requests that are not speculating
+    /// (and for test fixtures). Production admits install the resolved line
+    /// via [`SpecRetire::new`].
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
 impl SpecRetire {
     /// `None` never retires.
     pub fn new(break_even: Option<BreakEven>) -> Self {
@@ -147,6 +156,17 @@ impl SpecRetire {
             windows: 0,
             retired_at: None,
         }
+    }
+
+    /// Clear the per-request counters while keeping the resolved break-even
+    /// line, so a reused slot starts a fresh request on the same policy.
+    pub fn reset(&mut self) {
+        self.cycles = 0;
+        self.emitted = 0;
+        self.cost = 0.0;
+        self.failed_windows = 0;
+        self.windows = 0;
+        self.retired_at = None;
     }
 
     pub fn is_retired(&self) -> bool {

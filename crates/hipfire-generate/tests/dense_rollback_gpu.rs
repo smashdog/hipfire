@@ -300,6 +300,7 @@ fn run_generate_with(
             false,
             None,
             12345,
+            None,
         );
     }
     let bytes = finish_stdout_capture(saved, &path);

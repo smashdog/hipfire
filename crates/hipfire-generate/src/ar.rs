@@ -34,6 +34,7 @@ use hipfire_runtime::emit_text::{ThinkRouteEvent, ToolRouteEvent};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
+use hipfire_runtime::reasoning_loop::{reasoning_repeat_coverage, LoopCheck, LoopMode};
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::stop_sequence::{MinTokens, StopMatcher};
 use std::any::Any;
@@ -64,6 +65,7 @@ pub fn qwen_ar_route_think_events(
     stop: &mut StopMatcher,
     channel_events: Vec<ThinkRouteEvent>,
     visible_acc: &mut String,
+    reasoning_acc: &mut String,
 ) -> Result<(), ToolRouteError> {
     for channel_event in channel_events {
         if stop.matched() {
@@ -71,6 +73,7 @@ pub fn qwen_ar_route_think_events(
         }
         match channel_event {
             ThinkRouteEvent::Reasoning(reasoning) => {
+                reasoning_acc.push_str(&reasoning);
                 emit_reasoning_token(stdout, id, &reasoning);
             }
             ThinkRouteEvent::Content(content) => {
@@ -117,10 +120,19 @@ pub fn qwen_ar_route_filter_text(
     stop: &mut StopMatcher,
     text: &str,
     visible_acc: &mut String,
+    reasoning_acc: &mut String,
 ) -> Result<(), ToolRouteError> {
     let mut channel_events = Vec::new();
     think_router.push_into(text, &mut channel_events);
-    qwen_ar_route_think_events(stdout, id, router, stop, channel_events, visible_acc)
+    qwen_ar_route_think_events(
+        stdout,
+        id,
+        router,
+        stop,
+        channel_events,
+        visible_acc,
+        reasoning_acc,
+    )
 }
 
 /// Outcome of finishing the Qwen AR semantic router for one turn.
@@ -187,6 +199,63 @@ impl QwenArTerminalCause {
         Self::NaturalStop
     }
 }
+
+/// Sequential-path #728 control: in-memory only, one per request. The daemon
+/// fills `mode` (env/request knob) and `base` (tokens already produced by an
+/// earlier pass of the same request); the decode loop reports `requested` when
+/// a defined reasoning loop ended the pass for a recovery restart.
+#[derive(Debug, Clone)]
+pub struct SequentialRecovery {
+    pub mode: LoopMode,
+    /// Output tokens produced by previous passes of this request (done counts add them).
+    pub base: usize,
+    /// Set by the decode loop: this pass ended early for a low-effort restart.
+    pub requested: bool,
+    /// Output tokens produced by this pass when `requested` was set.
+    pub generated: usize,
+    /// Coverage reading that tripped the detector.
+    pub coverage: f64,
+    /// Continuation passes must not re-emit `gen_start`: the gateway latches
+    /// the stream contract on the first one and treats a second as a protocol
+    /// error. Pass 1 leaves this false; the daemon sets it for pass 2+.
+    pub suppress_route_start: bool,
+    /// Raw generated ids of this pass (`m.conversation_tokens` past prefill).
+    /// Pass 1 fills it so the daemon can carry the thoughts across a restart.
+    pub emitted: Vec<u32>,
+    /// Continuation suffix for THIS pass: raw ids appended directly after the
+    /// rendered assistant prefix, so the recovered pass continues the same
+    /// thoughts under the spliced low-effort sentence instead of starting cold.
+    pub suffix: Vec<u32>,
+    /// The detector tripped and `Stop` ended this pass as "length".
+    pub stopped: bool,
+    /// The detector tripped but `Recover` declined; the pass kept generating.
+    pub unavailable: Option<&'static str>,
+    /// `(output tokens, coverage)` of the last tripped look.
+    pub trip: Option<(usize, f64)>,
+}
+
+impl SequentialRecovery {
+    pub fn new(mode: LoopMode, base: usize) -> Self {
+        Self {
+            mode,
+            base,
+            requested: false,
+            generated: 0,
+            coverage: 0.0,
+            suppress_route_start: false,
+            emitted: Vec::new(),
+            suffix: Vec::new(),
+            stopped: false,
+            unavailable: None,
+            trip: None,
+        }
+    }
+}
+
+/// The template's xhigh sentence, whose presence is this path's proof that the
+/// request rendered the xhigh effort instruction (the reference splices the low
+/// sentence in only then).
+pub const SEQUENTIAL_XHIGH_EFFORT: &str = "xhigh";
 
 /// What the AR decode loop does after a committed token under an explicit
 /// `max_think_tokens` budget.
@@ -341,6 +410,7 @@ pub fn qwen_ar_observe_and_route(
     stop: &mut StopMatcher,
     new_bytes: &[u8],
     visible_acc: &mut String,
+    reasoning_acc: &mut String,
 ) -> Result<bool, ToolRouteError> {
     let action = if router.masks_builtin_terminators() {
         filter.observe_suppressing_stops(new_bytes)
@@ -355,7 +425,16 @@ pub fn qwen_ar_observe_and_route(
     };
     let text = std::str::from_utf8(&text_bytes).unwrap_or("");
     if !text.is_empty() {
-        qwen_ar_route_filter_text(stdout, id, think_router, router, stop, text, visible_acc)?;
+        qwen_ar_route_filter_text(
+            stdout,
+            id,
+            think_router,
+            router,
+            stop,
+            text,
+            visible_acc,
+            reasoning_acc,
+        )?;
     }
     Ok(filter_stop)
 }
@@ -372,18 +451,36 @@ pub fn qwen_ar_drain_pending_into_router(
     router: &mut ToolOutputRouter,
     stop: &mut StopMatcher,
     visible_acc: &mut String,
+    reasoning_acc: &mut String,
 ) -> Result<(), ToolRouteError> {
     let pending = filter.flush_pending();
     if !pending.is_empty() {
         let text = std::str::from_utf8(&pending).unwrap_or("");
         if !text.is_empty() {
-            qwen_ar_route_filter_text(stdout, id, think_router, router, stop, text, visible_acc)?;
+            qwen_ar_route_filter_text(
+                stdout,
+                id,
+                think_router,
+                router,
+                stop,
+                text,
+                visible_acc,
+                reasoning_acc,
+            )?;
         }
     }
 
     let mut channel_events = Vec::new();
     think_router.finish_into(&mut channel_events);
-    qwen_ar_route_think_events(stdout, id, router, stop, channel_events, visible_acc)?;
+    qwen_ar_route_think_events(
+        stdout,
+        id,
+        router,
+        stop,
+        channel_events,
+        visible_acc,
+        reasoning_acc,
+    )?;
     let held = stop.finish();
     qwen_ar_route_answer_content(stdout, id, router, &held, visible_acc)
 }
@@ -498,6 +595,10 @@ pub struct QwenArSemanticProducer {
     pub think_router: ThinkOutputRouter,
     pub router: ToolOutputRouter,
     pub visible_acc: String,
+    /// Reasoning-channel text emitted so far (the #728 detector's input; the
+    /// reference reads its parser's reasoning stream). Only appended while the
+    /// think router is inside a span.
+    pub reasoning_acc: String,
     /// Tokens that completed raw-commit before classify for this producer.
     pub raw_committed: Vec<u32>,
     /// Stream positions recorded at each raw commit (testable ordering).
@@ -547,6 +648,7 @@ impl QwenArSemanticProducer {
                 ToolOutputRouter::disabled()
             },
             visible_acc: String::new(),
+            reasoning_acc: String::new(),
             raw_committed: Vec::new(),
             raw_commit_positions: Vec::new(),
             stopped_by_filter: false,
@@ -621,6 +723,7 @@ impl QwenArSemanticProducer {
                     &mut self.stop,
                     new_bytes.as_ref(),
                     &mut self.visible_acc,
+                    &mut self.reasoning_acc,
                 )?;
                 if filter_stop {
                     self.stopped_by_filter = true;
@@ -706,6 +809,7 @@ impl QwenArSemanticProducer {
             &mut self.router,
             &mut self.stop,
             &mut self.visible_acc,
+            &mut self.reasoning_acc,
         )?;
         let open_think = self.think_router.in_think();
         let cause = QwenArTerminalCause::resolve(
@@ -2660,12 +2764,26 @@ pub fn generate(
     // attempt-key + counter entropy) so two requests with the same prompt
     // no longer replay the identical draw sequence at temp>0.
     request_seed: u32,
+    // Sequential #728 hook: `Some` lets a defined reasoning loop end this pass
+    // for a low-effort restart (the daemon re-invokes `generate` with the same
+    // id); `None` keeps every byte identical to the pre-recovery engine.
+    mut recovery: Option<&mut SequentialRecovery>,
 ) {
     // Whole-request PLE serving guard (Qwen4 with PLE rows; `None` otherwise):
     // every route below (Qwen4 AR, native MTP, the spec-capacity fallthrough)
     // prefills and decodes under it, and it drops on every return, error and
     // unwind, so a caller outside the daemon is covered too.
     let _ple_serving = m.ple_serving_guard();
+    // ── Sequential #728 recovery state ─────────────────────────────────
+    // The daemon re-invokes this entry point for a low-effort restart; `base`
+    // carries the tokens an earlier pass already produced (done counts add
+    // them). `None` keeps the decoder exactly as before this feature.
+    let recovery_mode = recovery.as_ref().map(|r| r.mode).unwrap_or(LoopMode::Off);
+    let recovery_base = recovery.as_ref().map(|r| r.base).unwrap_or(0);
+    let mut loop_check = LoopCheck::new();
+    let mut loop_stopped = false;
+    let mut recovery_requested = false;
+    let mut recovery_coverage = 0.0f64;
     // ── Producer-route authority (Task 6) ──────────────────────────────
     // Resolve the selected generation route BEFORE sampler RNG reset and
     // every stateful branch. Non-empty tools are denied for unsafe routes
@@ -4147,6 +4265,12 @@ pub fn generate(
         assistant_prefix,
         hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
     );
+    // #728 strict mirror: recovery replaces the xhigh effort sentence inside
+    // the FIRST system message and must give up when that sentence is absent
+    // from what the model actually reads. Only the rendered prompt tells the
+    // truth here (the raw `prompt` is the user turn alone); templates that
+    // ignore effort render without it.
+    let mut effort_sentence_in_render = false;
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -4211,6 +4335,8 @@ pub fn generate(
                 // Its rendered tail, not the template-less ChatFrame prefix,
                 // determines the initial response channel.
                 started_in_think = render_tail_opens_think(&rendered);
+                effort_sentence_in_render =
+                    rendered.contains(hipfire_runtime::reasoning_loop::HIGH_EFFORT_INSTRUCTION);
                 tokenizer.encode(&rendered)
             }
             Err(e) => {
@@ -4247,6 +4373,18 @@ pub fn generate(
         }
         .build_with_user_tokens(&q_tokens)
     };
+
+    // #728 continuation (sequential mirror): the reference re-runs the pass
+    // over the ORIGINAL prompt ids with the low-effort sentence spliced into
+    // the first system message, then appends every generated id so the model
+    // continues its own thoughts rather than restarting cold. The render
+    // supplies the spliced head; `suffix` restores the generated ids.
+    let mut new_tokens = new_tokens;
+    if let Some(r) = recovery.as_ref() {
+        if !r.suffix.is_empty() {
+            new_tokens.extend_from_slice(&r.suffix);
+        }
+    }
 
     // ── Prompt cache (LCP-based) — Qwen3.5/3.6 only ──────────────────────
     //
@@ -4894,7 +5032,13 @@ pub fn generate(
         _ => None,
     };
     let prefill_tokens = new_tokens.len();
-    emit_generation_start(selected_route, stdout, id, started_in_think);
+    match recovery.as_ref() {
+        // A continuation pass: the gateway already latched the stream contract
+        // on pass 1's gen_start. Keep the active route so terminal wrappers
+        // still resolve, but emit no second start edge.
+        Some(r) if r.suppress_route_start => set_generation_route(selected_route),
+        _ => emit_generation_start(selected_route, stdout, id, started_in_think),
+    }
     let t0 = Instant::now();
 
     // The Qwen3.5 multi-turn branch: prefill only the NEW turn tokens,
@@ -5528,6 +5672,8 @@ pub fn generate(
         let loop_guard =
             hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
 
+        // Raw output ids of THIS pass, for a possible continuation pass.
+        let conv_start = m.conversation_tokens.len();
         // `while` instead of `for 0..max_tokens` so budget-alert injection
         // (which increments `generated` beyond the iteration count) can't
         // push generated past max_tokens: each loop start rechecks the cap.
@@ -5732,6 +5878,70 @@ pub fn generate(
                 Err(err) => {
                     emit_error_with_id(stdout, id, &err.to_string());
                     return;
+                }
+            }
+            // ── #728: reasoning-loop look (sequential mirror) ──────────
+            // Every 512 output tokens, at a clean reasoning boundary (no held
+            // think-marker prefix, no partial UTF-8 in the EOS filter), read
+            // the reasoning channel for passages seen three times. `stop` ends
+            // the pass as "length"; `recover` ends it for a low-effort restart
+            // only when the request carried the xhigh effort sentence — an
+            // unavailable recovery keeps generating, exactly like the
+            // reference's `focused_recovery_prompt() is None` path.
+            if recovery_mode != LoopMode::Off && loop_check.due(generated + recovery_base) {
+                if hipfire_config::developer_var_os("HIPFIRE_THINK_RECOVER_TRACE").is_some() {
+                    eprintln!(
+                        "[think-recover] check n={} in_think={} think_pending={} eos_pending={} effort={:?} words={} cov={:.3} sentence={}",
+                        generated + recovery_base,
+                        semantic.think_router.in_think(),
+                        semantic.think_router.has_pending(),
+                        semantic.filter.has_pending(),
+                        reasoning_effort,
+                        semantic.reasoning_acc.split_whitespace().count(),
+                        reasoning_repeat_coverage(&semantic.reasoning_acc),
+                        effort_sentence_in_render,
+                    );
+                }
+            }
+            if recovery_mode != LoopMode::Off
+                && semantic.think_router.in_think()
+                && loop_check.due(generated + recovery_base)
+                && !semantic.think_router.has_pending()
+                && !semantic.filter.has_pending()
+            {
+                loop_check.advance(generated + recovery_base);
+                let coverage = reasoning_repeat_coverage(&semantic.reasoning_acc);
+                if coverage >= hipfire_runtime::reasoning_loop::LOOP_COVERAGE {
+                    let declined = if reasoning_effort != Some(SEQUENTIAL_XHIGH_EFFORT) {
+                        Some("effort is not xhigh")
+                    } else if !effort_sentence_in_render {
+                        Some("effort sentence absent from the render")
+                    } else if generated >= max_tokens {
+                        Some("budget exhausted")
+                    } else {
+                        None
+                    };
+                    match recovery_mode {
+                        LoopMode::Stop => {
+                            loop_stopped = true;
+                            if let Some(slot) = recovery.as_mut() {
+                                slot.stopped = true;
+                                slot.trip = Some((generated + recovery_base, coverage));
+                            }
+                            break;
+                        }
+                        LoopMode::Recover if declined.is_none() => {
+                            recovery_requested = true;
+                            recovery_coverage = coverage;
+                            break;
+                        }
+                        _ => {
+                            if let Some(slot) = recovery.as_mut() {
+                                slot.unavailable = Some(declined.unwrap_or("recovery unavailable"));
+                                slot.trip = Some((generated + recovery_base, coverage));
+                            }
+                        }
+                    }
                 }
             }
             // Checkpoint during decode too, so a long generated turn (e.g. a
@@ -6323,6 +6533,20 @@ pub fn generate(
             }
         }
 
+        // ── #728 recovery: end this pass without any terminal ────────
+        // The client keeps the reasoning it already received; no done,
+        // commit_ready or tool release is staged. The daemon re-invokes
+        // `generate` with the same id, the low-effort sentence and the
+        // remaining budget, and only that pass reaches the terminal staging.
+        if recovery_requested {
+            if let Some(slot) = recovery {
+                slot.requested = true;
+                slot.generated = generated;
+                slot.coverage = recovery_coverage;
+                slot.emitted = m.conversation_tokens[conv_start..].to_vec();
+            }
+            return;
+        }
         // ── semantic finish: tool_calls + cache + done ─────────────
         //
         // QwenArSemanticProducer is the sole wire authority for this AR path.
@@ -6334,13 +6558,20 @@ pub fn generate(
         // Open think → reasoning-only stop (no calls) via finish().
         // finish() shares the same drain + classify path as unit tests.
         let hit_length_cap = generated >= max_tokens;
-        let (finish, visible_for_cache) = match semantic.finish(stdout, hit_length_cap) {
+        let (mut finish, visible_for_cache) = match semantic.finish(stdout, hit_length_cap) {
             Ok(pair) => pair,
             Err(err) => {
                 emit_error_with_id(stdout, id, &err.to_string());
                 return;
             }
         };
+        if loop_stopped {
+            // #728 stop mode: the reference leaves `finish` at "length" (the
+            // pass was force-ended, not completed), so the client maps it to
+            // an incomplete / max_output_tokens answer.
+            finish.finish_reason = "length";
+            finish.wire_tool_calls.clear();
+        }
         //
         // Timing + pending done are fixed before handshake so commit_ready
         // carries the exact eventual done payload. Abort rolls back + emits
@@ -6369,7 +6600,9 @@ pub fn generate(
         let mut pending_done = qwen_ar_done_value(
             id,
             finish.finish_reason,
-            generated,
+            // Completion count spans every pass of the request (the reference's
+            // `n` accumulates across the restart); timing stays per pass.
+            generated + recovery_base,
             tok_s,
             prefill_tokens,
             prefill_s * 1000.0,

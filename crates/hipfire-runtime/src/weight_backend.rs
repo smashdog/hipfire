@@ -1634,7 +1634,6 @@ impl<'a> WeightBackend for HfqBackend<'a> {
         self.gpu.upload_f32(&v, &[n])
     }
 
-
     fn escha_sidecars(
         &mut self,
         rel: &str,
@@ -1777,7 +1776,6 @@ impl<'a> WeightBackend for ParoBackend<'a> {
         let v: Vec<f32> = (0..n).map(|i| f32::from_bits(i as u32)).collect();
         self.gpu.upload_f32(&v, &[n])
     }
-
 
     /// ParoQuant is not escha.
     fn escha_sidecars(

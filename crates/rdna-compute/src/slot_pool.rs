@@ -14,7 +14,7 @@
 //   Enables dynamic allocation, prefix sharing, and over-subscription.
 
 use crate::kv_slots::{preflight_alloc, KvSlotDesc, R9700_VRAM_BYTES};
-use crate::page_pool::{BlockTable, PagePool, PAGE_TOKENS as POOL_PAGE_TOKENS};
+use crate::page_pool::{BlockTable, PagePool, PAGE_TOKENS as POOL_PAGE_TOKENS, SPILLED_PAGE};
 
 /// Slab capacities round up to this, so a future page size divides them.
 /// Matches the tile size the flash path walks KV in.
@@ -445,6 +445,161 @@ impl SlotPool {
     /// Get the block table for `slot`, if in paged mode.
     pub fn block_table(&self, slot: SlotId) -> Option<&BlockTable> {
         self.block_tables.get(slot.0).and_then(|bt| bt.as_ref())
+    }
+
+    // ── KVMem spill / restore hooks ────────────────────────────────────
+
+    /// Install a non-resident prefix into an acquired, EMPTY paged slot
+    /// (freshly acquired or cleared with [`Self::reset`]). Allocates only a
+    /// CPU logical table of `ceil(frontier / PAGE_TOKENS)` [`SPILLED_PAGE`]
+    /// entries, never physical pages. Publishes `frontier` in both the table
+    /// and descriptor and marks both dirty; paged descriptor activation still
+    /// belongs to the block-table upload path.
+    ///
+    /// Zero is allowed and leaves an empty prefix, so repeated zero installs
+    /// are allowed. Any existing pages or nonzero table/descriptor length are
+    /// refused, even if every existing page is spilled. Invalid/unacquired or
+    /// non-paged slots, lengths above the slot cap or i32 descriptor ABI, and
+    /// logical allocation/rounding failures leave all pool state unchanged.
+    ///
+    /// This does NOT make the slot executable. The caller must bind and copy
+    /// the selected working set via [`Self::bind_restored_page`] before a
+    /// forward, including restoring a spilled partial tail before appending
+    /// into it. Later length growth allocates only newly added logical pages;
+    /// it does not restore existing spilled entries.
+    pub fn install_spilled_prefix(&mut self, slot: SlotId, frontier: usize) -> Result<(), String> {
+        let desc = self
+            .descs
+            .get(slot.0)
+            .ok_or_else(|| format!("install_spilled_prefix: slot {} out of range", slot.0))?;
+        if !self.in_use[slot.0] {
+            return Err(format!(
+                "install_spilled_prefix: slot {} is not in use",
+                slot.0
+            ));
+        }
+        if !self.is_paged() {
+            return Err("install_spilled_prefix: not in paged mode".to_string());
+        }
+        if frontier > self.cap_tokens {
+            return Err(format!(
+                "install_spilled_prefix: slot {} frontier {frontier} exceeds cap {}",
+                slot.0, self.cap_tokens
+            ));
+        }
+        if frontier > i32::MAX as usize {
+            return Err(format!(
+                "install_spilled_prefix: slot {} frontier {frontier} exceeds the i32 descriptor ABI",
+                slot.0
+            ));
+        }
+        let bt = self.block_tables[slot.0]
+            .as_mut()
+            .ok_or_else(|| format!("install_spilled_prefix: slot {} has no block table", slot.0))?;
+        if bt.num_pages() != 0 || bt.live_tokens() != 0 || desc.seq_len != 0 {
+            return Err(format!(
+                "install_spilled_prefix: slot {} requires an empty table and descriptor",
+                slot.0
+            ));
+        }
+        // Construct before committing: even a host allocation failure must
+        // leave the old table, descriptor, dirty flags and physical pool alone.
+        let spilled = BlockTable::new_spilled_prefix(frontier)?;
+        *bt = spilled;
+        self.descs[slot.0].seq_len = frontier as i32;
+        self.block_tables_dirty[slot.0] = true;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Mutable access to `slot`'s block table for KVMem logical-page edits.
+    /// Marks the table dirty so the next forward's `upload_block_tables`
+    /// pushes the rewritten entries (spill/restore write the sentinel and
+    /// rebind physical pages directly).
+    pub fn edit_block_table(&mut self, slot: SlotId) -> Option<&mut BlockTable> {
+        self.block_tables.get(slot.0).and_then(|bt| bt.as_ref())?;
+        self.block_tables_dirty[slot.0] = true;
+        self.block_tables[slot.0].as_mut()
+    }
+
+    /// Stage logical page `lp` of `slot` OUT of the arena (KVMem spill,
+    /// commit half). The caller MUST have copied the page's bytes out
+    /// first — this only drops residency: the entry becomes
+    /// [`SPILLED_PAGE`] and the physical page returns to the pool. Returns
+    /// the released physical page (arena offsets for the copy were derived
+    /// from it).
+    ///
+    /// Refuses unless the page is exclusively table-owned
+    /// ([`PagePool::page_evictable`]) — a COW/prefix-shared or leased page
+    /// still has live readers.
+    pub fn stage_out_page(&mut self, slot: SlotId, lp: usize) -> Result<u32, String> {
+        let pool = self
+            .page_pool
+            .as_mut()
+            .ok_or_else(|| "stage_out_page: not in paged mode".to_string())?;
+        let bt = self
+            .block_tables
+            .get_mut(slot.0)
+            .and_then(|bt| bt.as_mut())
+            .ok_or_else(|| format!("stage_out_page: slot {} has no block table", slot.0))?;
+        let phys = match bt.raw_entry(lp) {
+            Some(SPILLED_PAGE) => {
+                return Err(format!(
+                    "stage_out_page: slot {} logical page {lp} is already spilled",
+                    slot.0
+                ))
+            }
+            Some(phys) => phys,
+            None => {
+                return Err(format!(
+                    "stage_out_page: slot {} has no logical page {lp} ({} pages)",
+                    slot.0,
+                    bt.num_pages()
+                ))
+            }
+        };
+        if !pool.page_evictable(phys) {
+            return Err(format!(
+                "stage_out_page: slot {} logical page {lp} -> phys {phys} is not \
+                 exclusively table-owned (state={:?}, refs={}) — refusing to spill",
+                slot.0,
+                pool.page_state(phys),
+                pool.refcount(phys)
+            ));
+        }
+        bt.unbind_physical(lp)?;
+        pool.release_bound_page(phys)?;
+        self.block_tables_dirty[slot.0] = true;
+        Ok(phys)
+    }
+
+    /// Bind a freshly allocated physical page into logical slot `lp`
+    /// (KVMem restore, commit half). `phys` must come from
+    /// [`PagePool::alloc_page_unbound`]; on a bind failure the page is
+    /// released so it cannot leak. The caller then copies the KVMem bytes
+    /// into `phys`'s arena rows before the next forward — same host thread,
+    /// so no kernel can observe the half-restored page in between.
+    pub fn bind_restored_page(&mut self, slot: SlotId, lp: usize, phys: u32) -> Result<(), String> {
+        let bt = match self.block_tables.get_mut(slot.0).and_then(|bt| bt.as_mut()) {
+            Some(bt) => bt,
+            None => {
+                if let Some(pool) = self.page_pool.as_mut() {
+                    let _ = pool.release_bound_page(phys);
+                }
+                return Err(format!(
+                    "bind_restored_page: slot {} has no block table",
+                    slot.0
+                ));
+            }
+        };
+        if let Err(e) = bt.bind_physical(lp, phys) {
+            if let Some(pool) = self.page_pool.as_mut() {
+                let _ = pool.release_bound_page(phys);
+            }
+            return Err(e);
+        }
+        self.block_tables_dirty[slot.0] = true;
+        Ok(())
     }
 
     /// True when `slot`'s block table has changed since last upload.
@@ -1014,6 +1169,270 @@ mod tests {
         let p = SlotPool::new_paged(2, 256, PPB, 16).unwrap();
         // 16 pages * 128 tokens * 1088 bytes = 2,228,224 bytes per arena
         assert_eq!(p.arena_bytes(), 16 * 128 * PPB);
+    }
+
+    // ── Host-only sparse prefix installation ─────────────────────────
+
+    fn assert_spilled_prefix_refused(
+        p: &mut SlotPool,
+        slot: SlotId,
+        frontier: usize,
+        reason: &str,
+    ) {
+        let descs = p.descriptors().to_vec();
+        let free = p.free_pages();
+        // Includes tables, dirty flags, slot use/generations and all physical
+        // metadata/free-list order, not just the reported free-page count.
+        let before = format!("{p:?}");
+        let err = p.install_spilled_prefix(slot, frontier).unwrap_err();
+        assert!(err.contains(reason), "unexpected refusal: {err}");
+        assert_eq!(p.descriptors(), descs.as_slice());
+        assert_eq!(p.free_pages(), free);
+        assert_eq!(format!("{p:?}"), before);
+    }
+
+    #[test]
+    fn paged_install_spilled_prefix_exceeds_physical_pool() {
+        let mut p = SlotPool::new_paged(2, 16 * PAGE_TOKENS, PPB, 2).unwrap();
+        let lease = p.acquire_leased().unwrap();
+        let slot = lease.id;
+        let frontier = 10 * PAGE_TOKENS + 17;
+        assert!(frontier > p.page_pool().unwrap().max_tokens());
+        let other_desc = p.descriptors()[1];
+        p.mark_uploaded();
+
+        p.install_spilled_prefix(slot, frontier).unwrap();
+
+        let bt = p.block_table(slot).unwrap();
+        assert_eq!(bt.num_pages(), 11);
+        assert_eq!(bt.live_tokens(), frontier);
+        assert_eq!(bt.page_indices(), &[SPILLED_PAGE; 11]);
+        for lp in 0..11 {
+            assert!(bt.is_spilled(lp));
+            assert_eq!(bt.physical(lp), None);
+        }
+        assert_eq!(bt.raw_entry(11), None);
+        assert_eq!(p.free_pages(), 2);
+        assert_eq!(p.descriptors()[slot.0].seq_len, frontier as i32);
+        assert_eq!(p.descriptors()[slot.0].block_table, 0);
+        assert_eq!(p.descriptors()[slot.0].page_tokens, 0);
+        assert_eq!(p.descriptors()[1], other_desc);
+        assert!(p.dirty);
+        assert!(p.block_table_dirty(slot));
+        assert!(!p.block_table_dirty(SlotId(1)));
+        assert!(p.validate_generation(&lease).is_ok());
+        p.page_pool().unwrap().check_invariants();
+    }
+
+    #[test]
+    fn paged_install_spilled_prefix_binds_sparse_pages_and_partial_tail() {
+        let mut p = SlotPool::new_paged(1, 12 * PAGE_TOKENS, PPB, 4).unwrap();
+        let slot = p.acquire().unwrap();
+        let frontier = 8 * PAGE_TOKENS + 7;
+        p.install_spilled_prefix(slot, frontier).unwrap();
+        let desc = p.descriptors()[slot.0];
+        let mut expected = vec![SPILLED_PAGE; 9];
+        // Restore out of logical order, leaving holes and including the
+        // partially filled last page. No GPU bytes are copied in this test.
+        for lp in [7, 0, 8] {
+            p.mark_uploaded();
+            let phys = p.page_pool_mut().unwrap().alloc_page_unbound().unwrap();
+            p.bind_restored_page(slot, lp, phys).unwrap();
+            expected[lp] = phys;
+            assert_eq!(p.block_table(slot).unwrap().physical(lp), Some(phys));
+            assert_eq!(p.page_pool().unwrap().refcount(phys), 1);
+            assert!(p.block_table_dirty(slot));
+            assert!(p.descriptors_dirty());
+            assert_eq!(p.descriptors()[slot.0], desc);
+        }
+        let bt = p.block_table(slot).unwrap();
+        assert_eq!(bt.page_indices(), expected.as_slice());
+        assert_eq!(bt.live_tokens(), frontier);
+        for lp in 1..7 {
+            assert_eq!(bt.physical(lp), None);
+            assert!(bt.is_spilled(lp));
+        }
+        assert_eq!(p.free_pages(), 1);
+
+        // Append into the restored tail, then fill it: neither operation
+        // allocates nor restores any of the older spilled logical pages.
+        for len in [frontier + 1, 9 * PAGE_TOKENS] {
+            p.set_seq_len(slot, len).unwrap();
+            assert_eq!(p.free_pages(), 1);
+            assert_eq!(
+                p.block_table(slot).unwrap().page_indices(),
+                expected.as_slice()
+            );
+        }
+        // Crossing into a new logical page allocates exactly one page.
+        p.set_seq_len(slot, 9 * PAGE_TOKENS + 1).unwrap();
+        let bt = p.block_table(slot).unwrap();
+        assert_eq!(bt.num_pages(), 10);
+        assert_eq!(&bt.page_indices()[..9], expected.as_slice());
+        assert!(bt.physical(9).is_some());
+        assert_eq!(bt.live_tokens(), 9 * PAGE_TOKENS + 1);
+        assert_eq!(p.free_pages(), 0);
+        p.page_pool().unwrap().check_invariants();
+    }
+
+    #[test]
+    fn paged_install_spilled_prefix_refuses_repeat_and_nonempty() {
+        let mut p = SlotPool::new_paged(1, 8 * PAGE_TOKENS, PPB, 2).unwrap();
+        let slot = p.acquire().unwrap();
+        p.install_spilled_prefix(slot, 4 * PAGE_TOKENS + 1).unwrap();
+        assert_spilled_prefix_refused(&mut p, slot, PAGE_TOKENS, "empty");
+        p.mark_uploaded();
+        assert_spilled_prefix_refused(&mut p, slot, 0, "empty");
+
+        p.reset(slot);
+        p.set_seq_len(slot, 1).unwrap();
+        p.activate_paged_desc(slot, 0xCAFE_BABE); // host-only upload simulation
+        p.mark_uploaded();
+        assert_spilled_prefix_refused(&mut p, slot, PAGE_TOKENS, "empty");
+        // A zero live length with retained allocated pages is NOT empty.
+        p.set_seq_len(slot, 0).unwrap();
+        p.mark_uploaded();
+        assert_spilled_prefix_refused(&mut p, slot, PAGE_TOKENS, "empty");
+
+        // A nonzero descriptor alone is also not an empty slot.
+        p.reset(slot);
+        p.publish_seq_len(slot, 1).unwrap();
+        p.mark_uploaded();
+        assert_spilled_prefix_refused(&mut p, slot, PAGE_TOKENS, "empty");
+    }
+
+    #[test]
+    fn paged_install_spilled_prefix_refuses_invalid_or_unacquired_slot() {
+        let mut p = SlotPool::new_paged(2, PAGE_TOKENS, PPB, 2).unwrap();
+        p.mark_uploaded();
+        for frontier in [0, 1] {
+            assert_spilled_prefix_refused(&mut p, SlotId(2), frontier, "out of range");
+            assert_spilled_prefix_refused(&mut p, SlotId(usize::MAX), frontier, "out of range");
+            assert_spilled_prefix_refused(&mut p, SlotId(0), frontier, "not in use");
+        }
+        let slot = p.acquire().unwrap();
+        p.install_spilled_prefix(slot, PAGE_TOKENS).unwrap();
+        assert_spilled_prefix_refused(&mut p, SlotId(1), 1, "not in use");
+        p.release(slot);
+        p.mark_uploaded();
+        assert_spilled_prefix_refused(&mut p, slot, 1, "not in use");
+    }
+
+    #[test]
+    fn install_spilled_prefix_refuses_legacy_pool() {
+        let mut p = SlotPool::new(2, PAGE_TOKENS, PPB).unwrap();
+        p.acquire().unwrap();
+        let slot = p.acquire().unwrap(); // nonzero legacy arena offsets
+        p.mark_uploaded();
+        for frontier in [0, 1] {
+            assert_spilled_prefix_refused(&mut p, slot, frontier, "not in paged mode");
+        }
+    }
+
+    #[test]
+    fn paged_install_spilled_prefix_refuses_cap_and_descriptor_overflow() {
+        let mut p = SlotPool::new_paged(1, PAGE_TOKENS, PPB, 2).unwrap();
+        let slot = p.acquire().unwrap();
+        p.mark_uploaded();
+        assert_spilled_prefix_refused(&mut p, slot, PAGE_TOKENS + 1, "cap");
+        assert_spilled_prefix_refused(&mut p, slot, usize::MAX, "cap");
+
+        // Paged cap is admission-only, so it can exceed the descriptor ABI
+        // without creating a large physical pool or a large logical vector.
+        let over_abi = i32::MAX as usize + 1;
+        let mut p = SlotPool::new_paged(1, over_abi, PPB, 2).unwrap();
+        let slot = p.acquire().unwrap();
+        p.mark_uploaded();
+        assert_spilled_prefix_refused(&mut p, slot, over_abi, "i32 descriptor ABI");
+    }
+
+    #[test]
+    fn paged_install_spilled_prefix_reset_and_release_reclaim_only_bound_pages() {
+        for bind_pages in [false, true] {
+            for release in [false, true] {
+                let mut p = SlotPool::new_paged(2, 12 * PAGE_TOKENS, PPB, 4).unwrap();
+                let other = p.acquire().unwrap();
+                p.set_seq_len(other, 1).unwrap();
+                let other_phys = p.block_table(other).unwrap().physical(0).unwrap();
+                let other_desc = p.descriptors()[other.0];
+                let lease = p.acquire_leased().unwrap();
+                let slot = lease.id;
+                let frontier = 8 * PAGE_TOKENS + 7;
+                p.install_spilled_prefix(slot, frontier).unwrap();
+                let mut bound = Vec::new();
+                if bind_pages {
+                    for lp in [1, 8] {
+                        let phys = p.page_pool_mut().unwrap().alloc_page_unbound().unwrap();
+                        p.bind_restored_page(slot, lp, phys).unwrap();
+                        bound.push(phys);
+                    }
+                }
+                assert_eq!(p.free_pages(), 3 - bound.len());
+                p.activate_paged_desc(slot, 0xCAFE_BABE);
+                p.mark_uploaded();
+                if release {
+                    p.release(slot);
+                    assert!(p.block_table(slot).is_none());
+                    assert!(!p.in_use[slot.0]);
+                    assert!(!p.block_table_dirty(slot));
+                    assert_eq!(p.slot_generation(slot), lease.generation + 1);
+                } else {
+                    p.reset(slot);
+                    assert_eq!(p.block_table(slot).unwrap().num_pages(), 0);
+                    assert_eq!(p.block_table(slot).unwrap().live_tokens(), 0);
+                    assert!(p.block_table_dirty(slot));
+                    assert!(p.validate_generation(&lease).is_ok());
+                }
+                assert_eq!(p.free_pages(), 3);
+                assert_eq!(p.descriptors()[slot.0].seq_len, 0);
+                assert_eq!(p.descriptors()[slot.0].block_table, 0);
+                assert_eq!(p.descriptors()[slot.0].page_tokens, 0);
+                assert!(p.dirty);
+                assert_eq!(p.descriptors()[other.0], other_desc);
+                assert_eq!(p.block_table(other).unwrap().physical(0), Some(other_phys));
+                assert_eq!(p.page_pool().unwrap().refcount(other_phys), 1);
+                for phys in bound {
+                    assert_eq!(p.page_pool().unwrap().refcount(phys), 0);
+                    assert_eq!(
+                        p.page_pool().unwrap().page_state(phys),
+                        crate::page_pool::PageState::Free
+                    );
+                }
+                p.page_pool().unwrap().check_invariants();
+                if !release {
+                    // Reset keeps the lease active and permits installation
+                    // again, without an acquire or any physical allocation.
+                    p.install_spilled_prefix(slot, frontier).unwrap();
+                    assert_eq!(p.free_pages(), 3);
+                    p.release(slot);
+                }
+                p.release(other);
+                assert_eq!(p.free_pages(), 4);
+                p.page_pool().unwrap().check_invariants();
+            }
+        }
+    }
+
+    #[test]
+    fn paged_install_spilled_prefix_allows_zero_prefix() {
+        let mut p = SlotPool::new_paged(1, 0, PPB, 2).unwrap();
+        let slot = p.acquire().unwrap();
+        let desc = p.descriptors()[slot.0];
+        for _ in 0..2 {
+            p.mark_uploaded();
+            p.install_spilled_prefix(slot, 0).unwrap();
+            let bt = p.block_table(slot).unwrap();
+            assert_eq!(bt.num_pages(), 0);
+            assert_eq!(bt.live_tokens(), 0);
+            assert_eq!(p.descriptors()[slot.0], desc);
+            assert_eq!(p.free_pages(), 2);
+            assert!(p.dirty);
+            assert!(p.block_table_dirty(slot));
+        }
+        p.release(slot);
+        assert_eq!(p.free_pages(), 2);
+        assert!(p.block_table(slot).is_none());
+        p.page_pool().unwrap().check_invariants();
     }
 
     // ── Paged-mode regression tests (branch bug fixes) ─────────────────

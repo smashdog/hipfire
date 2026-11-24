@@ -31,6 +31,7 @@
 // 34*b + 2 + 4*(r%8): an unaligned dword for even b, read with one dword
 // load as the reference does (RDNA3 unaligned access mode).
 #include <hip/hip_runtime.h>
+#include "kv_slot_desc.h"
 
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__)
 #error "attention_flash_q8_0_tile_gqa_gfx1100 requires --offload-arch=gfx1100"
@@ -133,10 +134,15 @@ __device__ __forceinline__ void gqa_accum_key(const unsigned char* __restrict__ 
 // One (kv head, tile). All loads are issued at entry (Q, V, K in consumption
 // order) through buffer descriptors, so per-lane addressing is one 32-bit
 // offset and the per-load strides fold into instruction offsets.
+// `tile_off` is the byte offset of this tile's first key row in the K/V
+// arenas. Legacy contiguous slots pass `tile_start * row_stride`; the paged
+// (KVMem) entry resolves it through the slot's block table instead. The body
+// is otherwise identical, so partials stay byte-identical between the two.
 __device__ __forceinline__ void gqa_tile(
     const float* __restrict__ q, const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache, float* __restrict__ partials,
     int n_kv_heads, int max_tiles, float scale_attn, int seq_len, int kv_h, int tile_id,
+    size_t tile_off,
     unsigned int* __restrict__ v_lds, float* __restrict__ sc, float* __restrict__ q_lds) {
     const int tile_start = tile_id * GQA_TILE;
     const int tile_len = min(GQA_TILE, seq_len - tile_start);
@@ -151,9 +157,9 @@ __device__ __forceinline__ void gqa_tile(
     const unsigned head_off = (unsigned)kv_h * GQA_SEG;
     const unsigned tile_bytes = (unsigned)tile_len * row_stride;
     const auto k_rsrc = __builtin_amdgcn_make_buffer_rsrc(
-        (void*)(k_cache + (size_t)tile_start * row_stride), 0, tile_bytes, 0x31004000u);
+        (void*)(k_cache + tile_off), 0, tile_bytes, 0x31004000u);
     const auto v_rsrc = __builtin_amdgcn_make_buffer_rsrc(
-        (void*)(v_cache + (size_t)tile_start * row_stride), 0, tile_bytes, 0x31004000u);
+        (void*)(v_cache + tile_off), 0, tile_bytes, 0x31004000u);
 
     const int h0 = kv_h * GQA_GROUP;
     float2 qv[GQA_Q_CHUNKS];
@@ -326,7 +332,84 @@ __global__ void attention_flash_q8_0_tile_gqa_gfx1100(
 
     for (int tile_id = blockIdx.y; tile_id < n_tiles; tile_id += gridDim.y) {
         if (tile_id != (int)blockIdx.y) __syncthreads();
+        const size_t tile_off = (size_t)tile_id * GQA_TILE
+                              * ((size_t)n_kv_heads * GQA_SEG);
         gqa_tile(q, k_cache, v_cache, partials, n_kv_heads, max_tiles, scale_attn, seq_len, kv_h,
-                 tile_id, v_lds, sc, q_lds);
+                 tile_id, tile_off, v_lds, sc, q_lds);
     }
 }
+
+#ifdef HIPFIRE_KV_SLOT_PAGED
+// Paged (KVMem) twin: same body over block-table-addressed arenas. Each
+// GQA_TILE (128) key tile lives inside exactly one KV page
+// (page_tokens == GQA_TILE in production), so one block-table entry resolves
+// the whole tile; a spilled page (-1) publishes the empty-partial contract
+// and returns before any K/V read. Same ABI as the legacy entry plus the
+// descriptor tail; partials are byte-identical to the batched tile for
+// resident pages.
+extern "C" __launch_bounds__(GQA_THREADS, 1)
+__global__ void attention_flash_q8_0_tile_gqa_paged_gfx1100(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn,
+    int tile_size,
+    int window,
+    int effective_seq_len,
+    const KvSlotDesc* __restrict__ slot_descs,
+    const int* __restrict__ row_slot
+) {
+    (void)n_heads; (void)head_dim; (void)tile_size; (void)window;
+    (void)effective_seq_len;
+    const int seq_len = pos_buf[0] + 1;
+    const int kv_h = blockIdx.x;
+    if (kv_h >= n_kv_heads) return;
+    const int slot = (row_slot != nullptr) ? row_slot[0] : 0;
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy(seq_len, max_seq);
+    const int max_tiles = (max_seq + GQA_TILE - 1) / GQA_TILE;
+    const int n_tiles = min((seq_len + GQA_TILE - 1) / GQA_TILE, max_tiles);
+
+    __shared__ __attribute__((aligned(16))) unsigned int v_lds[GQA_V_TILE * GQA_SEG / 4];
+    __shared__ __attribute__((aligned(16))) float sc[GQA_GROUP * GQA_TILE];
+    __shared__ __attribute__((aligned(16))) float q_lds[GQA_GROUP * GQA_HD];
+
+    for (int tile_id = blockIdx.y; tile_id < n_tiles; tile_id += gridDim.y) {
+        if (tile_id != (int)blockIdx.y) __syncthreads();
+        const int tile_start = tile_id * GQA_TILE;
+        size_t tile_off;
+        if (desc.block_table != nullptr) {
+            const int phys = desc.block_table[tile_start / desc.page_tokens];
+            if (phys < 0) {
+                // Spilled page: empty-partial contract for this kv head's
+                // six q heads; the shared reduce skips p[1] <= 0.
+                if (threadIdx.x == 0) {
+                    for (int j = 0; j < GQA_GROUP; ++j) {
+                        float* p = partials
+                            + ((size_t)(kv_h * GQA_GROUP + j) * max_tiles + tile_id)
+                              * (2 + GQA_HD);
+                        p[0] = -1e30f;
+                        p[1] = 0.0f;
+                    }
+                }
+                continue;
+            }
+            tile_off = (size_t)phys * (size_t)desc.page_tokens
+                     * ((size_t)n_kv_heads * GQA_SEG)
+                     + (size_t)(tile_start % desc.page_tokens)
+                       * ((size_t)n_kv_heads * GQA_SEG);
+        } else {
+            tile_off = (size_t)tile_start * ((size_t)n_kv_heads * GQA_SEG);
+        }
+        gqa_tile(q, k_cache, v_cache, partials, n_kv_heads, max_tiles, scale_attn, seq_len, kv_h,
+                 tile_id, tile_off, v_lds, sc, q_lds);
+    }
+}
+#endif

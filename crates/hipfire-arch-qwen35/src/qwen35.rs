@@ -15,8 +15,13 @@ pub mod ep_batch;
 /// Q8_0, plus the per-layer H128 transform tables.
 pub mod escha;
 pub mod forward;
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+pub(crate) mod layerwise_attend;
 pub mod load;
 pub mod mesh_tp;
+pub(crate) mod paged_decode;
+mod tap;
+pub(crate) use tap::TapBinding;
 #[cfg(feature = "moe-oracle")]
 pub mod oracle;
 pub mod prefill;

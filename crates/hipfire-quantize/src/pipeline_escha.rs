@@ -4,8 +4,8 @@
 //! Code streams are copied byte-for-byte; `memcmp` on the round-trip is a
 //! post-condition. See docs/plans/escha-w2-port-design.md.
 
-use hipfire_quantize::float16::f16_to_f32;
 use crate::hfq::QuantType;
+use hipfire_quantize::float16::f16_to_f32;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,15 +241,19 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
                 .chunks_exact(2)
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
-            let w_bits = hipfire_quantize::escha_ref::reconstruct(&code_i16, ic_f, oc_f, k as usize);
-            let folded = hipfire_quantize::escha_fold::fold_escha_linear(&w_bits, ic_f, oc_f, &ri_f, &ro_f)?;
+            let w_bits =
+                hipfire_quantize::escha_ref::reconstruct(&code_i16, ic_f, oc_f, k as usize);
+            let folded =
+                hipfire_quantize::escha_fold::fold_escha_linear(&w_bits, ic_f, oc_f, &ri_f, &ro_f)?;
             let s1 = crate::quant_fwht::gen_fwht_signs(42, 256);
             let s2 = crate::quant_fwht::gen_fwht_signs(1042, 256);
             let (bytes, qt_f) = match fold_fmt {
                 DenseFormat::F16Fold => {
                     let mut b = Vec::with_capacity(folded.len() * 2);
                     for v in &folded {
-                        b.extend_from_slice(&hipfire_quantize::float16::f32_to_f16(*v).to_le_bytes());
+                        b.extend_from_slice(
+                            &hipfire_quantize::float16::f32_to_f16(*v).to_le_bytes(),
+                        );
                     }
                     (b, QuantType::F16)
                 }
@@ -283,7 +287,9 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
             // measuring the fold in isolation, and is how the first folded 27B
             // was benchmarked at PPL 13.91).
             if let Some((bm, bd)) = find(&format!("{proj}.bias")) {
-                if std::env::var("HIPFIRE_ESCHA_FOLD_DROP_BIAS").as_deref() != Ok("1") {
+                if hipfire_config::developer_var("HIPFIRE_ESCHA_FOLD_DROP_BIAS").as_deref()
+                    != Ok("1")
+                {
                     return Err(format!(
                         "{proj}: fold mode cannot represent the additive bias, and the runtime \
                          has no bias slot to apply it — the folded model would silently ignore \
@@ -325,7 +331,6 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
             ro,
         ));
 
-
         if let Some((bm, bd)) = find(&format!("{proj}.bias")) {
             tensors.push(HfqTensor {
                 name: format!("{proj}.bias"),
@@ -362,7 +367,11 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
                 // quant_type 15"). lm_head is a different matter: it IS read
                 // in full every token (0.54 GB, 22% of the budget).
                 let is_embed = prefix.contains("embed_tokens") || prefix.contains("token_embd");
-                let fmt = if is_embed { DenseFormat::Q8_0 } else { dense_format_for(prefix) };
+                let fmt = if is_embed {
+                    DenseFormat::Q8_0
+                } else {
+                    dense_format_for(prefix)
+                };
                 let (data, qt, gs) = match fmt {
                     // F16Fold only ever reaches the FOLD branch above; the
                     // non-escha dense tensors it never touches stay Q8_0.
@@ -401,17 +410,13 @@ pub(crate) fn convert_escha(src_dir: &Path, out: &Path) -> Result<(), String> {
                         // at KLD 0.0076.
                         if fmt == DenseFormat::Mq4V2 {
                             (
-                                crate::quant_fwht::quantize_mq4g256v2(
-                                    &f32_data, oc, ic, &s1, &s2,
-                                ),
+                                crate::quant_fwht::quantize_mq4g256v2(&f32_data, oc, ic, &s1, &s2),
                                 QuantType::MQ4G256V2,
                                 256u32,
                             )
                         } else {
                             (
-                                crate::quant_fwht::quantize_mq6g256v2(
-                                    &f32_data, oc, ic, &s1, &s2,
-                                ),
+                                crate::quant_fwht::quantize_mq6g256v2(&f32_data, oc, ic, &s1, &s2),
                                 QuantType::MQ6G256V2,
                                 256u32,
                             )
@@ -700,7 +705,10 @@ const DENSE_DEFAULT_KEEP_Q8: [&str; 2] = ["mlp.gate", "shared_expert"];
 /// `mq6` (recommended) or `mq4v2`. Unset means the normal escha output,
 /// byte-for-byte unchanged. See `escha_fold` for the algebra and the trade.
 fn fold_format() -> Option<DenseFormat> {
-    match std::env::var("HIPFIRE_ESCHA_FOLD").ok().as_deref() {
+    match hipfire_config::developer_var("HIPFIRE_ESCHA_FOLD")
+        .ok()
+        .as_deref()
+    {
         Some("mq6") => Some(DenseFormat::Mq6),
         Some("mq4v2") => Some(DenseFormat::Mq4V2),
         // `f16` folds WITHOUT re-quantising. It is an ATTRIBUTION tool, not a
@@ -714,7 +722,7 @@ fn fold_format() -> Option<DenseFormat> {
 }
 
 fn dense_format_for(name: &str) -> DenseFormat {
-    let Ok(spec) = std::env::var("HIPFIRE_ESCHA_DENSE") else {
+    let Ok(spec) = hipfire_config::developer_var("HIPFIRE_ESCHA_DENSE") else {
         return DenseFormat::Q8_0;
     };
     let (fmt, rule) = match spec.find(['!', ':']) {

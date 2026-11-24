@@ -2865,6 +2865,72 @@ pub const GEMV_MQ4G256V2_Q8X_V3_B5_SRC: &str =
 pub const GEMV_MQ4G256V2_Q8X_V3_B5_RES_SRC: &str =
     gemv_mq4g256v2_q8x_v3_source!("5", "#define Q8X_RESIDUAL 1\n", "mq4v2_q8x_v3_b5_res");
 
+// MQ3G256V2 (qt49, 3-bit) q8x verify twins. Same activation quantizer
+// (GEMV_MQ4G256V2_Q8X_QUANT_SRC, format-agnostic) and LDS staging; the weight
+// payload is 104 B/group, 12 B/lane, codes 0..7 (gemv_mq3g256v2_q8x.hip).
+macro_rules! gemv_mq3g256v2_q8x_v4_source {
+    ($b:literal, $res:literal, $name:literal) => {
+        concat!(
+            "#define Q8X_GEMV4 1\n#define Q8X3_R 8\n#define Q8X3_P 3\n#define Q8X3_NT 1\n",
+            "#define Q8X3_LDSKB 64\n#define Q8X4_XP 0\n#define Q8X_BMAX ",
+            $b,
+            "\n",
+            $res,
+            "#define Q8X_KERNEL ",
+            $name,
+            "\n#define Q8X_MULTI_KERNEL ",
+            $name,
+            "_multi\n",
+            include_str!("../../../kernels/src/gemv_mq3g256v2_q8x.hip")
+        )
+    };
+}
+macro_rules! gemv_mq3g256v2_q8x_v3_source {
+    ($b:literal, $res:literal, $name:literal) => {
+        concat!(
+            "#define Q8X_GEMV3 1\n#define Q8X3_R 8\n#define Q8X3_W 2\n#define Q8X3_P 2\n",
+            "#define Q8X3_NT 1\n#define Q8X3_LDSKB 32\n#define Q8X_BMAX ",
+            $b,
+            "\n",
+            $res,
+            "#define Q8X_KERNEL ",
+            $name,
+            "\n#define Q8X_MULTI_KERNEL ",
+            $name,
+            "_multi\n",
+            include_str!("../../../kernels/src/gemv_mq3g256v2_q8x.hip")
+        )
+    };
+}
+pub const GEMV_MQ3G256V2_Q8X_V4_B2_SRC: &str =
+    gemv_mq3g256v2_q8x_v4_source!("2", "", "mq3v2_q8x_v4_b2");
+pub const GEMV_MQ3G256V2_Q8X_V4_B2_RES_SRC: &str =
+    gemv_mq3g256v2_q8x_v4_source!("2", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v4_b2_res");
+pub const GEMV_MQ3G256V2_Q8X_V4_B3_SRC: &str =
+    gemv_mq3g256v2_q8x_v4_source!("3", "", "mq3v2_q8x_v4_b3");
+pub const GEMV_MQ3G256V2_Q8X_V4_B3_RES_SRC: &str =
+    gemv_mq3g256v2_q8x_v4_source!("3", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v4_b3_res");
+pub const GEMV_MQ3G256V2_Q8X_V4_B4_SRC: &str =
+    gemv_mq3g256v2_q8x_v4_source!("4", "", "mq3v2_q8x_v4_b4");
+pub const GEMV_MQ3G256V2_Q8X_V4_B4_RES_SRC: &str =
+    gemv_mq3g256v2_q8x_v4_source!("4", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v4_b4_res");
+pub const GEMV_MQ3G256V2_Q8X_V3_B2_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("2", "", "mq3v2_q8x_v3_b2");
+pub const GEMV_MQ3G256V2_Q8X_V3_B2_RES_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("2", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v3_b2_res");
+pub const GEMV_MQ3G256V2_Q8X_V3_B3_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("3", "", "mq3v2_q8x_v3_b3");
+pub const GEMV_MQ3G256V2_Q8X_V3_B3_RES_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("3", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v3_b3_res");
+pub const GEMV_MQ3G256V2_Q8X_V3_B4_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("4", "", "mq3v2_q8x_v3_b4");
+pub const GEMV_MQ3G256V2_Q8X_V3_B4_RES_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("4", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v3_b4_res");
+pub const GEMV_MQ3G256V2_Q8X_V3_B5_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("5", "", "mq3v2_q8x_v3_b5");
+pub const GEMV_MQ3G256V2_Q8X_V3_B5_RES_SRC: &str =
+    gemv_mq3g256v2_q8x_v3_source!("5", "#define Q8X_RESIDUAL 1\n", "mq3v2_q8x_v3_b5_res");
+
 pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
@@ -9440,6 +9506,20 @@ pub const ATTENTION_FLASH_REDUCE_DSPLIT_GFX1201_SRC: &str =
 /// GQA group 6, tile 128, window 0. gfx1100 only.
 pub const ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_gqa.gfx1100.hip");
+/// Paged (KVMem) twin of [`ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC`]: the
+/// same file assembled against the paged `KvSlotDesc` header, which selects
+/// the `attention_flash_q8_0_tile_gqa_paged_gfx1100` entry (one block-table
+/// lookup per 128-key tile; a spilled page publishes the empty partial).
+/// Same partials as the legacy entry for resident pages, so the shared
+/// `attention_flash_asym_reduce_batched` consumes both unchanged.
+pub fn attention_flash_q8_0_tile_gqa_paged_source() -> String {
+    // The GQA body includes only `kv_slot_desc.h` from the kernel tree (no
+    // turbo/givens helpers), so the paged header is the whole substitution:
+    // it defines `HIPFIRE_KV_SLOT_PAGED` and thereby selects the paged entry.
+    let stripped =
+        ATTENTION_FLASH_Q8_0_TILE_GQA_GFX1100_SRC.replace("#include \"kv_slot_desc.h\"", "");
+    format!("{}\n{}", KV_SLOT_DESC_PAGED_H, stripped)
+}
 /// Load-ahead decode reduce + gate + AWQ MQ rotation
 /// (`attention_flash_q8_0_reduce_gated_mq_rotate_awq_dec_gfx1100`):
 /// byte-identical to [`ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1100_SRC`]
@@ -9511,6 +9591,24 @@ pub const ATTENTION_VERIFY_GQA_GFX1201_SRC: &str =
 /// by 16-query tile count + `attention_verify_wmma_reduce_gfx1100`.
 pub const ATTENTION_VERIFY_WMMA_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/attention_verify_wmma.gfx1100.hip");
+
+/// Paged (slot-engine) variant of [`ATTENTION_VERIFY_WMMA_GFX1100_SRC`] for
+/// KVMem-spilled Q8 KV: the paged `KvSlotDesc` header (which defines
+/// `HIPFIRE_KV_SLOT_PAGED` and thereby the extra `slot_descs`/`row_slot`
+/// ABI + block-table addressing) plus the same body, with the three QT
+/// kernels renamed so they never share a function slot or JIT cache entry
+/// with the descriptor-less default module. The reduce kernel is shared
+/// verbatim — its ABI and arithmetic never touch KV — so it keeps its name
+/// and is also exported from this module.
+pub fn attention_verify_wmma_paged_source() -> String {
+    format!(
+        "#define attention_verify_wmma_q8_qt1_gfx1100 attention_verify_wmma_q8_qt1_paged_gfx1100\n\
+         #define attention_verify_wmma_q8_qt2_gfx1100 attention_verify_wmma_q8_qt2_paged_gfx1100\n\
+         #define attention_verify_wmma_q8_qt3_gfx1100 attention_verify_wmma_q8_qt3_paged_gfx1100\n\
+         {}{}",
+        KV_SLOT_DESC_PAGED_H, ATTENTION_VERIFY_WMMA_GFX1100_SRC
+    )
+}
 pub const ATTENTION_VERIFY_GQA_GFX1100_SRC: &str = concat!(
     "#define VA_TURBO_COMMON_INLINED 1\n",
     include_str!("../../../kernels/src/turbo_common.h"),
@@ -10683,6 +10781,11 @@ pub const DEINTERLEAVE_SRC: &str = include_str!("../../../kernels/src/deinterlea
 /// Batched deinterleave: same as DEINTERLEAVE but processes N tokens in one launch.
 pub const DEINTERLEAVE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deinterleave_batched.hip");
+
+/// KVMem statistics tap: copy the post-norm/pre-RoPE Q/K rows of one
+/// FullAttention layer before RoPE rotates them in place. Launcher lives in
+/// `kvmem_tap.rs`.
+pub const KVMEM_TAP_SRC: &str = include_str!("../../../kernels/src/kvmem_tap.hip");
 
 /// T-C Halo prefill fusion: batched deinterleave with the FullAttention Q
 /// RMSNorm folded in (gate passes through). See
