@@ -2672,13 +2672,7 @@ impl SlotBackend {
             let _ = stdout.flush();
             return Ok(());
         };
-        if !batch_mark_ready_with_pending(
-            id,
-            attempt_id,
-            admission,
-            ticket,
-            pending_done.clone(),
-        ) {
+        if !batch_mark_ready_with_pending(id, attempt_id, admission, ticket, pending_done.clone()) {
             // The staged done can never be committed: the registry does not
             // recognize this lane as the producer. Fail the request now rather
             // than publish a terminal that the daemon will later abort.
