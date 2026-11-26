@@ -830,9 +830,7 @@ fn cold_continuation_requeues_the_previous_lane_owner() {
     let generation =
         hipfire_engine::terminal::batch_announce_terminal(id, attempt_id).expect("admission");
     assert!(hipfire_engine::terminal::batch_transition_to_queued(
-        id,
-        attempt_id,
-        generation
+        id, attempt_id, generation
     ));
     // The first pass owns lane 0.
     let first = LaneTicket {
@@ -852,10 +850,7 @@ fn cold_continuation_requeues_the_previous_lane_owner() {
     assert!(!batch_bind_active(id, attempt_id, generation, next));
     // Requeueing the previous owner lets the continuation bind and commit.
     assert!(hipfire_engine::terminal::batch_requeue_active(
-        id,
-        attempt_id,
-        generation,
-        first
+        id, attempt_id, generation, first
     ));
     assert!(batch_bind_active(id, attempt_id, generation, next));
     let pending = serde_json::json!({
@@ -864,23 +859,11 @@ fn cold_continuation_requeues_the_previous_lane_owner() {
         "attempt_id": attempt_id,
     });
     assert!(batch_mark_ready_with_pending(
-        id,
-        attempt_id,
-        generation,
-        next,
-        pending
+        id, attempt_id, generation, next, pending
     ));
-    hipfire_engine::terminal::batch_apply_terminal_control(
-        "commit",
-        id,
-        attempt_id,
-    );
+    hipfire_engine::terminal::batch_apply_terminal_control("commit", id, attempt_id);
     assert_eq!(
-        hipfire_engine::terminal::batch_poll_decision(
-            id,
-            attempt_id,
-            generation
-        ),
+        hipfire_engine::terminal::batch_poll_decision(id, attempt_id, generation),
         Some(ClientTerminalDecision::Commit)
     );
     batch_clear_all_terminals();
