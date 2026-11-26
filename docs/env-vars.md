@@ -1109,6 +1109,7 @@ KVMem keeps a small per-slot paged KV pool and spills the rest to a host store; 
 | `HIPFIRE_KVMEM_LRFU` / `_LRFU_LAMBDA` / `_LRFU_TOP` | `0` / `0.5` / `0.9` | Decaying heavy-hitter history replaces the raw retrieval score (requires `retrieval`). |
 | `HIPFIRE_KVMEM_BATCH_XFER` | `1` | Batched pinned-slab spill/restore; `0` is the per-page blocking path (byte-identical). |
 | `HIPFIRE_KVMEM_GQA_DECODE` | `1` | Native q8 GQA decode kernel; `0` is the generic route. |
+| `HIPFIRE_KVMEM_HEAD_LIVE` | `0` (off) | Legacy MTP head: page the live head KV through the composite aux plane (128-token placeholder, no contiguous window). Requires `--spec mtp`; Layerwise already pages the head. |
 | `HIPFIRE_KVMEM_HOST_BYTES` | 16 GiB | Host KV storage account (RAM tier). |
 | `HIPFIRE_KVMEM_SPILL_DIR` / `HIPFIRE_KVMEM_SPILL_BYTES` | unset (RAM only) / 64 GiB | Disk spill tier directory and capacity (tiered storage instead of RAM-only). |
 | `HIPFIRE_KVMEM_RECALL_STRATEGY` | `legacy` | `legacy` (global page policy, default) or `layerwise` (per-layer selection with import/checkpoint semantics; fail-closed rejects the global policy knobs). |
@@ -1119,6 +1120,11 @@ KVMem keeps a small per-slot paged KV pool and spills the rest to a host store; 
 | `HIPFIRE_KVMEM_CHECKPOINT_POLICY` | unset (`spread` opt-in) | `spread` enables the coverage-retention policy below; unset keeps every cataloged checkpoint. |
 | `HIPFIRE_KVMEM_CHECKPOINT_COUNT` / `_MIB` / `_INTERVAL` / `_MIN_GAP` | `4` / `512` / `4096` / `0` | Retention caps for the spread policy: count, unique host bytes, frontier spacing, minimum gap. |
 | `HIPFIRE_KVMEM_CONTENT_GROUPS` | `0` (off, 0..1024) | Internal content groups in the prefix directory; whole-group LRU retirement and dedup before entry trimming. |
+| `HIPFIRE_KVMEM_DN_HOST_MIB` | `512` (`0` disables) | Host-memory ring of page-aligned DeltaNet checkpoints; the fallback when the GPU checkpoint pool misses. |
+| `HIPFIRE_KVMEM_DN_RING_DIR` | unset | Explicit persistent DN ring directory (DNR1 files). Setting it defaults `DN_DISK_MIB` to 512. |
+| `HIPFIRE_KVMEM_DN_DISK_MIB` | `0` (or 512 with an explicit ring dir) | Disk mirror capacity for the DN ring. Without an explicit ring dir the files live in `<CACHE_DIR>/dn-ring`. |
+| `HIPFIRE_KVMEM_DN_IDLE` | `0` (off) | Whole-image DeltaNet demotion for idle sessions between turns; exact session/frontier/fingerprint restore. Active decode remains device-resident. |
+| `HIPFIRE_KVMEM_DN_GPU` | `1` | Developer knob: `0` skips GPU checkpoint-pool writes to force the host-ring restore path. |
 | `HIPFIRE_KVMEM_CACHE_DIR` / `HIPFIRE_KVMEM_CACHE_BYTES` | unset / 2 GiB | Persistent content-pack tier (named `*.hkpack` files + DN sidecars). Must differ from `SPILL_DIR`; packs are the only persistent copy (single-tier). The byte cap covers packs **and** their `.dn` sidecars; LRU eviction removes the pair together. |
 | `HIPFIRE_KVMEM_TRACE` / `_TRACE_PAGES` / `_TRACE_KEEP` | off | Per-step residency / picked-page / keep-set traces (diagnostics, zero effect on bytes). |
 | `HIPFIRE_KVMEM_VERIFY` / `HIPFIRE_KVMEM_TIME` / `HIPFIRE_KVMEM_TAP_COPY` | off / off / `1` | Page checksums + block-table readback, per-step timing lines, and the tap-copy kill switch (timing only). |
@@ -2265,11 +2271,17 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_KVMEM_CHECKPOINT_MIN_GAP` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 | `HIPFIRE_KVMEM_CHECKPOINT_POLICY` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 | `HIPFIRE_KVMEM_CONTENT_GROUPS` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-config/src/kvmem.rs | developer |
+| `HIPFIRE_KVMEM_DN_DISK_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
+| `HIPFIRE_KVMEM_DN_GPU` | crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs | developer |
+| `HIPFIRE_KVMEM_DN_HOST_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl/plan.rs, crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs | developer |
+| `HIPFIRE_KVMEM_DN_IDLE` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
+| `HIPFIRE_KVMEM_DN_RING_DIR` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
 | `HIPFIRE_KVMEM_GEN_RESERVE` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
 | `HIPFIRE_KVMEM_GPU_HIGH` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
 | `HIPFIRE_KVMEM_GPU_HIGH_WATERMARK` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
 | `HIPFIRE_KVMEM_GPU_LOW_WATERMARK` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
 | `HIPFIRE_KVMEM_GQA_DECODE` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
+| `HIPFIRE_KVMEM_HEAD_LIVE` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs | developer |
 | `HIPFIRE_KVMEM_HOST_BYTES` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-config/src/kvmem.rs | developer |
 | `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_DISK_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |
 | `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |

@@ -1605,10 +1605,269 @@ pub(crate) fn lloyd_mmq_lut_route(gpu: &Gpu) -> bool {
             != Some("1")
 }
 
+/// Row shapes whose qt52 gfx11 MMQ-LUT wrapper stays allocation-free during
+/// graph capture. `N < 64` records a fixed per-row GEMV loop; `N % 128 == 0`
+/// takes the direct prequant MMQ path. Other positive shapes use the eager
+/// pad-to-128 wrapper and must not be captured.
+#[inline]
+pub const fn mq4v2_lloyd_mmq_graph_shape_admitted(n: usize) -> bool {
+    n != 0 && (n < 64 || n % 128 == 0)
+}
+
+/// Full qt52 graph capability for the gfx11 MMQ-LUT route. gfx1201 remains
+/// eager-only because its FP8-LUT launchers explicitly reject capture/replay.
+#[inline]
+pub fn mq4v2_lloyd_mmq_graph_admitted(gpu: &Gpu, n: usize) -> bool {
+    lloyd_mmq_lut_route(gpu) && mq4v2_lloyd_mmq_graph_shape_admitted(n)
+}
+
 /// True when all listed projection dtypes are the Lloyd-V2 dtype.
 #[inline]
 pub(crate) fn all_mq4v2_lloyd(dts: &[DType]) -> bool {
     dts.iter().all(|d| matches!(d, DType::MQ4G256V2Lloyd))
+}
+
+fn require_mq4v2_lloyd(weights: &[&WeightRef<'_>], family: &str) -> HipResult<()> {
+    if weights
+        .iter()
+        .all(|w| matches!(w.dtype, DType::MQ4G256V2Lloyd))
+    {
+        Ok(())
+    } else {
+        Err(HipError::new(
+            0,
+            &format!(
+                "{family}: mixed MQ4G256V2Lloyd/uniform projections are not supported; \
+                 quantize the whole projection group to one dtype"
+            ),
+        ))
+    }
+}
+
+fn mq4v2_lloyd_no_route(gpu: &Gpu, family: &str) -> HipError {
+    HipError::new(
+        0,
+        &format!(
+            "{family}: MQ4G256V2Lloyd has no batched LUT route on {} \
+             (supported: gfx1100/gfx1151 MMQ-LUT, gfx1201 FP8-LUT)",
+            gpu.arch
+        ),
+    )
+}
+
+/// Batched DeltaNet `qkvza` for a uniform MQ4G256V2Lloyd group.
+///
+/// The slot engine owns its norm/rotation producer, so `x` must already be in
+/// the FWHT-G256 basis. This is the thin multi-slot twin of the existing
+/// single-sequence prefill arm: gfx11 uses MMQ-LUT, gfx12 uses FP8-LUT, and
+/// every other architecture / mixed group fails closed.
+#[allow(clippy::too_many_arguments)]
+pub fn run_mq4v2_lloyd_qkvza(
+    gpu: &mut Gpu,
+    wqkv: &WeightRef<'_>,
+    wz: &WeightRef<'_>,
+    w_beta: &WeightRef<'_>,
+    w_alpha: &WeightRef<'_>,
+    x: &GpuTensor,
+    y_qkv: &GpuTensor,
+    y_z: &GpuTensor,
+    y_beta: &GpuTensor,
+    y_alpha: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    const FAMILY: &str = "forward_batch_slots: DeltaNet qkvza";
+    require_mq4v2_lloyd(&[wqkv, wz, w_beta, w_alpha], FAMILY)?;
+    if lloyd_mmq_lut_route(gpu) {
+        gpu.gemm_qkvza_mq4g256v2_mmq_lloyd(
+            &wqkv.buf,
+            &wz.buf,
+            &w_beta.buf,
+            &w_alpha.buf,
+            x,
+            y_qkv,
+            y_z,
+            y_beta,
+            y_alpha,
+            wqkv.m,
+            wz.m,
+            w_beta.m,
+            w_alpha.m,
+            wqkv.k,
+            n,
+            lloyd_c16_or_fail(wqkv, FAMILY)?,
+            lloyd_c16_or_fail(wz, FAMILY)?,
+            lloyd_c16_or_fail(w_beta, FAMILY)?,
+            lloyd_c16_or_fail(w_alpha, FAMILY)?,
+        )
+    } else if gpu.arch.as_str() == "gfx1201" {
+        gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
+            &wqkv.buf,
+            &wz.buf,
+            &w_beta.buf,
+            &w_alpha.buf,
+            x,
+            y_qkv,
+            y_z,
+            y_beta,
+            y_alpha,
+            wqkv.m,
+            wz.m,
+            w_beta.m,
+            w_alpha.m,
+            wqkv.k,
+            n,
+            1,
+            lloyd_e4m3_or_fail(wqkv, FAMILY)?,
+            lloyd_e4m3_or_fail(wz, FAMILY)?,
+            lloyd_e4m3_or_fail(w_beta, FAMILY)?,
+            lloyd_e4m3_or_fail(w_alpha, FAMILY)?,
+        )
+    } else {
+        Err(mq4v2_lloyd_no_route(gpu, FAMILY))
+    }
+}
+
+/// Batched FullAttention `qkv` for a uniform MQ4G256V2Lloyd group.
+#[allow(clippy::too_many_arguments)]
+pub fn run_mq4v2_lloyd_qkv(
+    gpu: &mut Gpu,
+    wq: &WeightRef<'_>,
+    wk: &WeightRef<'_>,
+    wv: &WeightRef<'_>,
+    x: &GpuTensor,
+    y_q: &GpuTensor,
+    y_k: &GpuTensor,
+    y_v: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    const FAMILY: &str = "forward_batch_slots: FullAttn qkv";
+    require_mq4v2_lloyd(&[wq, wk, wv], FAMILY)?;
+    if lloyd_mmq_lut_route(gpu) {
+        gpu.gemm_qkv_mq4g256v2_mmq_lloyd(
+            &wq.buf,
+            &wk.buf,
+            &wv.buf,
+            x,
+            y_q,
+            y_k,
+            y_v,
+            wq.m,
+            wk.m,
+            wv.m,
+            wq.k,
+            n,
+            lloyd_c16_or_fail(wq, FAMILY)?,
+            lloyd_c16_or_fail(wk, FAMILY)?,
+            lloyd_c16_or_fail(wv, FAMILY)?,
+        )
+    } else if gpu.arch.as_str() == "gfx1201" {
+        gpu.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
+            &wq.buf,
+            &wk.buf,
+            &wv.buf,
+            x,
+            y_q,
+            y_k,
+            y_v,
+            wq.m,
+            wk.m,
+            wv.m,
+            wq.k,
+            n,
+            1,
+            lloyd_e4m3_or_fail(wq, FAMILY)?,
+            lloyd_e4m3_or_fail(wk, FAMILY)?,
+            lloyd_e4m3_or_fail(wv, FAMILY)?,
+        )
+    } else {
+        Err(mq4v2_lloyd_no_route(gpu, FAMILY))
+    }
+}
+
+/// Batched dense-FFN `gate_up` for a uniform MQ4G256V2Lloyd group.
+#[allow(clippy::too_many_arguments)]
+pub fn run_mq4v2_lloyd_gate_up(
+    gpu: &mut Gpu,
+    w_gate: &WeightRef<'_>,
+    w_up: &WeightRef<'_>,
+    x: &GpuTensor,
+    y_gate: &GpuTensor,
+    y_up: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    const FAMILY: &str = "forward_batch_slots: dense FFN gate_up";
+    require_mq4v2_lloyd(&[w_gate, w_up], FAMILY)?;
+    if lloyd_mmq_lut_route(gpu) {
+        gpu.gemm_gate_up_mq4g256v2_mmq_lloyd(
+            &w_gate.buf,
+            &w_up.buf,
+            x,
+            y_gate,
+            y_up,
+            w_gate.m,
+            w_up.m,
+            w_gate.k,
+            n,
+            lloyd_c16_or_fail(w_gate, FAMILY)?,
+            lloyd_c16_or_fail(w_up, FAMILY)?,
+        )
+    } else if gpu.arch.as_str() == "gfx1201" {
+        gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
+            &w_gate.buf,
+            &w_up.buf,
+            x,
+            y_gate,
+            y_up,
+            w_gate.m,
+            w_up.m,
+            w_gate.k,
+            n,
+            1,
+            lloyd_e4m3_or_fail(w_gate, FAMILY)?,
+            lloyd_e4m3_or_fail(w_up, FAMILY)?,
+        )
+    } else {
+        Err(mq4v2_lloyd_no_route(gpu, FAMILY))
+    }
+}
+
+/// Batched residual projection for MQ4G256V2Lloyd.
+///
+/// `x` must already be FWHT-G256 rotated when the caller used the fused
+/// SwiGLU+rotate producer. The wrapper preserves residual ADD semantics.
+pub fn run_mq4v2_lloyd_residual(
+    gpu: &mut Gpu,
+    w: &WeightRef<'_>,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    const FAMILY: &str = "forward_batch_slots: Lloyd residual";
+    require_mq4v2_lloyd(&[w], FAMILY)?;
+    if lloyd_mmq_lut_route(gpu) {
+        gpu.gemm_hfq4g256_residual_mmq_lloyd(
+            &w.buf,
+            x,
+            y,
+            w.m,
+            w.k,
+            n,
+            lloyd_c16_or_fail(w, FAMILY)?,
+        )
+    } else if gpu.arch.as_str() == "gfx1201" {
+        gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd(
+            &w.buf,
+            x,
+            y,
+            w.m,
+            w.k,
+            n,
+            1,
+            lloyd_e4m3_or_fail(w, FAMILY)?,
+        )
+    } else {
+        Err(mq4v2_lloyd_no_route(gpu, FAMILY))
+    }
 }
 
 /// #397 Ship 5.2 slice 2: route a single BATCHED-prefill FUSED gate+up GEMM
@@ -2677,6 +2936,16 @@ pub(crate) fn execute_swiglu_ffn_batched(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mq4v2_lloyd_graph_shape_gate_matches_mmq_wrapper() {
+        for n in [1, 2, 4, 16, 63, 128, 256] {
+            assert!(mq4v2_lloyd_mmq_graph_shape_admitted(n), "N={n}");
+        }
+        for n in [0, 64, 65, 127, 129, 255, 257] {
+            assert!(!mq4v2_lloyd_mmq_graph_shape_admitted(n), "N={n}");
+        }
+    }
 
     /// ECSQ-5 §6 regression: `HIPFIRE_IU4_PREFILL=0` plus
     /// `HIPFIRE_GFX12_MQ4V2_FP8_{GATEUP,RESID,QKVZA,QKV}=0` gave WT2 KLD 11.74

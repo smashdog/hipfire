@@ -1576,6 +1576,9 @@ pub(super) fn admit(
             }
         }
     }
+    // S2: a cold admit never installs a stale idle recurrent image; the
+    // prefix/cold path will build the new state itself.
+    kvmem_hooks::drop_idle_dn(rig, slot.0);
     rig.sample_params[slot.0] = sample_params;
     // A prefix-cache hit's shared pages are already radix-owned up to
     // `reused`; seed both the session and the InFlight so this request's

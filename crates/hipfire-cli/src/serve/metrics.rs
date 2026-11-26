@@ -559,6 +559,96 @@ impl Metrics {
                 );
                 gauge(
                     &mut out,
+                    "hipfire_kvmem_trunk_managed",
+                    "1 when trunk full-attention KV is page-managed by KVMem.",
+                    flag(s.kvmem.trunk_managed),
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_mtp_head_managed",
+                    "1 when the MTP head KV lives on the KVMem auxiliary plane.",
+                    flag(s.kvmem.mtp_head_managed),
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_mtp_head_history_managed",
+                    "1 when the MTP head KV is captured in KVMem history images (Legacy park image or Layerwise aux plane).",
+                    flag(s.kvmem.mtp_head_history_managed),
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_dn_state_managed",
+                    "1 when the DeltaNet recurrent state is KVMem-tiered.",
+                    flag(s.kvmem.dn_state_managed),
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_dn_state_bytes",
+                    "Live DeltaNet recurrent/conv state bytes held by engine slots.",
+                    s.kvmem.dn_state_bytes as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_dn_state_slots",
+                    "Slots holding a live DeltaNet recurrent state.",
+                    s.kvmem.dn_state_slots as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_dn_checkpoints",
+                    "Page-aligned recurrent checkpoints in the engine pool.",
+                    s.kvmem.dn_checkpoints as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_dn_checkpoint_bytes",
+                    "Device bytes held by the recurrent checkpoint pool.",
+                    s.kvmem.dn_checkpoint_bytes as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_state_images",
+                    "Retained DN/DFlash/MTP state images.",
+                    s.kvmem.state_images as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_state_host_bytes",
+                    "Host bytes charged by retained state images.",
+                    s.kvmem.state_host_bytes as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_state_demotions_total",
+                    "Live-to-image state demotions since engine start.",
+                    s.kvmem.state_demotions as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_state_promotions_total",
+                    "Image-to-live state promotions since engine start.",
+                    s.kvmem.state_promotions as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_state_restores_total",
+                    "Successful state-image installs since engine start.",
+                    s.kvmem.state_restores as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_dflash_managed",
+                    "1 when the DFlash draft-context KV is KVMem-managed.",
+                    flag(s.kvmem.dflash_managed),
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_media_pins",
+                    "1 when live image spans are mandatory pinned pages.",
+                    flag(s.kvmem.media_pins),
+                );
+                gauge(
+                    &mut out,
                     "hipfire_kvmem_host_bytes",
                     "KVMem host storage charged bytes (live + sealed payload + metadata).",
                     s.kvmem.host_charged_bytes as f64,
@@ -694,6 +784,18 @@ impl Metrics {
                     "hipfire_kvmem_draft_image_misses_total",
                     "Prefix reuses with no restorable DFlash2 draft image (draft reseeds).",
                     s.kvmem.draft_image_misses,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_draft_sidecars",
+                    "On-disk DFlash draft images riding with prefix packs.",
+                    s.kvmem.draft_sidecars as f64,
+                );
+                gauge(
+                    &mut out,
+                    "hipfire_kvmem_draft_sidecar_bytes",
+                    "On-disk DFlash draft image bytes charged to the content cache cap.",
+                    s.kvmem.draft_sidecar_bytes as f64,
                 );
                 gauge(
                     &mut out,

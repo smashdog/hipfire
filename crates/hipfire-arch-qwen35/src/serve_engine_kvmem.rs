@@ -7,7 +7,7 @@
 // scheduling and batch execution stay in `serve_engine.rs`.
 
 use super::EngineConfig;
-use crate::qwen35::LayerType;
+use crate::qwen35::{DeltaNetState, LayerType};
 use hipfire_runtime::scheduler::{PendingWork, SpecKind};
 use hipfire_runtime::session_table::SessionId;
 use hipfire_runtime::slot_batch::SlotBatch;
@@ -49,6 +49,29 @@ pub(super) fn kvmem_session_media(rig: &Rig, session: SessionId) -> (Option<u64>
             .map(|s| (s.begin as u32, s.end as u32))
             .collect();
     (sess.media_digest, spans)
+}
+
+/// Canonical history pages a live image span occupies. Legacy pressure and
+/// Query selection pin exactly these pages, mirroring the Layerwise rule that
+/// media groups are indivisible. Restricted to the sealed prefix `[0, fed)`.
+#[cfg(feature = "kvmem")]
+fn legacy_media_pages(rig: &Rig, fed: u64, session: SessionId) -> Vec<u32> {
+    let (_, spans) = kvmem_session_media(rig, session);
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let spans: Vec<crate::kvmem_media::MediaSpan> = spans
+        .into_iter()
+        .map(|(begin, end)| crate::kvmem_media::MediaSpan {
+            begin: begin as u64,
+            end: end as u64,
+        })
+        .collect();
+    let block = crate::kvmem_ctl::KV_BLOCK_TOKENS as u64;
+    crate::kvmem_media::pages_from_spans(&spans, block, fed / block)
+        .into_iter()
+        .map(|p| p as u32)
+        .collect()
 }
 
 /// P2.2b2: freeze the canonical host prefix, release displaced GPU refs and PIN
@@ -145,6 +168,30 @@ pub(super) fn kvmem_catalog_and_pin(
             }
             None => {}
         }
+        // P3: persist the captured image beside the pack (`.draft`), so a
+        // restart/eviction reuse can reinstate draft conditioning instead of
+        // reseeding. Written after the pack exists; the content cap covers it.
+        if let (Some(pack), Some(img)) = (
+            ctl.prefix_pack_path(id),
+            ctl.prefix_checkpoint(id)
+                .and_then(|c| c.draft_image.as_ref()),
+        ) {
+            match img.encode() {
+                Ok(bytes) => {
+                    let path = crate::kvmem_prefix::draft_sidecar_path(&pack);
+                    let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+                    match std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &path)) {
+                        Ok(()) => ctl.note_draft_sidecar(&pack, bytes.len() as u64),
+                        Err(e) => eprintln!(
+                            "[kvmem-draft-image] sidecar write skipped at {boundary}: {e}"
+                        ),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[kvmem-draft-image] sidecar encode skipped at {boundary}: {e}")
+                }
+            }
+        }
     }
     // 期3 G3 P1.1 dn-persist: co-locate the recurrent state with the pack.
     // Live-frontier freezes export the live DN state; endpoint/coverage
@@ -181,11 +228,26 @@ pub(super) fn kvmem_catalog_and_pin(
                         .and_then(|pool| pool.peek(domain, boundary as u64, fp))
                     {
                         Some(snapshot) => snapshot.export_host(&rig.gpu),
-                        None => Err("no recurrent checkpoint at the frozen frontier".to_string()),
+                        // P2: the host ring is the fallback when the GPU pool
+                        // no longer holds the boundary (evicted or disabled).
+                        None => ctl
+                            .dn_checkpoint(boundary as u64, fp)
+                            .map(|bytes| bytes.to_vec())
+                            .ok_or_else(|| {
+                                "no recurrent checkpoint at the frozen frontier".to_string()
+                            }),
                     }
                 };
                 match exported {
                     Ok(bytes) => {
+                        // P2: every frozen pack has an exact page-aligned DN
+                        // image; retain it in the host ring so reuse does not
+                        // depend on the GPU checkpoint pool still holding it.
+                        let fp = crate::checkpoint::checkpoint_fingerprint(
+                            &tokens[..boundary as usize],
+                            media_digest,
+                        );
+                        ctl.note_dn_checkpoint(boundary as u64, fp, bytes.clone());
                         let tmp = std::path::PathBuf::from(format!("{}.tmp", dn_path.display()));
                         match std::fs::write(&tmp, &bytes)
                             .and_then(|_| std::fs::rename(&tmp, &dn_path))
@@ -257,35 +319,89 @@ pub(super) fn kvmem_coverage_capture(
         }
         let tokens: Vec<u32> = sess.tokens[..boundary as usize].to_vec();
         let fp = crate::checkpoint::checkpoint_fingerprint(&tokens, None);
-        let model = &mut rig.model;
-        let Some(pool) = model.checkpoint_pool.as_mut() else {
-            continue;
+        // P2: export the live recurrent state into the host ring even when the
+        // GPU pool refuses (or is disabled for the run). The ring is the
+        // ownership tier; the pool is only a fast-restore cache.
+        let dn_host = if rig
+            .model
+            .kvmem
+            .as_ref()
+            .is_some_and(|ctl| ctl.dn_ring_enabled())
+        {
+            match crate::speculative::DeltaNetSnapshot::export_host_from_state(
+                &rig.gpu,
+                &rig.model.dn_states[s],
+            ) {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    eprintln!("[kvmem-dn] host export skipped at {fed}: {e}");
+                    None
+                }
+            }
+        } else {
+            None
         };
-        if pool.peek(&domain, fed, fp).is_some() {
-            continue;
+        let gpu_pool =
+            hipfire_config::developer_var("HIPFIRE_KVMEM_DN_GPU").map_or(true, |v| v.trim() != "0");
+        let mut stored = false;
+        {
+            let model = &mut rig.model;
+            let Some(pool) = model.checkpoint_pool.as_mut() else {
+                if let Some(bytes) = dn_host {
+                    if let Some(ctl) = model.kvmem.as_mut() {
+                        ctl.note_dn_checkpoint(fed, fp, bytes);
+                        stored = true;
+                    }
+                }
+                if stored {
+                    if let Some(f) = slots[s].as_mut() {
+                        f.last_coverage_boundary = fed as usize;
+                    }
+                }
+                continue;
+            };
+            if pool.peek(&domain, fed, fp).is_some() {
+                // The GPU pool already owns this boundary; the host ring is a
+                // fallback, not a duplicate.
+                continue;
+            }
+            if gpu_pool {
+                let state = &model.dn_states[s];
+                match crate::checkpoint::capture_checkpoint(
+                    &mut rig.gpu,
+                    pool,
+                    &domain,
+                    fed,
+                    &tokens,
+                    None, // coverage is text-only (vision sessions skip it)
+                    state,
+                ) {
+                    Ok(id) if id == crate::checkpoint::CheckpointId::NONE => {
+                        // Pool ceiling refused capture; the host ring below is
+                        // still a valid anchor.
+                    }
+                    Ok(_) => stored = true,
+                    Err(e) => eprintln!("[kvmem-prefix] coverage capture skipped: {e:?}"),
+                }
+            }
         }
-        let state = &model.dn_states[s];
-        match crate::checkpoint::capture_checkpoint(
-            &mut rig.gpu,
-            pool,
-            &domain,
-            fed,
-            &tokens,
-            None, // coverage is text-only (vision sessions skip it)
-            state,
-        ) {
-            Ok(id) if id == crate::checkpoint::CheckpointId::NONE => {
-                // Pool ceiling refused capture; the boundary stays unreusable.
-            }
-            Ok(_) => {
-                if let Some(f) = slots[s].as_mut() {
-                    f.last_coverage_boundary = fed as usize;
-                }
+        if let Some(bytes) = dn_host {
+            let len = bytes.len();
+            if let Some(ctl) = rig.model.kvmem.as_mut() {
+                ctl.note_dn_checkpoint(fed, fp, bytes);
+                stored = true;
                 if rig.gpu.slot_trace() {
-                    eprintln!("[kvmem-prefix] slot {s} coverage checkpoint at {fed}");
+                    eprintln!("[kvmem-prefix] slot {s} host DN checkpoint at {fed} ({len} B)");
                 }
             }
-            Err(e) => eprintln!("[kvmem-prefix] coverage capture skipped: {e:?}"),
+        }
+        if stored {
+            if let Some(f) = slots[s].as_mut() {
+                f.last_coverage_boundary = fed as usize;
+            }
+            if rig.gpu.slot_trace() {
+                eprintln!("[kvmem-prefix] slot {s} coverage checkpoint at {fed}");
+            }
         }
     }
 }
@@ -427,7 +543,7 @@ pub(super) struct LegacyNativeImage {
 
 #[cfg(feature = "kvmem")]
 impl LegacyNativeImage {
-    fn auxiliary_bytes(&self) -> Result<usize, String> {
+    pub(super) fn auxiliary_bytes(&self) -> Result<usize, String> {
         let draft = match &self.draft {
             LegacyDraftImage::None => 0,
             LegacyDraftImage::Mtp(image) => image.host_bytes(),
@@ -443,6 +559,10 @@ impl LegacyNativeImage {
         matches!(
             (kind, &self.draft),
             (SpecKind::None, _)
+                // P1b: a bounded live Legacy head archives only the composite
+                // aux plane, so its history image carries no private head
+                // payload; the window is refilled from the trunk store.
+                | (SpecKind::Mtp, LegacyDraftImage::None)
                 | (SpecKind::Mtp, LegacyDraftImage::Mtp(_))
                 | (SpecKind::Dflash, LegacyDraftImage::Dflash(_))
         ) || self.store.frontier == 0
@@ -475,6 +595,11 @@ fn capture_legacy_native_image(
     let frontier = ctl
         .fed_tokens(slot)
         .ok_or("kvmem: snapshot slot out of range")? as usize;
+    // P1b: a bounded live head holds only the recent window; the full-history
+    // park image cannot represent it (payload_lengths requires
+    // frontier <= capacity). The composite aux pages in the native store carry
+    // the head history instead, and the window is refilled from them on reuse.
+    let head_live = ctl.head_live_enabled();
     let dn = crate::speculative::DeltaNetSnapshot::export_host_from_state(
         &rig.gpu,
         &rig.model.dn_states[slot],
@@ -484,6 +609,7 @@ fn capture_legacy_native_image(
     } else {
         match kind {
             SpecKind::None => LegacyDraftImage::None,
+            SpecKind::Mtp if head_live => LegacyDraftImage::None,
             SpecKind::Mtp => LegacyDraftImage::Mtp(crate::legacy_draft::LegacyMtpImage::capture(
                 &rig.gpu,
                 rig.model.mtp_states[slot]
@@ -574,6 +700,11 @@ pub(super) fn park_legacy_history(
     // persist, so the capture either proves its native frontier or reports a
     // miss (then the target-only image is parked).
     let run_kind = rig.legacy_spec_kind[slot.0];
+    let head_live = rig
+        .model
+        .kvmem
+        .as_ref()
+        .is_some_and(|ctl| ctl.head_live_enabled());
     if run_kind == SpecKind::Dflash {
         // The idle slot may still hold the last cycle's unconsumed draft
         // (request-local scratch). Park only the published conditioning state.
@@ -581,7 +712,7 @@ pub(super) fn park_legacy_history(
             crate::dflash_slot::dflash_abandon_inflight(&mut rig.gpu, st);
         }
     }
-    let image = match capture_legacy_native_image(rig, slot.0, run_kind) {
+    let mut image = match capture_legacy_native_image(rig, slot.0, run_kind) {
         Ok(image) => image,
         Err(e) => {
             eprintln!(
@@ -597,6 +728,38 @@ pub(super) fn park_legacy_history(
             }
         }
     };
+    // S2: an idle slot's recurrent state is a host image, not device scratch.
+    // Move those exact bytes into the native-history image (the catalog then
+    // becomes their only owner); a stale/missing idle image cannot be parked.
+    if rig.model.dn_states[slot.0].is_empty() {
+        match rig.model.dn_idle_images[slot.0].take() {
+            Some(idle)
+                if idle.session == session
+                    && idle.frontier as usize == image.store.frontier as usize =>
+            {
+                image.dn = idle.bytes;
+                eprintln!(
+                    "[kvmem-legacy] HistoryPark slot={} dn_idle=1 bytes={}",
+                    slot.0,
+                    image.dn.len()
+                );
+            }
+            Some(_) => {
+                eprintln!(
+                    "[kvmem-legacy] HistoryPark slot={} idle DN image mismatch at frontier {}; skipped",
+                    slot.0, image.store.frontier
+                );
+                return Ok(None);
+            }
+            None => {
+                eprintln!(
+                    "[kvmem-legacy] HistoryPark slot={} parked DN state unavailable at frontier {}; skipped",
+                    slot.0, image.store.frontier
+                );
+                return Ok(None);
+            }
+        }
+    }
     if image.store.frontier == 0 {
         return Ok(None);
     }
@@ -606,6 +769,7 @@ pub(super) fn park_legacy_history(
         .ok_or("kvmem: history image size overflow")?;
     let source = image.store.frontier as usize;
     let payload = image.store.payload_bytes();
+    let image_dn_bytes = image.dn.len();
     let catalog = rig
         .legacy_history
         .as_mut()
@@ -641,7 +805,104 @@ pub(super) fn park_legacy_history(
         source,
         catalog.len()
     );
+    // P3: the parked image is now the only owner of the draft conditioning.
+    // Release the idle slot's VRAM copy; a later cold catalog restore
+    // reallocates the empty state and reinstalls the image.
+    if run_kind == SpecKind::Dflash {
+        if let Some(state) = rig.model.dflash_states[slot.0].take() {
+            state.free_gpu(&mut rig.gpu);
+            eprintln!("[kvmem-legacy] HistoryPark slot={} draft_freed=1", slot.0);
+        }
+    }
+    // P1: same ownership rule for the MTP head cache. The parked image holds
+    // the full head KV; the idle slot's private copy is redundant. A cold
+    // catalog restore allocates a fresh empty cache and reinstalls the image.
+    // P1b: a bounded live head is NOT full history and must stay on the idle
+    // slot; its composite aux pages travel with the trunk pack instead.
+    let head_live = rig
+        .model
+        .kvmem
+        .as_ref()
+        .is_some_and(|ctl| ctl.head_live_enabled());
+    if run_kind == SpecKind::Mtp && !head_live {
+        if let Some(state) = rig.model.mtp_states[slot.0].take() {
+            state.free_gpu(&mut rig.gpu);
+            eprintln!("[kvmem-legacy] HistoryPark slot={} mtp_freed=1", slot.0);
+        }
+    }
+    // S2: the native-history image also owns the recurrent/conv state. The
+    // idle slot keeps only a tombstone so its VRAM can fund another session;
+    // restore or cold admission reallocates the same representation.
+    let dn_bytes = crate::speculative::DeltaNetSnapshot::bytes_for(&rig.model.dn_states[slot.0]);
+    if dn_bytes > 0 {
+        let quant = rig.model.dn_states[slot.0].quant;
+        let live = std::mem::replace(
+            &mut rig.model.dn_states[slot.0],
+            DeltaNetState::empty(quant),
+        );
+        live.free_gpu(&mut rig.gpu);
+        rig.model.dn_images[slot.0] = Some(crate::kvmem_ctl::StateImageId::new(publication.id));
+        if let Some(ctl) = rig.model.kvmem.as_mut() {
+            ctl.note_state_demotion(dn_bytes);
+        }
+        eprintln!(
+            "[kvmem-legacy] HistoryPark slot={} dn_freed=1 bytes={dn_bytes}",
+            slot.0
+        );
+    } else {
+        // The idle image already left the device and is now owned by the
+        // catalog publication; only its handle moves here.
+        rig.model.dn_images[slot.0] = Some(crate::kvmem_ctl::StateImageId::new(publication.id));
+        eprintln!(
+            "[kvmem-legacy] HistoryPark slot={} dn_idle_owned=1 bytes={image_dn_bytes}",
+            slot.0
+        );
+    }
     Ok(Some(publication.id))
+}
+
+/// S2: give an active slot its live recurrent state again.
+///
+/// `park_legacy_history` replaces the slot's `DeltaNetState` with a tombstone
+/// after publishing the native image, so a cold admission (or a resumed
+/// session) must allocate the representation the image expects before any
+/// forward or restore runs. The image handle is cleared and the promotion is
+/// charged to the state-image ledger; the caller still owns the install.
+#[cfg(feature = "kvmem")]
+pub(super) fn ensure_dn_live(rig: &mut Rig, slot: usize, reason: &str) -> Result<(), String> {
+    if !rig.model.dn_states[slot].is_empty() {
+        return Ok(());
+    }
+    let quant = rig.model.dn_states[slot].quant;
+    let state = DeltaNetState::new_with_quant(&mut rig.gpu, &rig.model.config, quant)
+        .map_err(|e| format!("kvmem: DN state alloc for slot {slot}: {e}"))?;
+    let bytes = crate::speculative::DeltaNetSnapshot::bytes_for(&state);
+    let image = rig.model.dn_images[slot].take();
+    let restoring = reason == "restore";
+    rig.model.dn_states[slot] = state;
+    if restoring {
+        if let Some(ctl) = rig.model.kvmem.as_mut() {
+            if image.is_some() {
+                ctl.note_state_promotion(bytes);
+            }
+        }
+    }
+    if let Some(id) = image {
+        if restoring {
+            eprintln!(
+                "[kvmem-dn] slot={slot} live state promoted image={} bytes={bytes} reason={reason}",
+                id.get()
+            );
+        } else {
+            // The catalog still owns this image; the slot was reused for a
+            // different request, so only the slot-local handle is stale.
+            eprintln!(
+                "[kvmem-dn] slot={slot} parked image handle dropped image={} bytes={bytes} reason={reason}",
+                id.get()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Restore target and draft as one execution frontier. The source stays owned
@@ -660,6 +921,10 @@ pub(super) fn restore_legacy_native_image(
             "kvmem: cached source has no complete {kind:?} history"
         ));
     }
+    // S2: cold admission may reuse a slot whose recurrent state was parked
+    // with the image. Allocate the destination before building the import
+    // scratch so `new_for` sees the real geometry.
+    ensure_dn_live(rig, slot, "restore")?;
     rig.gpu
         .hip
         .device_synchronize()
@@ -688,6 +953,9 @@ pub(super) fn restore_legacy_native_image(
         snapshot
             .restore_to(&mut rig.model.dn_states[slot], &mut rig.gpu)
             .map_err(|e| format!("kvmem restore DN: {e}"))?;
+        if let Some(ctl) = rig.model.kvmem.as_mut() {
+            ctl.note_state_restore();
+        }
         if source.store.frontier == 0 {
             if let Some(state) = rig.model.mtp_states[slot].as_mut() {
                 state
@@ -699,13 +967,37 @@ pub(super) fn restore_legacy_native_image(
             }
         } else {
             match (&source.draft, kind) {
-                (LegacyDraftImage::Mtp(image), SpecKind::Mtp) => image.restore(
-                    &mut rig.gpu,
-                    rig.model.mtp_states[slot]
-                        .as_mut()
-                        .ok_or("kvmem: missing destination MTP state")?,
-                    source.store.frontier as usize,
-                )?,
+                (LegacyDraftImage::Mtp(image), SpecKind::Mtp) => {
+                    // P1: a parked MTP image owns the head KV; the idle slot's
+                    // private cache was freed at park. Allocate the empty
+                    // destination the same way the first prefill chunk would,
+                    // then let the image reinstate it.
+                    if rig.model.mtp_states[slot].is_none() {
+                        let head = rig
+                            .model
+                            .mtp_head
+                            .as_ref()
+                            .ok_or("kvmem: missing destination MTP head")?;
+                        let st = crate::mtp_spec::MtpSpecState::new_for_components(
+                            &mut rig.gpu,
+                            &rig.model.config,
+                            &rig.model.dn_states[slot],
+                            head,
+                            rig.model.mtp_k,
+                            crate::mtp_head::MtpKvMode::Q8,
+                            None,
+                        )
+                        .map_err(|e| format!("kvmem restore MTP state alloc: {e}"))?;
+                        rig.model.mtp_states[slot] = Some(st);
+                    }
+                    image.restore(
+                        &mut rig.gpu,
+                        rig.model.mtp_states[slot]
+                            .as_mut()
+                            .ok_or("kvmem: missing destination MTP state")?,
+                        source.store.frontier as usize,
+                    )?
+                }
                 (LegacyDraftImage::Dflash(image), SpecKind::Dflash) => {
                     // Cold admission frees the previous occupant's draft state;
                     // allocate the empty destination the same way the first
@@ -735,6 +1027,9 @@ pub(super) fn restore_legacy_native_image(
                         session,
                         source.store.frontier as usize,
                     )?
+                }
+                (LegacyDraftImage::None, SpecKind::Mtp) => {
+                    restore_live_head_window(rig, slot, source.store.frontier as usize)?;
                 }
                 (_, SpecKind::None) => {
                     // A non-zero frontier can be restored without a native
@@ -769,6 +1064,44 @@ pub(super) fn restore_legacy_native_image(
     })();
     snapshot.free_gpu(&mut rig.gpu);
     result
+}
+
+/// P1b: refill a bounded Legacy head cache from the composite aux pages of the
+/// just-restored trunk pack. Only the `window_pages` immediately before the
+/// frontier can ever be addressed again: `head_prefill_shift` places them at
+/// compact rows `0..window`, with global RoPE unchanged. Called only for a
+/// native image whose head plane was NOT full-history captured (`head_live`).
+#[cfg(feature = "kvmem")]
+fn restore_live_head_window(rig: &mut Rig, slot: usize, _frontier: usize) -> Result<(), String> {
+    let head_live = rig
+        .model
+        .kvmem
+        .as_ref()
+        .is_some_and(|ctl| ctl.head_live_enabled());
+    if !head_live {
+        return Err("kvmem: MTP head image missing for a non-live head restore".into());
+    }
+    if rig.model.mtp_states[slot].is_none() {
+        let head = rig
+            .model
+            .mtp_head
+            .as_ref()
+            .ok_or("kvmem: missing destination MTP head")?;
+        let st = crate::mtp_spec::MtpSpecState::new_for_components_paged_only(
+            &mut rig.gpu,
+            &rig.model.config,
+            &rig.model.dn_states[slot],
+            head,
+            rig.model.mtp_k,
+            crate::mtp_head::MtpKvMode::Q8,
+        )
+        .map_err(|e| format!("kvmem live head restore alloc: {e}"))?;
+        rig.model.mtp_states[slot] = Some(st);
+    }
+    // P1b plane-only: the contiguous head cache is a placeholder. The next
+    // draft/fill restores the paged arena from a checkpoint or redispatches the
+    // accepted rows; there is nothing to copy here.
+    Ok(())
 }
 
 #[cfg(feature = "kvmem")]
@@ -935,6 +1268,7 @@ enum LegacyQueryDecision {
 fn plan_legacy_query_replay(
     rig: &Rig,
     run: &mut LegacyQueryRun,
+    media_pages: &[u32],
 ) -> Result<LegacyQueryDecision, String> {
     let Some(control) = rig.model.kvmem.as_ref() else {
         return Ok(LegacyQueryDecision::Skip {
@@ -956,15 +1290,16 @@ fn plan_legacy_query_replay(
             scores: None,
         });
     }
-    let (selected, scores) = match control.select_legacy_query(&source.store, &run.query) {
-        Ok(result) => result,
-        Err(e) => {
-            return Ok(LegacyQueryDecision::Skip {
-                reason: format!("selection_refused: {e}"),
-                scores: None,
-            })
-        }
-    };
+    let (selected, scores) =
+        match control.select_legacy_query(&source.store, &run.query, media_pages) {
+            Ok(result) => result,
+            Err(e) => {
+                return Ok(LegacyQueryDecision::Skip {
+                    reason: format!("selection_refused: {e}"),
+                    scores: None,
+                })
+            }
+        };
     let prompt_end = run.query.prompt_end() as u64;
     let restore_begin = run.query.restore_begin() as u64;
     let window_tokens = control.window_capacity_tokens();
@@ -1082,7 +1417,19 @@ pub(super) fn advance_legacy_query_replay(
             Some(run) => run,
             None => continue,
         };
-        let decision = plan_legacy_query_replay(rig, &mut run)?;
+        let media_pages = slots[s]
+            .as_ref()
+            .map(|frame| {
+                let fed = rig
+                    .model
+                    .kvmem
+                    .as_ref()
+                    .and_then(|ctl| ctl.fed_tokens(s))
+                    .unwrap_or(0) as u64;
+                legacy_media_pages(rig, fed, frame.session)
+            })
+            .unwrap_or_default();
+        let decision = plan_legacy_query_replay(rig, &mut run, &media_pages)?;
         match decision {
             LegacyQueryDecision::Skip { reason, scores } => {
                 if let Some(scores) = scores {
@@ -1215,6 +1562,15 @@ pub(super) fn prepare_kvmem_step(
     batch: &SlotBatch,
     n: usize,
 ) -> Result<(), String> {
+    // S2: a Legacy park leaves a tombstone plus an image handle. Reallocate
+    // before the batch is provisioned so every scheduled slot has real
+    // recurrent buffers (and so the forward guard is a contract, not a trap).
+    #[cfg(feature = "kvmem")]
+    for (slot, flight) in slots.iter().take(n).enumerate() {
+        if flight.is_some() {
+            ensure_dn_live(rig, slot, "active")?;
+        }
+    }
     // ── KVMem residency pass (HIPFIRE_KVMEM) ────────────────────────
     // Runs BEFORE provisioning: a step's new pages come from the
     // pool's free list, so the pages this step sheds must be back in
@@ -1269,6 +1625,23 @@ pub(super) fn prepare_kvmem_step(
                         })
                 })
                 .collect();
+            // G7: the live image spans are mandatory prefix groups on the
+            // Legacy path too. Compute their canonical pages before the
+            // mutable controller borrow; the pressure pass pins them.
+            let media_pages: Vec<Vec<u32>> = (0..n)
+                .map(|s| {
+                    let Some(frame) = slots[s].as_ref() else {
+                        return Vec::new();
+                    };
+                    let fed = rig
+                        .model
+                        .kvmem
+                        .as_ref()
+                        .and_then(|ctl| ctl.fed_tokens(s))
+                        .unwrap_or(0) as u64;
+                    legacy_media_pages(rig, fed, frame.session)
+                })
+                .collect();
             let ctl = rig.model.kvmem.as_mut().unwrap();
             ctl.prepare_legacy_step(
                 &mut rig.gpu,
@@ -1278,6 +1651,7 @@ pub(super) fn prepare_kvmem_step(
                 &incoming,
                 &decoding,
                 &replaying,
+                &media_pages,
                 &rig.model.k_arenas,
                 &rig.model.v_arenas,
             )
@@ -2529,10 +2903,38 @@ pub(super) fn kvmem_prefix_reuse(
                     &req.prompt_tokens[..frontier as usize],
                     ckpt_media,
                 );
+                // P2: the host ring is the first fallback after the GPU pool;
+                // the pack sidecar is the cold-restart tier. Copy the blob out
+                // before the pool mutable borrow below.
+                let host_dn = ctl
+                    .dn_checkpoint(frontier as u64, fp)
+                    .map(|bytes| bytes.to_vec());
                 // 期3 G3 P1.1 dn-persist: rebuild the recurrent checkpoint from
                 // the pack sidecar when this process has no pool entry (restart).
                 if ckpt_pool.peek(domain, frontier as u64, fp).is_none() {
-                    if let Some(pack) = ctl.prefix_pack_path(reuse_id) {
+                    if let Some(bytes) = host_dn {
+                        match crate::speculative::DeltaNetSnapshot::new_for(
+                            &mut rig.gpu,
+                            &rig.model.dn_states[slot.0],
+                        ) {
+                            Ok(mut snap) => match snap.import_host(&rig.gpu, &bytes) {
+                                Ok(()) => {
+                                    let (cid, displaced) =
+                                        ckpt_pool.insert(domain.clone(), frontier as u64, fp, snap);
+                                    for d in displaced {
+                                        d.free_gpu(&mut rig.gpu);
+                                    }
+                                    if cid != crate::checkpoint::CheckpointId::NONE {
+                                        eprintln!(
+                                            "[kvmem-dn] DN restored from host ring frontier={frontier}"
+                                        );
+                                    }
+                                }
+                                Err(e) => eprintln!("[kvmem-dn] host ring DN rejected: {e}"),
+                            },
+                            Err(e) => eprintln!("[kvmem-dn] host ring DN alloc failed: {e:?}"),
+                        }
+                    } else if let Some(pack) = ctl.prefix_pack_path(reuse_id) {
                         let dn_path = std::path::PathBuf::from(format!("{}.dn", pack.display()));
                         match std::fs::read(&dn_path) {
                             Ok(bytes) => {
@@ -2721,6 +3123,29 @@ pub(super) fn kvmem_prefix_reuse(
                 //    serialization; logical ring + captured watermarks). A
                 //    missing/unrestorable image reseeds the draft from scratch
                 //    — acceptance degrades, output stays verify-exact.
+                //    P3: a cold/restart checkpoint has no RAM image; load the
+                //    `.draft` sidecar the freeze wrote beside the pack first.
+                if ctl
+                    .prefix_checkpoint(reuse_id)
+                    .is_some_and(|c| c.draft_image.is_none())
+                {
+                    if let Some(pack) = ctl.prefix_pack_path(reuse_id) {
+                        let path = crate::kvmem_prefix::draft_sidecar_path(&pack);
+                        match std::fs::read(&path) {
+                            Ok(bytes) => match crate::kvmem_prefix::DraftImage::decode(&bytes) {
+                                Ok(img) => {
+                                    if let Some(ckpt) = ctl.prefix_checkpoint_mut(reuse_id) {
+                                        ckpt.draft_image = Some(img);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[kvmem-draft-image] sidecar decode skipped: {e}")
+                                }
+                            },
+                            Err(_) => {}
+                        }
+                    }
+                }
                 if let Some(shared) = rig.model.dflash.as_ref() {
                     let restored = {
                         match ctl
@@ -2877,6 +3302,33 @@ pub(super) fn kvmem_feed_step(
                             .map(|sess| sess.tokens[pos0..pos0 + m].to_vec())
                             .unwrap_or_default();
                         if tokens.len() == m {
+                            let paged_only = state.mtp_kv.paged_only();
+                            if paged_only {
+                                if rig.model.legacy_head_planes[s].is_none() {
+                                    let window = ctl.budget_blocks().saturating_add(2);
+                                    let kv_mode = ctl.kv_mode();
+                                    let window_pages = u32::try_from(window).map_err(|_| {
+                                        format!("kvmem AR head plane window {window} overflow")
+                                    })?;
+                                    let plane = crate::kvmem_ctl::LegacyHeadPlane::new(
+                                        &mut rig.gpu,
+                                        kv_mode,
+                                        head.config.n_head_kv,
+                                        head.config.head_dim,
+                                        window_pages,
+                                    )
+                                    .map_err(|e| format!("kvmem AR head plane: {e}"))?;
+                                    rig.model.legacy_head_planes[s] = Some(plane);
+                                }
+                                let start = u32::try_from(pos0).map_err(|_| {
+                                    format!("kvmem AR head plane pos {pos0} overflow")
+                                })?;
+                                rig.model.legacy_head_planes[s]
+                                    .as_mut()
+                                    .unwrap()
+                                    .restore(&mut rig.gpu, ctl, s, start)
+                                    .map_err(|e| format!("kvmem AR head plane restore: {e}"))?;
+                            }
                             let dim = rig.model.config.dim;
                             let rope_shift = ctl.head_prefill_shift(pos0 + m);
                             let raw = rig.model.pbs.x_batch.sub_offset(row_start * dim, m * dim);
@@ -2899,17 +3351,22 @@ pub(super) fn kvmem_feed_step(
                                 pos0,
                                 &tokens,
                                 rope_shift,
+                                rig.model.legacy_head_planes[s].as_mut(),
                             )
                             .map_err(|e| format!("kvmem AR head fill: {e}"))?;
-                            ctl.head_write_through_archive(
-                                &rig.gpu,
-                                &state.mtp_kv.inner.k_gpu[0],
-                                &state.mtp_kv.inner.v_gpu[0],
-                                s,
-                                pos0,
-                                m,
-                                pos0 - rope_shift,
-                            )?;
+                            match rig.model.legacy_head_planes[s].as_ref() {
+                                Some(plane) => ctl
+                                    .head_write_through_archive_paged(&rig.gpu, plane, s, pos0, m),
+                                None => ctl.head_write_through_archive(
+                                    &rig.gpu,
+                                    &state.mtp_kv.inner.k_gpu[0],
+                                    &state.mtp_kv.inner.v_gpu[0],
+                                    s,
+                                    pos0,
+                                    m,
+                                    pos0 - rope_shift,
+                                ),
+                            }?;
                             ctl.accept_head_append(s, pos0 as u64, (pos0 + m) as u64)?;
                         }
                     }
@@ -3422,6 +3879,43 @@ pub(super) fn enable_kvmem_taps(
     Ok(())
 }
 
+/// P5: the operator-facing ownership record. Pure so the legal matrix can be
+/// regression-tested without a GPU or a model load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct KvMemOwnership {
+    pub head: &'static str,
+    pub dn: &'static str,
+}
+
+pub(super) fn kvmem_ownership_labels(
+    legacy: bool,
+    mtp_head: bool,
+    head_live: bool,
+    dn_host_mib: u64,
+    dn_idle: bool,
+    dn_disk: bool,
+) -> KvMemOwnership {
+    let head = if !mtp_head {
+        "private-resident"
+    } else if !legacy {
+        "aux-plane"
+    } else if head_live {
+        // P1b plane-only: the live head has no contiguous KV window; the
+        // 128-token row cache is a prefill/draft placeholder only.
+        "paged-plane"
+    } else {
+        "park-image"
+    };
+    let dn = match (dn_host_mib > 0, dn_idle, dn_disk) {
+        (false, _, _) => "private-resident",
+        (true, false, false) => "host-ring+live",
+        (true, true, false) => "host-ring+live+idle",
+        (true, false, true) => "host-ring+live+disk",
+        (true, true, true) => "host-ring+live+idle+disk",
+    };
+    KvMemOwnership { head, dn }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_kvmem_controller(
     cfg: &EngineConfig,
@@ -3552,6 +4046,11 @@ pub(super) fn build_kvmem_controller(
             options.host_bytes = Some(resolved_host);
         }
     }
+    // P1 ownership: Legacy captures the MTP head KV into the parked history
+    // image and frees the live cache at park; a cold catalog restore rebuilds
+    // the private cache. Layerwise additionally pages it through the composite
+    // aux plane while live. Both strategies therefore keep the head history in
+    // KVMem; only the live residency differs.
     if let Some(config) = legacy_config.as_ref() {
         eprintln!(
             "[kvmem-config] contract={} budget_tokens={} gen_reserve_tokens={} \
@@ -3594,6 +4093,43 @@ pub(super) fn build_kvmem_controller(
             cfg.cap_tokens
         );
     }
+    let ownership_strategy = if legacy_config.is_some() {
+        "legacy"
+    } else {
+        "layerwise"
+    };
+    let head_live = hipfire_config::developer_var("HIPFIRE_KVMEM_HEAD_LIVE")
+        .is_ok_and(|v| !matches!(v.trim(), "0" | "false" | "off"));
+    let dn_mib = hipfire_config::developer_var("HIPFIRE_KVMEM_DN_HOST_MIB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(512);
+    let dn_idle = options
+        .as_ref()
+        .and_then(|options| options.dn_idle)
+        .unwrap_or(false);
+    let dn_ring_dir = options
+        .as_ref()
+        .and_then(|options| options.dn_ring_dir.as_deref())
+        .is_some_and(|dir| !dir.trim().is_empty());
+    let dn_disk_mib = options
+        .as_ref()
+        .and_then(|options| options.dn_disk_mib)
+        .unwrap_or(if dn_ring_dir { 512 } else { 0 });
+    let owners = kvmem_ownership_labels(
+        legacy_config.is_some(),
+        mtp_head,
+        head_live,
+        dn_mib,
+        dn_idle,
+        dn_ring_dir || dn_disk_mib > 0,
+    );
+    eprintln!(
+        "[kvmem-ownership] strategy={ownership_strategy} trunk=managed \
+         mtp_head={} dn_state={} \
+         dflash=checkpoint-image media_pins=mandatory vision_kv=none",
+        owners.head, owners.dn
+    );
     Ok(Some(crate::kvmem_ctl::KvMemCtl::new_with_config(
         n_slots,
         &plan,
@@ -3642,26 +4178,27 @@ impl ModelRig {
         F: for<'b> FnOnce(
             &mut Gpu,
             Option<&mut crate::layerwise_driver::HeadLayerwise<'b>>,
+            Option<&mut crate::kvmem_ctl::LegacyHeadPlane>,
         ) -> Result<crate::mtp_spec::MtpDraftOutput, String>,
     {
         use crate::layerwise_layout::LAYERWISE_BLOCK_TOKENS as BT;
         let fed = match ctl.fed_tokens(slot) {
             Some(f) => f,
-            None => return draft(gpu, None),
+            None => return draft(gpu, None, None),
         };
         // No sealed full page yet ⇒ nothing to recall; stay full-resident.
         if fed < BT {
-            return draft(gpu, None);
+            return draft(gpu, None, None);
         }
         let aux = match ctl.peek_aux_selection(slot) {
             Some(a) => a,
-            None => return draft(gpu, None),
+            None => return draft(gpu, None, None),
         };
         let mut head = match ctl.take_head_plane(slot) {
             Some(h) => h,
             None => {
                 ctl.set_aux_selection(slot, aux);
-                return draft(gpu, None);
+                return draft(gpu, None, None);
             }
         };
         // Committed: every failure below restores the head map + aux binding.
@@ -3735,7 +4272,7 @@ impl ModelRig {
                         // Attend the draft through the handle, then free it
                         // *here* so its `ctl` borrow ends before the `&mut ctl`
                         // head-map restore below (verify-pattern confinement).
-                        let res = draft(gpu, Some(&mut hlw));
+                        let res = draft(gpu, Some(&mut hlw), None);
                         let free_res = hlw.free(gpu);
                         ctl.restore_head_plane(slot, head);
                         if let Err(e) = free_res {
@@ -3753,7 +4290,7 @@ impl ModelRig {
             Ok(None) => {
                 ctl.restore_head_plane(slot, head);
                 ctl.set_aux_selection(slot, aux);
-                draft(gpu, None)
+                draft(gpu, None, None)
             }
             Err(e) => {
                 ctl.restore_head_plane(slot, head);
@@ -3766,7 +4303,7 @@ impl ModelRig {
 
 #[cfg(test)]
 mod kvmem_dflash_validation_tests {
-    use super::kvmem_dflash_validation_error;
+    use super::{kvmem_dflash_validation_error, kvmem_ownership_labels};
 
     /// 期4 rejection matrix (KVMem/nInfer integration pattern): unsupported
     /// combinations are refused at load; everything outside the KVMem+DFlash
@@ -3792,5 +4329,69 @@ mod kvmem_dflash_validation_tests {
     fn rejects_multi_slot_kvmem_dflash() {
         let e = kvmem_dflash_validation_error(true, true, 0, 2).expect("must reject");
         assert!(e.contains("single-slot"), "{e}");
+    }
+
+    /// P5 legal-combination matrix: the operator-facing labels are a pure
+    /// function of (strategy, MTP, head live, DN host ring, idle, disk). The
+    /// startup log prints these exact strings, so no GPU is needed to pin the
+    /// matrix and keep docs/log/tests in lockstep.
+    #[test]
+    fn ownership_labels_cover_the_strategy_matrix() {
+        assert_eq!(
+            kvmem_ownership_labels(false, false, false, 512, false, false),
+            super::KvMemOwnership {
+                head: "private-resident",
+                dn: "host-ring+live"
+            }
+        );
+        assert_eq!(
+            kvmem_ownership_labels(true, true, false, 512, false, false),
+            super::KvMemOwnership {
+                head: "park-image",
+                dn: "host-ring+live"
+            }
+        );
+        assert_eq!(
+            kvmem_ownership_labels(true, true, true, 512, false, false),
+            super::KvMemOwnership {
+                head: "paged-plane",
+                dn: "host-ring+live"
+            }
+        );
+        assert_eq!(
+            kvmem_ownership_labels(false, true, false, 512, false, false),
+            super::KvMemOwnership {
+                head: "aux-plane",
+                dn: "host-ring+live"
+            }
+        );
+        assert_eq!(
+            kvmem_ownership_labels(true, false, false, 0, false, false),
+            super::KvMemOwnership {
+                head: "private-resident",
+                dn: "private-resident"
+            }
+        );
+        assert_eq!(
+            kvmem_ownership_labels(true, false, false, 512, true, true),
+            super::KvMemOwnership {
+                head: "private-resident",
+                dn: "host-ring+live+idle+disk"
+            }
+        );
+        assert_eq!(
+            kvmem_ownership_labels(true, false, false, 512, false, true),
+            super::KvMemOwnership {
+                head: "private-resident",
+                dn: "host-ring+live+disk"
+            }
+        );
+        assert_eq!(
+            kvmem_ownership_labels(true, false, false, 512, true, false),
+            super::KvMemOwnership {
+                head: "private-resident",
+                dn: "host-ring+live+idle"
+            }
+        );
     }
 }

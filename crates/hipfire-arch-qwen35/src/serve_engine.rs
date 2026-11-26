@@ -512,11 +512,38 @@ const REPEAT_WINDOW_MAX: usize = 2048;
 /// All model-owned GPU state for the slot engine, grouped so `Rig`'s other
 /// fields stay family-neutral. Field-for-field with the former `Rig` model
 /// members; this is the concrete bundle a future `SlotModel` impl owns.
+/// S2 idle tier: a host-only copy of one slot's DeltaNet state, keyed by the
+/// session and the exact `(frontier, fingerprint)` it was captured at. Unlike
+/// a catalog image this is not a KV payload owner; it only lets an idle
+/// session's recurrent state leave the device between turns.
+#[cfg(feature = "kvmem")]
+struct IdleDnImage {
+    session: SessionId,
+    frontier: u32,
+    fp: u64,
+    bytes: Vec<u8>,
+}
+
 struct ModelRig {
     weights: Qwen35Weights,
     config: qwen35::Qwen35Config,
     scratch: Qwen35Scratch,
     dn_states: Vec<DeltaNetState>,
+    /// S1 parked-image handles, one per slot. `None` while the live state is
+    /// engine-resident; S2 replaces the live state with `DeltaNetState::empty`
+    /// and stores the published image id here.
+    #[cfg(feature = "kvmem")]
+    dn_images: Vec<Option<crate::kvmem_ctl::StateImageId>>,
+    /// S2 (`HIPFIRE_KVMEM_DN_IDLE`): host image of an idle session's live DN
+    /// state. The slot keeps a tombstone until the next continuation restores
+    /// this exact image; a cold admit drops it.
+    #[cfg(feature = "kvmem")]
+    dn_idle_images: Vec<Option<IdleDnImage>>,
+    /// P1b paged Legacy MTP-head arenas, one per slot. Each draft rebuilds the
+    /// sink + retained page window from the composite aux plane; no per-slot
+    /// copy of the full head history is held on the device.
+    #[cfg(feature = "kvmem")]
+    legacy_head_planes: Vec<Option<crate::kvmem_ctl::LegacyHeadPlane>>,
     k_arenas: Vec<GpuTensor>,
     v_arenas: Vec<GpuTensor>,
     desc_staging: SlotDescStaging,
@@ -2277,6 +2304,12 @@ impl Rig {
                 config,
                 scratch,
                 dn_states,
+                #[cfg(feature = "kvmem")]
+                dn_images: (0..cfg.n_slots).map(|_| None).collect(),
+                #[cfg(feature = "kvmem")]
+                dn_idle_images: (0..cfg.n_slots).map(|_| None).collect(),
+                #[cfg(feature = "kvmem")]
+                legacy_head_planes: (0..cfg.n_slots).map(|_| None).collect(),
                 k_arenas,
                 v_arenas,
                 desc_staging,
@@ -2394,6 +2427,8 @@ impl Rig {
                     k_arenas,
                     v_arenas,
                     dn_states,
+                    #[cfg(feature = "kvmem")]
+                    legacy_head_planes,
                     desc_staging,
                     pbs,
                     scratch,
@@ -2430,6 +2465,10 @@ impl Rig {
         kv_tier.free_gpu(&mut gpu);
         for dn in dn_states.into_iter().rev() {
             dn.free_gpu(&mut gpu);
+        }
+        #[cfg(feature = "kvmem")]
+        for plane in legacy_head_planes.into_iter().flatten() {
+            let _ = plane.free(&mut gpu);
         }
         // Arenas were allocated per FA layer as k then v; free reverse layers
         // as v then k.
@@ -3065,8 +3104,12 @@ fn commit_sampled_token(
             // Nobody will follow up on a vanished client, so hand the slot
             // back at once.
             rig.swap.forget(session.0);
+            self::kvmem_hooks::drop_idle_dn(rig, s);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
         } else {
+            // S2: between turns the recurrent state may leave the device. The
+            // exact host image is reinstalled by the next continuation.
+            self::kvmem_hooks::demote_idle_dn(rig, s, session);
             // Keep the session resident so its next turn can extend it in
             // place. Under KVMem that reuse is the whole KV: the trunk pages
             // (resident plus spilled payloads and their row statistics in
@@ -5627,8 +5670,12 @@ fn run_loop(
                         // Nobody will follow up on a vanished client, so hand the
                         // slot back at once.
                         rig.swap.forget(session.0);
+                        self::kvmem_hooks::drop_idle_dn(&mut rig, s);
                         rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
                     } else {
+                        // S2: release the idle recurrent state to its exact
+                        // host image; the next continuation reinstalls it.
+                        self::kvmem_hooks::demote_idle_dn(&mut rig, s, session);
                         // Keep the session resident: the trunk KV (under KVMem
                         // including the host store's statistics and spilled
                         // pages), DeltaNet and MTP head state are exactly what a

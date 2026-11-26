@@ -203,6 +203,7 @@ impl KvMemCtl {
                             fingerprint,
                             bytes,
                             sidecar_bytes: 0,
+                            draft_bytes: 0,
                             stamp: 0,
                         });
                     }
@@ -511,6 +512,93 @@ impl KvMemCtl {
         demoted
     }
 
+    /// Record the DFlash draft image written beside a pack. The whole cache
+    /// directory (packs + DN + draft sidecars) is re-pruned under the same cap.
+    /// When the pack disappeared meanwhile, drop the orphan draft file.
+    pub fn note_draft_sidecar(&mut self, path: &std::path::Path, bytes: u64) {
+        if !self.cold_packs.set_draft_bytes(path, bytes) {
+            let draft = crate::kvmem_prefix::draft_sidecar_path(path);
+            let _ = std::fs::remove_file(draft);
+            return;
+        }
+        self.draft_sidecars_total += 1;
+        self.draft_sidecar_bytes = self.draft_sidecar_bytes.saturating_add(bytes);
+        let removed = self.cold_packs.prune_to(self.cold_bytes);
+        if !removed.is_empty() && self.diagnostics.trace {
+            eprintln!(
+                "[kvmem-pack] pruned {} pack(s), {} disk bytes retained",
+                removed.len(),
+                self.cold_packs.disk_bytes()
+            );
+        }
+    }
+
+    /// P2: whether KVMem owns persistent DeltaNet checkpoints in host memory.
+    pub fn dn_ring_enabled(&self) -> bool {
+        self.dn_ring.enabled()
+    }
+
+    /// S2: whether an idle session's DeltaNet state may be demoted to a host
+    /// image (`HIPFIRE_KVMEM_DN_IDLE`, default off).
+    pub fn dn_idle_enabled(&self) -> bool {
+        self.dn_idle
+    }
+
+    /// P2: store one serialized `DeltaNetSnapshot`. The engine exports the
+    /// live state at a page boundary; the ring evicts oldest checkpoints to
+    /// stay within `HIPFIRE_KVMEM_DN_HOST_MIB`.
+    pub fn note_dn_checkpoint(&mut self, frontier: u64, fp: u64, bytes: Vec<u8>) {
+        let len = bytes.len();
+        if self.dn_ring.insert(frontier, fp, bytes) {
+            if self.diagnostics.trace {
+                eprintln!(
+                    "[kvmem-dn] host checkpoint frontier={frontier} fp={fp:#x} bytes={len} \
+                     ring_bytes={}",
+                    self.dn_ring.total_bytes()
+                );
+            }
+        } else if self.diagnostics.trace {
+            eprintln!(
+                "[kvmem-dn] host checkpoint refused frontier={frontier} bytes={len} \
+                 cap={}",
+                self.dn_ring.total_bytes()
+            );
+        }
+    }
+
+    /// P2: exact host checkpoint lookup (frontier + token/media fingerprint).
+    pub fn dn_checkpoint(&self, frontier: u64, fp: u64) -> Option<&[u8]> {
+        self.dn_ring.get(frontier, fp)
+    }
+
+    pub fn dn_ring_len(&self) -> u32 {
+        self.dn_ring.len() as u32
+    }
+
+    pub fn dn_ring_bytes(&self) -> u64 {
+        self.dn_ring.total_bytes()
+    }
+
+    /// S2: a live slot's recurrent bytes moved into a parked native image.
+    /// The legacy catalog already owns those bytes; this ledger tracks the
+    /// state-image share so `/metrics` reports it without double-counting
+    /// host storage.
+    pub fn note_state_demotion(&mut self, bytes: u64) {
+        self.state_demotions_total = self.state_demotions_total.saturating_add(1);
+        self.state_host_bytes = self.state_host_bytes.saturating_add(bytes);
+    }
+
+    /// S2: a parked image was promoted back into a live allocation.
+    pub fn note_state_promotion(&mut self, bytes: u64) {
+        self.state_promotions_total = self.state_promotions_total.saturating_add(1);
+        self.state_host_bytes = self.state_host_bytes.saturating_sub(bytes);
+    }
+
+    /// S2: a parked image was successfully installed into a live state.
+    pub fn note_state_restore(&mut self) {
+        self.state_restores_total = self.state_restores_total.saturating_add(1);
+    }
+
     /// Live observability snapshot (`/metrics` via `EngineStats.kvmem`).
     /// Cheap integer reads from the host stores: no device work, no
     /// allocation, and no path reads it back into selection/residency, so it
@@ -529,6 +617,28 @@ impl KvMemCtl {
         KvMemStats {
             enabled: true,
             layerwise: self.strategy.is_layerwise(),
+            trunk_managed: true,
+            mtp_head_managed: self.head_plane_enabled() || self.head_live,
+            mtp_head_history_managed: self.head_composite_enabled(),
+            // S2: the working state is still engine scratch while a slot is
+            // active, but parking demotes it into a native history image and a
+            // cold admission reallocates/restores it. Together with the host
+            // ring, that makes the recurrent state a KVMem-owned tier.
+            dn_state_managed: true,
+            dflash_managed: false,
+            // The engine fills live and parked bytes in `note_stats`.
+            dn_state_bytes: 0,
+            dn_state_slots: 0,
+            dn_checkpoints: self.dn_ring.len() as u32,
+            dn_checkpoint_bytes: self.dn_ring.total_bytes(),
+            // S0/S2: the engine fills the parked-image count in `note_stats`;
+            // the lifecycle counters below are controller-owned.
+            state_images: 0,
+            state_host_bytes: self.state_host_bytes,
+            state_demotions: self.state_demotions_total,
+            state_promotions: self.state_promotions_total,
+            state_restores: self.state_restores_total,
+            media_pins: true,
             host_charged_bytes: self.storage.charged_bytes(),
             disk_bytes: self.storage.disk_bytes(),
             payload_bytes,
@@ -561,6 +671,8 @@ impl KvMemCtl {
             draft_images: self.draft_images_total,
             draft_image_hits: self.draft_image_hits_total,
             draft_image_misses: self.draft_image_misses_total,
+            draft_sidecars: self.draft_sidecars_total,
+            draft_sidecar_bytes: self.draft_sidecar_bytes,
         }
     }
 

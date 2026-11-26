@@ -225,6 +225,11 @@ impl<T> LegacyHistoryCatalog<T> {
         self.slots.iter().flatten().find(|entry| entry.id == id)
     }
 
+    /// Every live entry, for accounting that the catalog itself does not own.
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.slots.iter().flatten().map(|entry| &entry.value)
+    }
+
     /// Publish a complete immutable image supplied by the caller. This call
     /// attests that all native components in `value` cover `frontier`; metadata
     /// alone cannot validate native completeness. Zero/out-of-range frontiers

@@ -6,6 +6,8 @@
 // engine calls these hooks unconditionally; feature builds delegate to the
 // KVMem implementation, while stock builds compile to explicit no-ops.
 
+#[cfg(feature = "kvmem")]
+use super::IdleDnImage;
 use super::{convo_group, EngineConfig, InFlight, ModelRig, Rig, SpecDraftRows};
 use hipfire_runtime::scheduler::{PendingWork, Scheduler};
 use hipfire_runtime::serve::{EngineStats, SubmitRequest};
@@ -351,6 +353,11 @@ pub(super) fn begin_continuation_request(
         if !super::kvmem_enabled(rig) {
             return Ok(());
         }
+        // S2: an idle session may have released its recognisable recurrent
+        // state. Install it before any truncation/forward decision; a mismatch
+        // drops the image, and an empty slot below a nonzero frontier is
+        // refused rather than decoded against a parked state.
+        let _ = restore_idle_dn(rig, slot.0, existing, reused, extended)?;
         // A continuation resuming below the stored frontier truncates only
         // when a DeltaNet checkpoint at exactly that frontier pairs with it.
         if rig.kvmem_prefix_pin {
@@ -398,6 +405,14 @@ pub(super) fn begin_continuation_request(
                     }
                 }
             }
+        }
+        // An idle demotion without a matching image (or a failed truncation
+        // checkpoint restore) must never decode against a parked tombstone.
+        if reused > 0 && rig.model.dn_states[slot.0].is_empty() {
+            return Err(
+                "kvmem continuation: DeltaNet state is parked without a matching idle image"
+                    .to_string(),
+            );
         }
         let _ = rig.model.kvmem.as_mut().map(|ctl| {
             ctl.set_request_query(slot.0, req.query)
@@ -452,6 +467,7 @@ pub(super) fn evict_for_admit(
                 );
             }
             rig.swap.forget(victim.0);
+            drop_idle_dn_session(rig, victim);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, victim);
             true
         } else {
@@ -548,17 +564,23 @@ pub(super) fn accept_mtp_verify(
                     pos,
                     &tokens,
                     rope_shift,
+                    model.legacy_head_planes[slot.0].as_mut(),
                 )
                 .map_err(|e| format!("mtp head consume fill: {e}"))?;
-                ctl.head_write_through_archive(
-                    gpu,
-                    &state.mtp_kv.inner.k_gpu[0],
-                    &state.mtp_kv.inner.v_gpu[0],
-                    slot.0,
-                    pos,
-                    advance,
-                    pos - rope_shift,
-                )
+                match model.legacy_head_planes[slot.0].as_ref() {
+                    Some(plane) => {
+                        ctl.head_write_through_archive_paged(gpu, plane, slot.0, pos, advance)
+                    }
+                    None => ctl.head_write_through_archive(
+                        gpu,
+                        &state.mtp_kv.inner.k_gpu[0],
+                        &state.mtp_kv.inner.v_gpu[0],
+                        slot.0,
+                        pos,
+                        advance,
+                        pos - rope_shift,
+                    ),
+                }
                 .map_err(|e| format!("mtp head consume archive: {e}"))?;
                 ctl.accept_head_append(slot.0, pos as u64, (pos + advance) as u64)
                     .map_err(|e| format!("mtp head consume append: {e}"))?;
@@ -636,6 +658,25 @@ pub(super) fn accept_dflash_verify(
     {
         let _ = (model, gpu, pool, slot, pos, committed, hidden_row_offset);
         Ok(())
+    }
+}
+
+/// P1b: either the Layerwise aux plane or the Legacy live composite plane is
+/// active. Prefill/consume write-through and bounded capacity gate on this;
+/// Layerwise-only live maps keep gating on `head_plane_enabled`.
+pub(super) fn head_composite_enabled(model: &ModelRig) -> bool {
+    #[cfg(feature = "kvmem")]
+    {
+        model
+            .kvmem
+            .as_ref()
+            .map(|ctl| ctl.head_composite_enabled())
+            .unwrap_or(false)
+    }
+    #[cfg(not(feature = "kvmem"))]
+    {
+        let _ = model;
+        false
     }
 }
 
@@ -799,12 +840,218 @@ pub(super) fn note_stats(rig: &Rig, stats: &mut EngineStats) {
     #[cfg(feature = "kvmem")]
     {
         if let Some(kvmem) = rig.model.kvmem.as_ref() {
-            stats.note_kvmem(kvmem.stats());
+            let mut snapshot = kvmem.stats();
+            // P0 ownership ledger: the controller cannot see the engine's
+            // recurrent/draft allocations, so the engine fills them here.
+            let mut dn_bytes = 0u64;
+            for dn in &rig.model.dn_states {
+                for t in super::dn_buffers(dn) {
+                    dn_bytes = dn_bytes.saturating_add(t.buf.size() as u64);
+                }
+            }
+            snapshot.dn_state_bytes = dn_bytes;
+            snapshot.dn_state_slots = rig
+                .model
+                .dn_states
+                .iter()
+                .filter(|state| !state.is_empty())
+                .count() as u32;
+            // P2: when the host ring owns persistent DN checkpoints, report its
+            // count/bytes (the GPU pool is a cache, not the ownership tier).
+            if !kvmem.dn_ring_enabled() {
+                if let Some(pool) = rig.model.checkpoint_pool.as_ref() {
+                    snapshot.dn_checkpoints = pool.len() as u32;
+                    snapshot.dn_checkpoint_bytes = pool.total_bytes();
+                }
+            }
+            snapshot.dflash_managed = rig.model.dflash_states.iter().any(|s| s.is_some());
+            // S2: the catalog is the authoritative owner of parked native
+            // images. Count entries and charge their DN/draft payloads from
+            // the images themselves; the slot handles are only locators and
+            // are cleared when a slot is reused for a different request.
+            let mut idle_images = 0u32;
+            let mut idle_bytes = 0u64;
+            for image in rig.model.dn_idle_images.iter().flatten() {
+                idle_images = idle_images.saturating_add(1);
+                idle_bytes = idle_bytes.saturating_add(image.bytes.len() as u64);
+            }
+            if let Some(catalog) = rig.legacy_history.as_ref() {
+                snapshot.state_images = (catalog.len() as u32).saturating_add(idle_images);
+                let mut host_bytes = idle_bytes;
+                for image in catalog.values() {
+                    host_bytes =
+                        host_bytes.saturating_add(image.auxiliary_bytes().unwrap_or(0) as u64);
+                }
+                snapshot.state_host_bytes = host_bytes;
+            } else {
+                snapshot.state_images = idle_images;
+                snapshot.state_host_bytes = idle_bytes;
+            }
+            stats.note_kvmem(snapshot);
         }
     }
     #[cfg(not(feature = "kvmem"))]
     {
         let _ = (rig, stats);
+    }
+}
+
+/// S2 (`HIPFIRE_KVMEM_DN_IDLE`): release the recurrent state of a session that
+/// just finished a turn. Active decode cannot be paged by token, so the whole
+/// state is exported once and the slot keeps a tombstone until the next turn.
+pub(super) fn demote_idle_dn(rig: &mut Rig, slot: usize, session: SessionId) {
+    #[cfg(feature = "kvmem")]
+    {
+        let Some(ctl) = rig.model.kvmem.as_ref() else {
+            return;
+        };
+        if !ctl.dn_idle_enabled() || rig.model.dn_states[slot].is_empty() {
+            return;
+        }
+        let Some(frontier) = ctl.fed_tokens(slot).filter(|f| *f > 0) else {
+            return;
+        };
+        let Some(sess) = rig.sessions.get(session) else {
+            return;
+        };
+        if sess.tokens.len() < frontier as usize {
+            return;
+        }
+        let media = sess.media_digest.filter(|_| sess.has_image);
+        let fp =
+            crate::checkpoint::checkpoint_fingerprint(&sess.tokens[..frontier as usize], media);
+        let bytes = match crate::speculative::DeltaNetSnapshot::export_host_from_state(
+            &rig.gpu,
+            &rig.model.dn_states[slot],
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                eprintln!("[kvmem-dn] idle demote slot={slot} export failed: {e}");
+                return;
+            }
+        };
+        if bytes.is_empty() {
+            return;
+        }
+        let host_bytes = bytes.len() as u64;
+        let quant = rig.model.dn_states[slot].quant;
+        let live = std::mem::replace(
+            &mut rig.model.dn_states[slot],
+            crate::qwen35::DeltaNetState::empty(quant),
+        );
+        let _ = live.free_gpu(&mut rig.gpu);
+        rig.model.dn_idle_images[slot] = Some(IdleDnImage {
+            session,
+            frontier,
+            fp,
+            bytes,
+        });
+        if let Some(ctl) = rig.model.kvmem.as_mut() {
+            ctl.note_state_demotion(host_bytes);
+        }
+        eprintln!(
+            "[kvmem-dn] idle demote slot={slot} session={} frontier={frontier} bytes={host_bytes}",
+            session.0
+        );
+    }
+    #[cfg(not(feature = "kvmem"))]
+    {
+        let _ = (rig, slot, session);
+    }
+}
+
+/// Drop a slot's idle DN image without installing it (cold reuse, eviction, or
+/// a vanished client).
+pub(super) fn drop_idle_dn(rig: &mut Rig, slot: usize) {
+    #[cfg(feature = "kvmem")]
+    {
+        rig.model.dn_idle_images[slot] = None;
+    }
+    #[cfg(not(feature = "kvmem"))]
+    {
+        let _ = (rig, slot);
+    }
+}
+
+/// Drop every idle image owned by `session` (session sweep / close).
+pub(super) fn drop_idle_dn_session(rig: &mut Rig, session: SessionId) {
+    #[cfg(feature = "kvmem")]
+    {
+        for image in &mut rig.model.dn_idle_images {
+            if image.as_ref().is_some_and(|i| i.session == session) {
+                *image = None;
+            }
+        }
+    }
+    #[cfg(not(feature = "kvmem"))]
+    {
+        let _ = (rig, session);
+    }
+}
+
+/// S2: install the idle image for the exact frontier a continuation resumes at.
+/// Returns `false` when there is no image or it belongs to another session /
+/// prefix; the caller then follows the normal checkpoint/cold path.
+pub(super) fn restore_idle_dn(
+    rig: &mut Rig,
+    slot: usize,
+    session: SessionId,
+    reused: usize,
+    tokens: &[u32],
+) -> Result<bool, String> {
+    #[cfg(feature = "kvmem")]
+    {
+        let Some(image) = rig.model.dn_idle_images[slot].take() else {
+            return Ok(false);
+        };
+        let media = rig.sessions.get(session).and_then(|s| s.media_digest);
+        let fp = if reused <= tokens.len() {
+            crate::checkpoint::checkpoint_fingerprint(&tokens[..reused], media)
+        } else {
+            0
+        };
+        if image.session != session || image.frontier as usize != reused || image.fp != fp {
+            eprintln!(
+                "[kvmem-dn] idle image dropped slot={slot} session={} image_frontier={} reused={reused}",
+                session.0, image.frontier
+            );
+            return Ok(false);
+        }
+        let quant = rig.model.dn_states[slot].quant;
+        let old = std::mem::replace(
+            &mut rig.model.dn_states[slot],
+            crate::qwen35::DeltaNetState::empty(quant),
+        );
+        let _ = old.free_gpu(&mut rig.gpu);
+        super::kvmem_engine::ensure_dn_live(rig, slot, "restore")?;
+        rig.gpu
+            .hip
+            .device_synchronize()
+            .map_err(|e| format!("kvmem idle restore drain: {e}"))?;
+        let mut snapshot =
+            crate::speculative::DeltaNetSnapshot::new_for(&mut rig.gpu, &rig.model.dn_states[slot])
+                .map_err(|e| format!("kvmem idle restore DN scratch: {e}"))?;
+        snapshot
+            .import_host(&rig.gpu, &image.bytes)
+            .map_err(|e| format!("kvmem idle restore DN image: {e}"))?;
+        snapshot
+            .restore_to(&mut rig.model.dn_states[slot], &mut rig.gpu)
+            .map_err(|e| format!("kvmem idle restore DN copy: {e}"))?;
+        if let Some(ctl) = rig.model.kvmem.as_mut() {
+            ctl.note_state_restore();
+            ctl.note_state_promotion(image.bytes.len() as u64);
+        }
+        eprintln!(
+            "[kvmem-dn] idle restore slot={slot} session={} frontier={reused} bytes={}",
+            session.0,
+            image.bytes.len()
+        );
+        Ok(true)
+    }
+    #[cfg(not(feature = "kvmem"))]
+    {
+        let _ = (rig, slot, session, reused, tokens);
+        Ok(false)
     }
 }
 

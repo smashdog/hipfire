@@ -92,7 +92,15 @@ impl KvMemCtl {
         // the default record is byte-neutral. The trunk GPU paged arena is
         // UNCHANGED; only this host record gains the aux layer.
         let head_plane = strategy.is_layerwise() && geom.mtp_head;
-        let n_record_layers = if head_plane {
+        // P1b: Legacy + native MTP can page the live head KV too. The switch is
+        // opt-in until the bounded carrier has an E2E run; `HEAD_LIVE=0`
+        // explicitly keeps the historical full-resident head.
+        let head_live = !strategy.is_layerwise()
+            && geom.mtp_head
+            && hipfire_config::developer_var("HIPFIRE_KVMEM_HEAD_LIVE")
+                .is_ok_and(|v| !matches!(v.trim(), "0" | "false" | "off"));
+        let head_composite = head_plane || head_live;
+        let n_record_layers = if head_composite {
             geom.n_fa_layers + 1
         } else {
             geom.n_fa_layers
@@ -140,6 +148,49 @@ impl KvMemCtl {
             }
             _ => None,
         };
+        // P2: persistent DN checkpoints are host-resident. The GPU pool remains
+        // a fast cache; the ring is the ownership tier and the fallback when
+        // the pool misses. 0 disables the ring (GPU pool only). An optional
+        // immutable disk mirror seeds the ring after a process restart.
+        let dn_host_mib: u64 = hipfire_config::developer_var("HIPFIRE_KVMEM_DN_HOST_MIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(512);
+        // S2: opt-in idle-session DN demotion. The live recurrent state of a
+        // decoding slot cannot be paged, so this only releases an idle slot
+        // between turns and restores the exact image on continuation.
+        let dn_idle = options.dn_idle.unwrap_or(false);
+        let explicit_dn_ring_dir = options
+            .dn_ring_dir
+            .clone()
+            .filter(|d| !d.is_empty())
+            .map(PathBuf::from);
+        let dn_disk_mib = options
+            .dn_disk_mib
+            .unwrap_or(if explicit_dn_ring_dir.is_some() {
+                512
+            } else {
+                0
+            });
+        if dn_host_mib > 0 {
+            eprintln!(
+                "[kvmem] P2 DN host ring: {} MiB (HIPFIRE_KVMEM_DN_HOST_MIB); idle demote={}; disk={} MiB",
+                dn_host_mib,
+                if dn_idle { "on" } else { "off" },
+                dn_disk_mib,
+            );
+        }
+        if dn_disk_mib > 0 && explicit_dn_ring_dir.is_none() {
+            let has_cache_dir = options
+                .content_cache_dir
+                .as_ref()
+                .is_some_and(|d| !d.is_empty());
+            if !has_cache_dir {
+                eprintln!(
+                    "[kvmem] P2 DN ring: disk mirror requested with no ring/cache directory; memory only"
+                );
+            }
+        }
 
         // ── opt-in policy knobs (defaults reproduce the historical behaviour) ──
         // LRFU replaces the raw retrieval score with a decaying heavy-hitter
@@ -295,6 +346,31 @@ impl KvMemCtl {
             }
         }
         let content_cache_dir = content_cache_dir.map(PathBuf::from);
+        let layout_identity = layout_fingerprint(&raw_cfg);
+        // P2 disk mirror: an explicit ring directory wins; otherwise the
+        // content cache directory hosts `<cache>/dn-ring`. Persistence is off
+        // unless `HIPFIRE_KVMEM_DN_DISK_MIB` (or an explicit ring dir, whose
+        // default is 512 MiB) asks for it.
+        let dn_ring_dir = explicit_dn_ring_dir
+            .or_else(|| content_cache_dir.as_ref().map(|dir| dir.join("dn-ring")));
+        let dn_ring_bytes = dn_disk_mib.saturating_mul(1 << 20);
+        let dn_ring = if dn_host_mib == 0 {
+            DnRing::new(0)
+        } else if dn_ring_bytes > 0 {
+            match dn_ring_dir.as_ref() {
+                Some(dir) => DnRing::new_persistent(
+                    dn_host_mib.saturating_mul(1 << 20),
+                    dir,
+                    dn_ring_bytes,
+                    layout_identity,
+                    options.diagnostics.trace,
+                )
+                .map_err(|e| format!("kvmem DN ring: {e}"))?,
+                None => DnRing::new(dn_host_mib.saturating_mul(1 << 20)),
+            }
+        } else {
+            DnRing::new(dn_host_mib.saturating_mul(1 << 20))
+        };
 
         // 期3 G3 P1.1: pack files live beside the content account; scanning
         // here rebuilds the cold index after a restart (metadata only).
@@ -306,7 +382,7 @@ impl KvMemCtl {
         let cold_packs = match cold_dir.as_ref() {
             Some(dir) => ColdPackIndex::scan(
                 dir,
-                layout_fingerprint(&raw_cfg),
+                layout_identity,
                 n_record_layers as u32,
                 KV_BLOCK_TOKENS as u32,
                 1 << 20,
@@ -444,6 +520,7 @@ impl KvMemCtl {
             interval: plan.interval,
             diagnostics: options.diagnostics,
             n_fa_layers: geom.n_fa_layers,
+            mtp_head: geom.mtp_head,
             n_heads: geom.n_heads,
             n_kv_heads: geom.n_kv_heads,
             head_dim: geom.head_dim,
@@ -456,7 +533,7 @@ impl KvMemCtl {
             page_v: vec![0u8; KV_BLOCK_TOKENS * geom.per_pos_v_bytes],
             wt_k: vec![
                 0u8;
-                if strategy.is_layerwise() {
+                if strategy.is_layerwise() || head_live {
                     geom.max_rows * geom.per_pos_bytes
                 } else {
                     0
@@ -464,7 +541,7 @@ impl KvMemCtl {
             ],
             wt_v: vec![
                 0u8;
-                if strategy.is_layerwise() {
+                if strategy.is_layerwise() || head_live {
                     geom.max_rows * geom.per_pos_v_bytes
                 } else {
                     0
@@ -492,6 +569,7 @@ impl KvMemCtl {
             q_span: vec![0f32; ring_cap],
             q_layer_rows: vec![0u32; if query_span > 1 { n_record_layers } else { 0 }],
             head_plane,
+            head_live,
             layerwise_mtp_history,
             aux_ordinal: geom.n_fa_layers as u32,
             n_record_layers,
@@ -525,6 +603,14 @@ impl KvMemCtl {
             draft_images_total: 0,
             draft_image_hits_total: 0,
             draft_image_misses_total: 0,
+            draft_sidecars_total: 0,
+            draft_sidecar_bytes: 0,
+            dn_ring,
+            dn_idle,
+            state_host_bytes: 0,
+            state_demotions_total: 0,
+            state_promotions_total: 0,
+            state_restores_total: 0,
         })
     }
 

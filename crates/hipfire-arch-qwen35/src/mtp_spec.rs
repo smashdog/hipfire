@@ -40,9 +40,18 @@ use crate::mtp_head::{
 // pass `None` there, the dispatch's `Some` arm is cfg-gated out, and the
 // `Option<&mut …>` threading / `is_none()` gates behave identically.
 #[cfg(feature = "kvmem")]
+use crate::kvmem_ctl::LegacyHeadPlane;
+#[cfg(not(feature = "kvmem"))]
+type LegacyHeadPlane = core::marker::PhantomData<()>;
+#[cfg(feature = "kvmem")]
 use crate::layerwise_driver::HeadLayerwise;
 #[cfg(not(feature = "kvmem"))]
 type HeadLayerwise<'a> = core::marker::PhantomData<&'a ()>;
+
+#[cfg(feature = "kvmem")]
+const KV_BLOCK_TOKENS: usize = crate::kvmem_ctl::KV_BLOCK_TOKENS;
+#[cfg(not(feature = "kvmem"))]
+const KV_BLOCK_TOKENS: usize = 128;
 use crate::qwen35::prefill::{fp8_verify_open, fp8_verify_target};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use crate::qwen35::{LayerType, LayerWeights, PrefillBatchScratch, StateQuant};
@@ -910,6 +919,46 @@ impl MtpSpecState {
             takeover_fill_hidden,
             takeover_fill_batched: None,
         })
+    }
+
+    /// P1b plane-only state: the contiguous head cache is a 128-token
+    /// placeholder; live K/V lives in the paged Legacy arena. The transient
+    /// bounded allocation is dropped immediately after construction.
+    pub fn new_for_components_paged_only(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        dn_state: &DeltaNetState,
+        head: &Qwen35MtpHead,
+        max_n: usize,
+        kv_mode: crate::mtp_head::MtpKvMode,
+    ) -> HipResult<Self> {
+        Self::new_for_components_with_verify_capacity_paged_only(
+            gpu, config, dn_state, head, max_n, max_n, kv_mode,
+        )
+    }
+
+    pub fn new_for_components_with_verify_capacity_paged_only(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        dn_state: &DeltaNetState,
+        head: &Qwen35MtpHead,
+        max_n: usize,
+        verify_capacity: usize,
+        kv_mode: crate::mtp_head::MtpKvMode,
+    ) -> HipResult<Self> {
+        let physical = head.config.max_seq.min(128).max(1);
+        let mut state = Self::new_for_components_with_verify_capacity(
+            gpu,
+            config,
+            dn_state,
+            head,
+            max_n,
+            verify_capacity,
+            kv_mode,
+            Some(physical),
+        )?;
+        state.mtp_kv = Qwen35MtpHeadKvCache::new_paged_only(gpu, &head.config, kv_mode)?;
+        Ok(state)
     }
 
     /// Like [`Self::new_for_slot`] but allocates the MTP head's KV cache in
@@ -4031,6 +4080,7 @@ where
                         Some(rot),
                         true,
                         /* rope_shift */ 0,
+                        None,
                     )?;
                     slice_off = slice_end;
                 }
@@ -4252,6 +4302,7 @@ pub fn spec_step_mtp(
     // MTP step k writes its own KV slot at position cur_pos + k (same as
     // before — a per-step single-layer transformer cache).
     let dim_bytes = dim * 4;
+    let head_shift = state.mtp_kv.head_shift;
     for k in 0..max_n {
         // Step 0 reads from state.prev_hidden (trunk's last post-norm
         // hidden, snapshot from the previous cycle / prefill) and embeds
@@ -4259,7 +4310,7 @@ pub fn spec_step_mtp(
         // (k-1) of mtp_t_outs and uses that same row as the embedding
         // override (lossy substitute for embed[predicted_token_{k-1}]).
         if k == 0 {
-            mtp_head::mtp_head_forward_block_only(
+            mtp_head_block_forward_dispatch(
                 gpu,
                 head,
                 &state.mtp_scratch,
@@ -4268,11 +4319,15 @@ pub fn spec_step_mtp(
                 &state.prev_hidden,
                 None,
                 cur_pos + k,
+                0,
                 trunk_weights,
+                None,
+                None,
+                head_shift,
             )?;
         } else {
             let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-            mtp_head::mtp_head_forward_block_only(
+            mtp_head_block_forward_dispatch(
                 gpu,
                 head,
                 &state.mtp_scratch,
@@ -4281,7 +4336,11 @@ pub fn spec_step_mtp(
                 &prev_row,       // prev_hidden = step k-1's t_mtp_out
                 Some(&prev_row), // embed override = step k-1's t_mtp_out (lossy)
                 cur_pos + k,
+                0,
                 trunk_weights,
+                None,
+                None,
+                head_shift,
             )?;
         }
         // Capture this step's t_mtp_out into row k of mtp_t_outs so the
@@ -5096,6 +5155,7 @@ pub fn spec_step_mtp_compressed_serial(
 /// `mtp_head_forward_block_only` wrapper byte-for-byte. The head ALGORITHM is
 /// identical either way; only KV residency differs.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "kvmem"), allow(unused_variables))]
 fn mtp_head_block_forward_dispatch(
     gpu: &mut Gpu,
     head: &Qwen35MtpHead,
@@ -5108,7 +5168,35 @@ fn mtp_head_block_forward_dispatch(
     row: usize,
     trunk_weights: &Qwen35Weights,
     head_lw: Option<&mut HeadLayerwise<'_>>,
+    legacy_plane: Option<&mut LegacyHeadPlane>,
+    head_shift: usize,
 ) -> HipResult<()> {
+    if kv.paged_only() && legacy_plane.is_none() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "paged-only head cache requires the Legacy paged plane",
+        ));
+    }
+    #[cfg(feature = "kvmem")]
+    if let Some(plane) = legacy_plane {
+        let paged = plane
+            .stage_row_with_rope(gpu, row, pos)
+            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+        return mtp_head::mtp_head_forward_block_only_with_pos_buf(
+            gpu,
+            head,
+            scratch,
+            kv,
+            next_token,
+            prev_hidden,
+            next_token_embed,
+            &scratch.pos_buf,
+            pos,
+            paged.ctx_len,
+            trunk_weights,
+            Some(&paged),
+        );
+    }
     match head_lw {
         Some(hlw) => {
             #[cfg(feature = "kvmem")]
@@ -5148,6 +5236,41 @@ fn mtp_head_block_forward_dispatch(
                 unreachable!("mtp head layerwise draft requires the kvmem feature")
             }
         }
+        None if head_shift > 0 => {
+            // P1b: Legacy bounded head cache. KV writes address the COMPACT
+            // slot (`pos - shift`) while RoPE reads the GLOBAL position from
+            // `pos_buf` — the contiguous sibling of the Layerwise paged handle.
+            let compact = pos.checked_sub(head_shift).ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "mtp head draft: pos {pos} < head shift {head_shift} \
+                         (draft span exceeds the head window)"
+                    ),
+                )
+            })?;
+            let rope = i32::try_from(pos).map_err(|_| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("mtp head draft: rope pos {pos} overflow i32"),
+                )
+            })?;
+            gpu.hip.memcpy_htod(&scratch.pos_buf, &rope.to_ne_bytes())?;
+            mtp_head::mtp_head_forward_block_only_with_pos_buf(
+                gpu,
+                head,
+                scratch,
+                kv,
+                next_token,
+                prev_hidden,
+                next_token_embed,
+                &scratch.pos_buf,
+                compact,
+                kv.max_seq,
+                trunk_weights,
+                None,
+            )
+        }
         None => mtp_head::mtp_head_forward_block_only(
             gpu,
             head,
@@ -5174,6 +5297,8 @@ pub fn mtp_draft_phase_inner(
     k: usize,
     skip_proposal_graph: bool,
     mut head_lw: Option<&mut HeadLayerwise<'_>>,
+    mut legacy_plane: Option<&mut LegacyHeadPlane>,
+    head_shift: usize,
 ) -> HipResult<MtpDraftOutput> {
     // Per-call k is authoritative (remaining max_emit from MtpSpeculator). Never
     // draft more than state.max_n, and k==0 means verify [seed] only + bonus.
@@ -5479,6 +5604,8 @@ pub fn mtp_draft_phase_inner(
                     k,
                     trunk_weights,
                     head_lw.as_deref_mut(),
+                    legacy_plane.as_deref_mut(),
+                    head_shift,
                 )?;
                 // rmsnorm(t_mtp_out, shared_head_norm) → tmp, then trunk lm_head
                 // GEMV → full_vocab_logits_view. weight_gemv dispatches the right
@@ -5518,6 +5645,8 @@ pub fn mtp_draft_phase_inner(
                     k,
                     trunk_weights,
                     head_lw.as_deref_mut(),
+                    legacy_plane.as_deref_mut(),
+                    head_shift,
                 )?;
                 mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
             } else {
@@ -5543,6 +5672,8 @@ pub fn mtp_draft_phase_inner(
                     k,
                     trunk_weights,
                     head_lw.as_deref_mut(),
+                    legacy_plane.as_deref_mut(),
+                    head_shift,
                 )?;
                 mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
             }
@@ -5882,6 +6013,8 @@ pub fn spec_step_mtp_compressed_serial_inner(
         k,
         skip_proposal_graph,
         None,
+        None,
+        0,
     )?;
 
     mtp_shared_verify_accept_rollback_inner(
@@ -6057,6 +6190,7 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
         cur_pos,
         &mtp_takeover_fill_tokens(last_committed, candidates, result.advance),
         /* rope_shift: Legacy sequential verify stays full-resident */ 0,
+        None,
     )?;
 
     // External windows are never truncated; ensure result fields cohere even
@@ -6074,6 +6208,7 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
 /// KV-only head pass (same gate and kernels as the batched prompt fill) and
 /// falls back to per-row decode forwards otherwise. Rows are independent:
 /// each slot's K/V depends only on its own token and hidden.
+#[cfg_attr(not(feature = "kvmem"), allow(unused_variables))]
 pub(crate) fn mtp_takeover_fill_head_kv(
     gpu: &mut Gpu,
     head: &Qwen35MtpHead,
@@ -6084,8 +6219,18 @@ pub(crate) fn mtp_takeover_fill_head_kv(
     // P4.1② f2 (E): the bounded-head COMPACT-write shift (= ninfer removed_tokens).
     // `0` ⇒ full-resident global positions (Legacy / AR-only, byte-neutral).
     rope_shift: usize,
+    // P1b: optional bounded Legacy arena. When present the same accepted rows
+    // are mirrored into it at compact coordinates, so the following draft can
+    // read them without re-copying the append pages from the archive.
+    mut paged_plane: Option<&mut LegacyHeadPlane>,
 ) -> HipResult<()> {
     let n = tokens.len();
+    let paged_only = state.mtp_kv.paged_only();
+    // P1b: a block-quantized Legacy window advanced; slide the contiguous
+    // cache before this verify span writes at `pos - rope_shift`.
+    if !paged_only && rope_shift > 0 && rope_shift % KV_BLOCK_TOKENS == 0 {
+        state.mtp_kv.slide_to_shift(gpu, rope_shift)?;
+    }
     let dim = head.config.n_embd;
     let dim_bytes = dim * 4;
     if n > 1 {
@@ -6107,6 +6252,12 @@ pub(crate) fn mtp_takeover_fill_head_kv(
         ],
     );
     if use_batched {
+        if paged_only && paged_plane.is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "paged-only head cache requires the Legacy paged plane",
+            ));
+        }
         if state.takeover_fill_batched.is_none() {
             let rows = state.verify_capacity + 1;
             let scratch = Qwen35MtpHeadBatchedScratch::new(gpu, &head.config, rows)?;
@@ -6141,7 +6292,41 @@ pub(crate) fn mtp_takeover_fill_head_kv(
             .map(|p| p as i32)
             .collect();
         let hidden = state.takeover_fill_hidden.sub_offset(0, n * dim);
-        mtp_head::mtp_head_forward_block_batched(
+        // P1b: mirror the accepted rows into the bounded Legacy arena at the
+        // arena's own compact coordinates. A stale/mismatched plane (cold
+        // start, span left the window) falls back to the contiguous write;
+        // the next draft then restores from the archive as before.
+        #[cfg(feature = "kvmem")]
+        let mut paged_view = None;
+        #[cfg(not(feature = "kvmem"))]
+        let paged_view = None;
+        #[cfg(feature = "kvmem")]
+        if let Some(plane) = paged_plane.as_deref_mut() {
+            let start = u32::try_from(cur_pos)
+                .map_err(|_| hip_bridge::HipError::new(0, "paged head start overflow"))?;
+            let rows = u32::try_from(n)
+                .map_err(|_| hip_bridge::HipError::new(0, "paged head row count overflow"))?;
+            let end = start
+                .checked_add(rows)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "paged head span overflow"))?;
+            match plane.stage_rows(gpu, start, rows, end) {
+                Ok(view) => paged_view = Some(view),
+                Err(e) if paged_only => {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!("paged-only head stage: {e}"),
+                    ));
+                }
+                Err(e) => eprintln!("[kvmem-head] paged stage skipped: {e}"),
+            }
+        }
+        if paged_only && paged_view.is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "paged-only head cache requires a staged paged span",
+            ));
+        }
+        let result = mtp_head::mtp_head_forward_block_batched(
             gpu,
             head,
             scratch,
@@ -6154,8 +6339,23 @@ pub(crate) fn mtp_takeover_fill_head_kv(
             Some(rot),
             true,
             /* rope_shift */ rope_shift as i32,
-        )
+            paged_view.as_ref(),
+        );
+        drop(paged_view);
+        #[cfg(feature = "kvmem")]
+        if result.is_ok() {
+            if let (Some(plane), Ok(end)) = (paged_plane, u32::try_from(cur_pos + n)) {
+                plane.mark_filled(end);
+            }
+        }
+        result
     } else {
+        if paged_only {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "paged-only head cache requires the batched paged fill path",
+            ));
+        }
         // P4.1② f2 (E): the bounded head staging pool requires the batched
         // kv_only fill (compact write + global RoPE). The per-row decode fallback
         // has no separated RoPE coordinate, so refuse it under a non-zero shift

@@ -94,6 +94,106 @@ impl DraftImage {
     pub fn nbytes(&self) -> u64 {
         self.blobs.iter().map(|b| b.len() as u64).sum()
     }
+
+    /// Persist the draft conditioning image beside the prefix pack. The ring is
+    /// a native full-state serialization: restart reuse can reinstate it
+    /// instead of reseeding the draft (acceptance parity, not correctness).
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        const MAGIC: &[u8; 4] = b"HFDR";
+        const VERSION: u32 = 1;
+        let mut out = Vec::with_capacity(48 + self.blobs.iter().map(Vec::len).sum::<usize>());
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&self.geometry.to_le_bytes());
+        out.extend_from_slice(&self.frontier.to_le_bytes());
+        out.extend_from_slice(&self.floor.to_le_bytes());
+        out.extend_from_slice(&(self.window as u32).to_le_bytes());
+        out.extend_from_slice(&(self.feature_width as u32).to_le_bytes());
+        out.extend_from_slice(&(self.kv_dim as u32).to_le_bytes());
+        out.extend_from_slice(&(self.n_layers as u32).to_le_bytes());
+        out.extend_from_slice(&(self.proj_cached_rows as u64).to_le_bytes());
+        out.extend_from_slice(&(self.full_cached_rows as u64).to_le_bytes());
+        out.extend_from_slice(&(self.blobs.len() as u32).to_le_bytes());
+        for blob in &self.blobs {
+            out.extend_from_slice(&(blob.len() as u64).to_le_bytes());
+            out.extend_from_slice(blob);
+        }
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        const MAGIC: &[u8; 4] = b"HFDR";
+        const VERSION: u32 = 1;
+        const MAX_BLOBS: u32 = 64;
+        const MAX_BLOB_BYTES: u64 = 1 << 30;
+        struct Cursor<'a> {
+            bytes: &'a [u8],
+            at: usize,
+        }
+        impl<'a> Cursor<'a> {
+            fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+                let end = self
+                    .at
+                    .checked_add(n)
+                    .ok_or("draft image: length overflow")?;
+                if end > self.bytes.len() {
+                    return Err("draft image: truncated".to_string());
+                }
+                let slice = &self.bytes[self.at..end];
+                self.at = end;
+                Ok(slice)
+            }
+            fn u32(&mut self) -> Result<u32, String> {
+                Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+            }
+            fn u64(&mut self) -> Result<u64, String> {
+                Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+            }
+        }
+        let mut c = Cursor { bytes, at: 0 };
+        if c.take(4)? != MAGIC {
+            return Err("draft image: bad magic".to_string());
+        }
+        if c.u32()? != VERSION {
+            return Err("draft image: unsupported version".to_string());
+        }
+        let geometry = c.u64()?;
+        let frontier = c.u32()?;
+        let floor = c.u32()?;
+        let window = c.u32()? as usize;
+        let feature_width = c.u32()? as usize;
+        let kv_dim = c.u32()? as usize;
+        let n_layers = c.u32()? as usize;
+        let proj_cached_rows = c.u64()? as usize;
+        let full_cached_rows = c.u64()? as usize;
+        let n_blobs = c.u32()?;
+        if n_blobs > MAX_BLOBS {
+            return Err("draft image: too many blobs".to_string());
+        }
+        let mut blobs = Vec::with_capacity(n_blobs as usize);
+        for _ in 0..n_blobs {
+            let len = c.u64()?;
+            if len > MAX_BLOB_BYTES {
+                return Err("draft image: blob too large".to_string());
+            }
+            blobs.push(c.take(len as usize)?.to_vec());
+        }
+        if c.at != bytes.len() {
+            return Err("draft image: trailing bytes".to_string());
+        }
+        Ok(Self {
+            geometry,
+            frontier,
+            floor,
+            window,
+            feature_width,
+            kv_dim,
+            n_layers,
+            proj_cached_rows,
+            full_cached_rows,
+            blobs,
+        })
+    }
 }
 
 /// 期3 G3 P1.1: adapter metadata of one persistent prefix pack. The pack
@@ -140,6 +240,14 @@ pub fn sidecar_path(pack: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
+/// The DFlash draft conditioning image that co-locates with a pack
+/// (`<pack>.draft`). Optional: a pack without one reseeds the draft.
+pub fn draft_sidecar_path(pack: &std::path::Path) -> std::path::PathBuf {
+    let mut path = pack.as_os_str().to_owned();
+    path.push(".draft");
+    std::path::PathBuf::from(path)
+}
+
 /// One pack file discovered in the content directory (metadata only; the
 /// payload is loaded on demand).
 #[derive(Debug, Clone)]
@@ -152,6 +260,9 @@ pub struct ColdPack {
     /// `<path>.dn` bytes (0 when absent). Charged against the same on-disk
     /// content cap as the pack so the cap bounds the whole cache directory.
     pub sidecar_bytes: u64,
+    /// `<path>.draft` bytes (0 when absent): the DFlash draft conditioning
+    /// image that rides with the pack. Charged alongside the pack too.
+    pub draft_bytes: u64,
     /// Monotonic LRU stamp assigned at scan (file mtime order).
     pub stamp: u64,
 }
@@ -161,9 +272,11 @@ impl ColdPack {
         sidecar_path(&self.path)
     }
 
-    /// Complete on-disk artifact (pack + optional recurrent sidecar).
+    /// Complete on-disk artifact (pack + optional recurrent/draft sidecars).
     pub fn disk_bytes(&self) -> u64 {
-        self.bytes.saturating_add(self.sidecar_bytes)
+        self.bytes
+            .saturating_add(self.sidecar_bytes)
+            .saturating_add(self.draft_bytes)
     }
 }
 
@@ -189,6 +302,10 @@ impl ColdPackIndex {
     /// Recurrent-state sidecars currently on disk (`<pack>.dn`).
     pub fn sidecar_bytes(&self) -> u64 {
         self.packs.iter().map(|p| p.sidecar_bytes).sum()
+    }
+    /// Draft conditioning images currently on disk (`<pack>.draft`).
+    pub fn draft_bytes(&self) -> u64 {
+        self.packs.iter().map(|p| p.draft_bytes).sum()
     }
     /// Whole cache-directory footprint the byte cap is applied to.
     pub fn disk_bytes(&self) -> u64 {
@@ -246,6 +363,9 @@ impl ColdPackIndex {
             let sidecar_bytes = std::fs::metadata(sidecar_path(&path))
                 .map(|m| m.len())
                 .unwrap_or(0);
+            let draft_bytes = std::fs::metadata(draft_sidecar_path(&path))
+                .map(|m| m.len())
+                .unwrap_or(0);
             raw.push((
                 modified,
                 ColdPack {
@@ -254,6 +374,7 @@ impl ColdPackIndex {
                     meta,
                     bytes: info.file_bytes,
                     sidecar_bytes,
+                    draft_bytes,
                     stamp: 0,
                 },
             ));
@@ -390,6 +511,18 @@ impl ColdPackIndex {
         match self.packs.iter_mut().find(|p| p.path == path) {
             Some(p) => {
                 p.sidecar_bytes = bytes;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Update the draft-image charge for a registered pack. Returns false when
+    /// the pack vanished (the caller drops the orphan file).
+    pub fn set_draft_bytes(&mut self, path: &std::path::Path, bytes: u64) -> bool {
+        match self.packs.iter_mut().find(|p| p.path == path) {
+            Some(p) => {
+                p.draft_bytes = bytes;
                 true
             }
             None => false,
@@ -1135,6 +1268,31 @@ mod tests {
     }
 
     #[test]
+    fn draft_image_sidecar_roundtrip_and_truncation() {
+        let img = DraftImage {
+            geometry: 0x1234,
+            frontier: 384,
+            floor: 128,
+            window: 256,
+            feature_width: 8,
+            kv_dim: 4,
+            n_layers: 2,
+            proj_cached_rows: 384,
+            full_cached_rows: 128,
+            blobs: vec![vec![1, 2, 3], vec![4; 17]],
+        };
+        let bytes = img.encode().expect("encode");
+        let back = DraftImage::decode(&bytes).expect("decode");
+        assert_eq!(back.geometry, img.geometry);
+        assert_eq!(back.frontier, img.frontier);
+        assert_eq!(back.floor, img.floor);
+        assert_eq!(back.window, img.window);
+        assert_eq!(back.blobs, img.blobs);
+        assert!(DraftImage::decode(&bytes[..bytes.len() - 1]).is_err());
+        assert!(DraftImage::decode(b"HFDR").is_err());
+    }
+
+    #[test]
     fn layout_fingerprint_detects_drift() {
         let base = layout_fingerprint(&raw_config());
         let mut drifted = raw_config();
@@ -1587,6 +1745,7 @@ mod tests {
             meta,
             bytes: 1,
             sidecar_bytes: 0,
+            draft_bytes: 0,
             stamp: 1,
         });
         assert_eq!(

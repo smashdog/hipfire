@@ -71,19 +71,27 @@ use crate::layerwise_layout::LayerwiseMtpQ8Layout;
 use crate::layerwise_mtp::{
     auxiliary_removed_tokens, auxiliary_visible_tokens, AuxiliarySelection, LayerwiseMtpHistory,
 };
+use dn_ring::DnRing;
 
+mod dn_ring;
 mod import;
 mod layerwise;
 mod legacy;
+mod legacy_head;
 mod options;
 mod plan;
 mod prefix;
 mod slot;
+mod state_image;
 mod step;
 mod transfer;
 
 pub use import::*;
+pub(crate) use legacy_head::LegacyHeadPlane;
 pub(crate) use options::{KvMemDiagnostics, KvMemOptions};
+pub(crate) use state_image::{
+    StateImage, StateImageId, StateImageKind, StateImageResidency, StateImageRole, StateImageStamp,
+};
 
 /// KVMem blocks are 128 tokens — the engine's page size (`PAGE_TOKENS`).
 pub const KV_BLOCK_TOKENS: usize = 128;
@@ -802,10 +810,11 @@ pub struct KvMemGeometry {
     /// `mtp_head.is_some() && mtp_k > 0` enablement). Under Layerwise this turns
     /// the host co-archive into the COMPOSITE `kvmem-main-mtp-pages-v4` record
     /// (`n_fa_layers + 1` ordinals, the head aux plane at ordinal `n_fa_layers`)
-    /// and activates the per-slot head-plane state. Under Legacy it is carried
-    /// unread (the head keeps the historical full-resident KvCache path), so the
-    /// default serve stays byte-neutral. The trunk GPU paged arena is UNCHANGED
-    /// (`n_fa_layers`); only the host record gains the appended aux layer.
+    /// and activates the per-slot head-plane state. Under Legacy the live head
+    /// keeps the full-resident KvCache path, but the parked history image owns
+    /// its full KV and the idle slot's copy is freed; a cold catalog restore
+    /// rebuilds it. The trunk GPU paged arena is UNCHANGED (`n_fa_layers`);
+    /// only the Layerwise host record gains the appended aux layer.
     pub mtp_head: bool,
 }
 
@@ -1126,6 +1135,10 @@ pub struct KvMemCtl {
     interval: usize,
     diagnostics: KvMemDiagnostics,
     n_fa_layers: usize,
+    /// P1: an independent native MTP head is active. Under Layerwise it is
+    /// paged on the aux plane; under Legacy it is captured in parked history
+    /// images and freed while the slot is idle.
+    mtp_head: bool,
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -1191,6 +1204,10 @@ pub struct KvMemCtl {
     /// ordinals) and every head-plane path. False under Legacy / AR-only, so the
     /// default serve keeps the historical `n_fa_layers` record byte-neutral.
     head_plane: bool,
+    /// P1b: Legacy + native MTP pages the live head KV through the composite
+    /// aux plane (`HIPFIRE_KVMEM_HEAD_LIVE=1`). Layerwise keeps `head_plane`;
+    /// this flag never enables Layerwise-only carriers or live maps.
+    head_live: bool,
     /// P4.1③ H5: resolved `HIPFIRE_KVMEM_LAYERWISE_MTP_HISTORY` head-history
     /// policy. FirstLayer (the ninfer auto-default) binds the head aux from the
     /// trunk's first-layer restored view; UpstreamGlobal runs the global Mean-K
@@ -1255,6 +1272,25 @@ pub struct KvMemCtl {
     draft_images_total: u64,
     draft_image_hits_total: u64,
     draft_image_misses_total: u64,
+    /// P3: `<pack>.draft` sidecars written and their on-disk bytes.
+    draft_sidecars_total: u64,
+    draft_sidecar_bytes: u64,
+    /// P2: host-resident ring of page-aligned DeltaNet checkpoints. The live
+    /// recurrent state stays engine scratch; this ring is the persistent
+    /// ownership tier and the fallback when the GPU checkpoint pool misses.
+    /// Capacity is `HIPFIRE_KVMEM_DN_HOST_MIB` (default 512, 0 disables).
+    dn_ring: DnRing,
+    /// S2: opt-in idle-session DeltaNet demotion (`HIPFIRE_KVMEM_DN_IDLE`).
+    /// The live state of a decoding slot cannot be paged; this only releases
+    /// an idle slot between turns and restores its exact image on continuation.
+    dn_idle: bool,
+    /// S2 state-image ledger: live-to-image demotions, image-to-live
+    /// promotions, successful image installs, and the host bytes currently
+    /// charged by parked DN images.
+    state_demotions_total: u64,
+    state_promotions_total: u64,
+    state_restores_total: u64,
+    state_host_bytes: u64,
 }
 
 /// `SPILLED_PAGE` is re-exported for engine-side diagnostics; keep the import

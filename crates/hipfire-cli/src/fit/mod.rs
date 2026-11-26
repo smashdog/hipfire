@@ -528,6 +528,7 @@ pub(crate) fn fit_command(paths: &crate::Paths, args: FitArgs) -> Result<()> {
     notes.extend(host_notes);
     notes.push("Free memory is sampled without opening the GPU; HIP reports slightly less once a process opens it. Fit reserves no cards: device availability, locks and memory counters can change before the real load.".into());
     notes.push("Admission assumes HIP VMM is available on native Linux ROCm; the loader still applies its platform refusal rules.".into());
+    notes.push(kvmem_fit_ledger_note());
     let report = Report {
         schema: "hipfire-fit-1",
         hipfire: json!({"version": env!("HIPFIRE_BUILD_VERSION"), "commit": crate::BUILD_COMMIT}),
@@ -1362,6 +1363,93 @@ fn safe_name(input: &str) -> String {
 /// Error strings from the loader/network may carry a local path. The public
 /// JSON contract intentionally contains only basenames, never home paths or
 /// PCI addresses; scrub nested findings/notes as well as the explicit file.
+/// P5: pure formatter for the read-only KVMem ledger note. `fit` projects
+/// device residency from file headers; the host KV pool, MTP head plane, DN
+/// ring/idle images and media pins are owned by the serve engine and must not
+/// silently change the capacity math here.
+fn kvmem_fit_ledger_text(
+    kvmem_build: bool,
+    enabled: bool,
+    strategy: &str,
+    budget_tokens: u64,
+    host_mib: u64,
+    head_live: bool,
+    dn_mib: u64,
+    dn_idle: bool,
+    dn_disk: bool,
+) -> String {
+    format!(
+        "KVMem ledger ({}): configured={} strategy={} trunk=managed \
+         budget_tokens={} host={host_mib}MiB head_live={} dn_ring={dn_mib}MiB \
+         dn_idle={} dn_disk={}; fit projects device residency only and \
+         excludes host KV pool, MTP head plane, DN ring/idle images and media pins",
+        if kvmem_build {
+            "kvmem-build"
+        } else {
+            "stock-build"
+        },
+        if enabled { "on" } else { "off" },
+        strategy,
+        budget_tokens,
+        if head_live { "on" } else { "off" },
+        if dn_idle { "on" } else { "off" },
+        if dn_disk { "on" } else { "off" },
+    )
+}
+
+/// Read the installed process-start snapshot; never `std::env::var` and never
+/// mutate config. The same snapshot the daemon would use at serve time.
+fn kvmem_fit_ledger_note() -> String {
+    fn env_u64(name: &str, default: u64) -> u64 {
+        hipfire_config::developer_var(name)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(default)
+    }
+    fn env_flag(name: &str) -> bool {
+        hipfire_config::developer_var(name).is_ok_and(|v| matches!(v.trim(), "1" | "on" | "true"))
+    }
+
+    let resolved = hipfire_config::active_process_config().and_then(|p| p.kvmem.as_ref());
+    let enabled = resolved
+        .map(|c| c.enabled)
+        .unwrap_or_else(|| env_flag("HIPFIRE_KVMEM"));
+    let strategy_owned = hipfire_config::developer_var("HIPFIRE_KVMEM_RECALL_STRATEGY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "legacy".to_owned());
+    let strategy = match resolved {
+        Some(c) => match c.recall_strategy {
+            hipfire_config::kvmem::RecallStrategy::Legacy => "legacy",
+        },
+        None => strategy_owned.as_str(),
+    };
+    let budget_tokens = resolved
+        .map(|c| c.budget_tokens as u64)
+        .unwrap_or_else(|| env_u64("HIPFIRE_KVMEM_BUDGET_TOKENS", 0));
+    let host_mib = resolved
+        .map(|c| c.host_bytes >> 20)
+        .unwrap_or_else(|| env_u64("HIPFIRE_KVMEM_HOST_BYTES", 0) >> 20);
+    let head_live = hipfire_config::developer_var("HIPFIRE_KVMEM_HEAD_LIVE")
+        .is_ok_and(|v| !matches!(v.trim(), "0" | "false" | "off"));
+    let dn_mib = env_u64("HIPFIRE_KVMEM_DN_HOST_MIB", 512);
+    let dn_idle = env_flag("HIPFIRE_KVMEM_DN_IDLE");
+    let dn_disk = env_u64("HIPFIRE_KVMEM_DN_DISK_MIB", 0) > 0
+        || hipfire_config::developer_var("HIPFIRE_KVMEM_DN_RING_DIR")
+            .is_ok_and(|v| !v.trim().is_empty());
+    kvmem_fit_ledger_text(
+        cfg!(feature = "kvmem"),
+        enabled,
+        strategy,
+        budget_tokens,
+        host_mib,
+        head_live,
+        dn_mib,
+        dn_idle,
+        dn_disk,
+    )
+}
+
 fn json_report(report: &Report) -> Result<Value> {
     let mut value = serde_json::to_value(report)?;
     fn scrub_with_home(value: &mut Value, home: Option<&str>) {
@@ -1935,6 +2023,16 @@ fn admission_inputs(params: &Value) -> AdmissionInputs<'_> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn kvmem_ledger_note_is_a_read_only_accounting_note() {
+        let note = kvmem_fit_ledger_text(true, true, "legacy", 1024, 2048, true, 512, true, true);
+        assert!(note.starts_with("KVMem ledger (kvmem-build): configured=on strategy=legacy"));
+        assert!(note.contains("budget_tokens=1024 host=2048MiB head_live=on"));
+        assert!(note.contains("dn_ring=512MiB dn_idle=on dn_disk=on"));
+        assert!(note
+            .contains("excludes host KV pool, MTP head plane, DN ring/idle images and media pins"));
+    }
 
     #[test]
     fn unchecked_context_is_undetermined_and_advisory() {

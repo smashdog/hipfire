@@ -6,6 +6,16 @@
 
 use super::*;
 
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+use crate::kvmem_ctl::LegacyHeadPlane;
+#[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+type LegacyHeadPlane = core::marker::PhantomData<()>;
+
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+const KV_BLOCK_TOKENS: usize = crate::kvmem_ctl::KV_BLOCK_TOKENS;
+#[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+const KV_BLOCK_TOKENS: usize = 128;
+
 impl ModelRig {
     /// One batched forward step across the N slots (spec §5.2). Wraps
     /// `forward_slots::forward_batch_slots_graphed_opts` with every model
@@ -433,7 +443,11 @@ impl ModelRig {
             .mtp_head
             .as_ref()
             .ok_or_else(|| "mtp_head_prefill_chunk: MTP head not loaded".to_string())?;
-        let head_cap = if self.mtp_states[slot.0].is_none() {
+        #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+        let head_live = self.kvmem.as_ref().is_some_and(|c| c.head_live_enabled());
+        #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+        let head_live = false;
+        let head_cap = if self.mtp_states[slot.0].is_none() && !head_live {
             kvmem_hooks::mtp_head_capacity(self)
         } else {
             None
@@ -444,17 +458,30 @@ impl ModelRig {
         };
         if self.mtp_states[slot.0].is_none() {
             // P4.1② f2 (E): bound the head KV under Layerwise+MTP; Legacy / AR-only
-            // get None ⇒ full-resident (byte-neutral).
-            let state = crate::mtp_spec::MtpSpecState::new_for_components(
-                &mut gpu,
-                &self.config,
-                &self.dn_states[slot.0],
-                head,
-                self.mtp_k,
-                crate::mtp_head::MtpKvMode::Q8,
-                head_cap,
-            )
-            .map_err(|e| format!("mtp state alloc: {e}"))?;
+            // get None ⇒ full-resident (byte-neutral). P1b plane-only keeps just
+            // a 128-token placeholder and writes every row into the paged arena.
+            let state = if head_live {
+                crate::mtp_spec::MtpSpecState::new_for_components_paged_only(
+                    &mut gpu,
+                    &self.config,
+                    &self.dn_states[slot.0],
+                    head,
+                    self.mtp_k,
+                    crate::mtp_head::MtpKvMode::Q8,
+                )
+                .map_err(|e| format!("mtp state alloc: {e}"))?
+            } else {
+                crate::mtp_spec::MtpSpecState::new_for_components(
+                    &mut gpu,
+                    &self.config,
+                    &self.dn_states[slot.0],
+                    head,
+                    self.mtp_k,
+                    crate::mtp_head::MtpKvMode::Q8,
+                    head_cap,
+                )
+                .map_err(|e| format!("mtp state alloc: {e}"))?
+            };
             self.mtp_states[slot.0] = Some(state);
         }
         if let Some(cvs) = head.weights.compressed_vocab_size {
@@ -520,25 +547,140 @@ impl ModelRig {
                 .collect()
         };
 
+        let head_cap = state.mtp_kv.max_seq;
+        if let Some(&last) = compact_positions.last() {
+            if last < 0 || last as usize >= head_cap {
+                self.mtp_states[slot.0] = Some(state);
+                return Err(format!(
+                    "mtp head prefill: compact position {last} outside head cache {head_cap}"
+                ));
+            }
+        }
+        // P1b: mirror the chunk's K/V into the paged head arena as well. The
+        // arena is restored at the chunk's global start (cold 0 or a prefix
+        // checkpoint), then `stage_rows` maps this span and the batched forward
+        // writes it alongside the contiguous archive staging. The first draft
+        // after the prompt then restores with no archive copy.
+        #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+        let mut legacy_plane: Option<crate::kvmem_ctl::LegacyHeadPlane> =
+            if self.kvmem.as_ref().is_some_and(|c| c.head_live_enabled()) {
+                let (kv_mode, window_pages) = {
+                    let ctl = self.kvmem.as_ref().unwrap();
+                    // P1b: one trunk window plus the sink and one spare page.
+                    // A 1024-row prefill chunk spans at most eight pages, so
+                    // the chunk's start page stays retained while `stage_rows`
+                    // remaps the window to the chunk end; the spare page
+                    // absorbs a draft/verify span that crosses the front.
+                    let window = ctl.budget_blocks().saturating_add(2);
+                    (
+                        ctl.kv_mode(),
+                        u32::try_from(window)
+                            .map_err(|_| format!("mtp head plane: window {window} overflow"))?,
+                    )
+                };
+                if window_pages == 0 {
+                    self.mtp_states[slot.0] = Some(state);
+                    return Err("mtp head plane: head window is empty".to_string());
+                }
+                let mut plane = match self.legacy_head_planes[slot.0].take() {
+                    Some(p) => p,
+                    None => crate::kvmem_ctl::LegacyHeadPlane::new(
+                        &mut gpu,
+                        kv_mode,
+                        head.config.n_head_kv,
+                        head.config.head_dim,
+                        window_pages,
+                    )?,
+                };
+                let start = u32::try_from(chunk_positions[0]).map_err(|_| {
+                    format!("mtp head plane: start {} overflow", chunk_positions[0])
+                })?;
+                let restored = {
+                    let ctl = self.kvmem.as_ref().unwrap();
+                    plane.restore(&mut gpu, ctl, slot.0, start)
+                };
+                match restored {
+                    Ok(()) => Some(plane),
+                    Err(e) => {
+                        let _ = plane.free(&mut gpu);
+                        return Err(format!("mtp head prefill paged restore: {e}"));
+                    }
+                }
+            } else {
+                None
+            };
+        #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+        let mut legacy_plane: Option<LegacyHeadPlane> = None;
         // Disjoint field borrows: `scratch`/`rot` from mtp_prefill_batched,
         // `gpu`/`weights`/head separately. No closure — it would capture all of
         // `rig` and collide with the scratch borrow.
         let mtp_outcome = norm_outcome.and_then(|()| {
-            crate::mtp_head::mtp_head_forward_block_batched(
-                &mut gpu,
-                head,
-                scratch,
-                &mut state.mtp_kv,
-                chunk_tokens,
-                &staged,
-                &compact_positions,
-                m,
-                &self.weights,
-                Some(rot),
-                /* kv_only */ true,
-                /* rope_shift */ rope_shift as i32,
-            )
-            .map_err(|e| format!("mtp head prefill: {e}"))
+            // P1b: block-quantized Legacy shift — move the live window before
+            // this chunk stages its compact rows.
+            if rope_shift > 0 && rope_shift % KV_BLOCK_TOKENS == 0 {
+                state
+                    .mtp_kv
+                    .slide_to_shift(&mut gpu, rope_shift)
+                    .map_err(|e| format!("mtp head slide: {e}"))?;
+            }
+            #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+            {
+                let start = chunk_positions[0] as u32;
+                let end = start.saturating_add(m as u32);
+                let mut paged_view = match legacy_plane.as_mut() {
+                    Some(plane) => match plane.stage_rows(&mut gpu, start, m as u32, end) {
+                        Ok(view) => Some(view),
+                        Err(e) => {
+                            return Err(format!(
+                                "mtp head prefill paged stage slot={slot:?} pos={start} rows={m}: {e}"
+                            ));
+                        }
+                    },
+                    None => None,
+                };
+                let res = crate::mtp_head::mtp_head_forward_block_batched(
+                    &mut gpu,
+                    head,
+                    scratch,
+                    &mut state.mtp_kv,
+                    chunk_tokens,
+                    &staged,
+                    &compact_positions,
+                    m,
+                    &self.weights,
+                    Some(rot),
+                    /* kv_only */ true,
+                    /* rope_shift */ rope_shift as i32,
+                    paged_view.as_ref(),
+                )
+                .map_err(|e| format!("mtp head prefill: {e}"));
+                drop(paged_view);
+                if res.is_ok() {
+                    if let Some(plane) = legacy_plane.as_mut() {
+                        plane.mark_filled(end);
+                    }
+                }
+                res
+            }
+            #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+            {
+                crate::mtp_head::mtp_head_forward_block_batched(
+                    &mut gpu,
+                    head,
+                    scratch,
+                    &mut state.mtp_kv,
+                    chunk_tokens,
+                    &staged,
+                    &compact_positions,
+                    m,
+                    &self.weights,
+                    Some(rot),
+                    /* kv_only */ true,
+                    /* rope_shift */ rope_shift as i32,
+                    None,
+                )
+                .map_err(|e| format!("mtp head prefill: {e}"))
+            }
         });
         // Seed hidden for the first draft cycle: the (normed) trunk hidden of
         // the chunk's last token — same convention as the verify-path capture.
@@ -572,27 +714,28 @@ impl ModelRig {
         let mut outcome = hidden_outcome;
         #[cfg(feature = "kvmem")]
         if outcome.is_ok() {
-            let head_plane = self
-                .kvmem
-                .as_ref()
-                .map(|k| k.head_plane_enabled())
-                .unwrap_or(false);
+            let head_plane = kvmem_hooks::head_composite_enabled(self);
             if head_plane {
                 let pos0 = chunk_positions[0] as usize;
                 let mut kvmem = self.kvmem.take();
                 let res = match kvmem.as_mut() {
                     Some(ctl) => ctl.ensure_head_plane(slot.0).and_then(|()| {
-                        ctl.head_write_through_archive(
-                            gpu,
-                            &state.mtp_kv.inner.k_gpu[0],
-                            &state.mtp_kv.inner.v_gpu[0],
-                            slot.0,
-                            pos0,
-                            m,
-                            // E: gather from the COMPACT staging offset; the seal
-                            // above stays at the GLOBAL canonical pos0.
-                            pos0 - rope_shift,
-                        )?;
+                        match legacy_plane.as_ref() {
+                            Some(plane) => {
+                                ctl.head_write_through_archive_paged(gpu, plane, slot.0, pos0, m)?
+                            }
+                            None => ctl.head_write_through_archive(
+                                gpu,
+                                &state.mtp_kv.inner.k_gpu[0],
+                                &state.mtp_kv.inner.v_gpu[0],
+                                slot.0,
+                                pos0,
+                                m,
+                                // E: gather from the COMPACT staging offset; the seal
+                                // above stays at the GLOBAL canonical pos0.
+                                pos0 - rope_shift,
+                            )?,
+                        }
                         // f2-D: grow the head resident selection map with this
                         // chunk's accepted canonical pages (ninfer prefill
                         // `initialize`/append, NL:12274/12309). Full-resident
@@ -608,6 +751,10 @@ impl ModelRig {
                     outcome = Err(e);
                 }
             }
+        }
+        #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+        {
+            self.legacy_head_planes[slot.0] = legacy_plane;
         }
         self.mtp_states[slot.0] = Some(state);
         outcome
@@ -647,18 +794,39 @@ impl ModelRig {
 
         if self.mtp_states[slot.0].is_none() {
             // P4.1② f2 (E): bound the head KV under Layerwise+MTP; Legacy / AR-only
-            // get None ⇒ full-resident (byte-neutral).
-            let head_cap = kvmem_hooks::mtp_head_capacity(self);
-            let state = crate::mtp_spec::MtpSpecState::new_for_components(
-                &mut gpu,
-                &self.config,
-                &self.dn_states[slot.0],
-                head,
-                self.mtp_k,
-                crate::mtp_head::MtpKvMode::Q8,
-                head_cap,
-            )
-            .map_err(|e| format!("mtp state alloc: {e}"))?;
+            // get None ⇒ full-resident (byte-neutral). P1b plane-only keeps just
+            // a 128-token placeholder and writes every row into the paged arena.
+            #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+            let head_live = self.kvmem.as_ref().is_some_and(|c| c.head_live_enabled());
+            #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+            let head_live = false;
+            let head_cap = if head_live {
+                None
+            } else {
+                kvmem_hooks::mtp_head_capacity(self)
+            };
+            let state = if head_live {
+                crate::mtp_spec::MtpSpecState::new_for_components_paged_only(
+                    &mut gpu,
+                    &self.config,
+                    &self.dn_states[slot.0],
+                    head,
+                    self.mtp_k,
+                    crate::mtp_head::MtpKvMode::Q8,
+                )
+                .map_err(|e| format!("mtp state alloc: {e}"))?
+            } else {
+                crate::mtp_spec::MtpSpecState::new_for_components(
+                    &mut gpu,
+                    &self.config,
+                    &self.dn_states[slot.0],
+                    head,
+                    self.mtp_k,
+                    crate::mtp_head::MtpKvMode::Q8,
+                    head_cap,
+                )
+                .map_err(|e| format!("mtp state alloc: {e}"))?
+            };
             self.mtp_states[slot.0] = Some(state);
         }
         let mut state = self.mtp_states[slot.0]
@@ -718,11 +886,89 @@ impl ModelRig {
         #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
         type HeadLw<'a> = core::marker::PhantomData<&'a ()>;
 
+        // P1b: Legacy's bounded live head is addressed by COMPACT KV rows while
+        // RoPE stays on the global position. The shift is fixed for this draft
+        // span; a span that would start before the window fails loudly instead
+        // of aliasing another page.
+        #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+        let head_shift = self
+            .kvmem
+            .as_ref()
+            .filter(|ctl| ctl.head_composite_enabled())
+            .map(|ctl| ctl.head_prefill_shift(pos + self.mtp_k))
+            .unwrap_or(0);
+        #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+        let head_shift = 0usize;
+
+        // P1b: rebuild the paged Legacy head's sink + recent window from the
+        // composite aux plane before the draft attends. The plane is taken out
+        // of the rig so the closure can borrow it disjointly from `state`.
+        #[cfg(all(feature = "deltanet", feature = "kvmem"))]
+        let mut legacy_plane: Option<crate::kvmem_ctl::LegacyHeadPlane> =
+            if self.kvmem.as_ref().is_some_and(|c| c.head_live_enabled()) {
+                let (kv_mode, window_pages) = {
+                    let ctl = self.kvmem.as_ref().unwrap();
+                    // One trunk window plus the sink and one spare page; see
+                    // the prefill plane above. The spare absorbs a verify span
+                    // crossing the window front.
+                    let window = ctl.budget_blocks().saturating_add(2);
+                    (
+                        ctl.kv_mode(),
+                        u32::try_from(window)
+                            .map_err(|_| format!("mtp head plane: window {window} overflow"))?,
+                    )
+                };
+                if window_pages == 0 {
+                    return Err("mtp head plane: head window is empty".to_string());
+                }
+                let mut plane = match self.legacy_head_planes[slot.0].take() {
+                    Some(p) => p,
+                    None => crate::kvmem_ctl::LegacyHeadPlane::new(
+                        &mut gpu,
+                        kv_mode,
+                        head.config.n_head_kv,
+                        head.config.head_dim,
+                        window_pages,
+                    )?,
+                };
+                let restored = {
+                    let ctl = self.kvmem.as_ref().unwrap();
+                    plane.restore(
+                        &mut gpu,
+                        ctl,
+                        slot.0,
+                        u32::try_from(pos).unwrap_or(u32::MAX),
+                    )
+                };
+                match restored {
+                    Ok(()) => Some(plane),
+                    Err(e) => {
+                        let _ = plane.free(&mut gpu);
+                        if state.mtp_kv.paged_only() {
+                            self.mtp_states[slot.0] = Some(state);
+                            return Err(format!("mtp head paged-only restore: {e}"));
+                        }
+                        // No sealed aux page yet (cold start / short prompt):
+                        // keep the historical contiguous path authoritative
+                        // until the archive has something to page in.
+                        eprintln!(
+                            "[kvmem-head] paged restore skipped slot={slot:?} pos={pos}: {e}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+        let mut legacy_plane: Option<LegacyHeadPlane> = None;
+
         // The draft body, factored so the restore helper can run it through the
         // head handle (kvmem) or full-resident (fallback / default build). `gpu`
         // and the handle are parameters; the rest is captured disjointly.
         let mut run_draft = |gpu: &mut Gpu,
-                             hlw: Option<&mut HeadLw<'_>>|
+                             hlw: Option<&mut HeadLw<'_>>,
+                             _plane: Option<&mut LegacyHeadPlane>|
          -> Result<crate::mtp_spec::MtpDraftOutput, String> {
             if prompt_tokens.is_empty() {
                 return Err("mtp_draft_step: no seed token".to_string());
@@ -735,6 +981,15 @@ impl ModelRig {
                 .save_from(&mut self.dn_states[slot.0], gpu)
                 .map_err(|e| format!("mtp dn snapshot: {e}"))?;
 
+            // P1b: slide the bounded Legacy window once, before the draft
+            // (and before any proposal graph capture — a host copy inside a
+            // captured region would not replay).
+            if hlw.is_none() && head_shift > 0 {
+                state
+                    .mtp_kv
+                    .slide_to_shift(gpu, head_shift)
+                    .map_err(|e| format!("mtp head draft slide: {e}"))?;
+            }
             let draft_outcome = crate::mtp_spec::mtp_draft_phase_inner(
                 gpu,
                 &self.weights,
@@ -746,6 +1001,8 @@ impl ModelRig {
                 self.mtp_k,
                 /* skip_proposal_graph */ true,
                 hlw,
+                legacy_plane.as_mut(),
+                head_shift,
             )
             .map_err(|e| format!("mtp draft: {e}"));
             if crate::mtp_spec::mtp_trace_enabled() {
@@ -760,10 +1017,10 @@ impl ModelRig {
         let outcome: Result<crate::mtp_spec::MtpDraftOutput, String> = 'c: {
             let ctl = match kvmem_taken.as_mut() {
                 Some(c) => c,
-                None => break 'c run_draft(&mut gpu, None),
+                None => break 'c run_draft(&mut gpu, None, None),
             };
             if !ctl.head_plane_enabled() {
-                break 'c run_draft(&mut gpu, None);
+                break 'c run_draft(&mut gpu, None, None);
             }
             Self::mtp_draft_head_restore(
                 &mut gpu,
@@ -776,11 +1033,13 @@ impl ModelRig {
             )
         };
         #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
-        let outcome: Result<crate::mtp_spec::MtpDraftOutput, String> = run_draft(&mut gpu, None);
+        let outcome: Result<crate::mtp_spec::MtpDraftOutput, String> =
+            run_draft(&mut gpu, None, None);
 
         #[cfg(all(feature = "deltanet", feature = "kvmem"))]
         {
             self.kvmem = kvmem_taken;
+            self.legacy_head_planes[slot.0] = legacy_plane;
         }
         self.mtp_states[slot.0] = Some(state);
         self.spec_req_sampling[slot.0] = req_sampling;
@@ -845,7 +1104,7 @@ impl ModelRig {
             // overwrites `state.prev_hidden` with the last accepted verify row
             // (h_{pos+advance-1}) before returning. Legacy / AR-only skip this
             // (head_plane_enabled() == false ⇒ byte-neutral).
-            let head_consume = kvmem_hooks::head_plane_enabled(self);
+            let head_consume = kvmem_hooks::head_composite_enabled(self);
             if head_consume {
                 let dim = self.config.dim;
                 gpu.hip

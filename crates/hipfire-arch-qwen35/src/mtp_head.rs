@@ -789,6 +789,18 @@ pub struct Qwen35MtpHeadKvCache {
     pub n_head_kv: usize,
     pub head_dim: usize,
     pub kv_mode: MtpKvMode,
+    /// P1b: first GLOBAL token still addressable at compact row 0. Zero for the
+    /// full-resident cache and for a freshly bounded cache; advanced in whole
+    /// blocks by [`Self::slide_to_shift`] as the window moves.
+    pub head_shift: usize,
+    /// One K/V-buffer-sized device scratch for the in-place window slide. The
+    /// two-hop D2D copy keeps the slide graph-capturable (memcpy nodes cannot
+    /// overlap source and destination).
+    slide_buf: Option<GpuTensor>,
+    /// P1b plane-only mode: `inner` is a tiny placeholder; live K/V lives in
+    /// the paged `LegacyHeadPlane` arena. No contiguous write, slide or reset
+    /// is meaningful, and every forward must carry a `HeadPagedKv`.
+    paged_only: bool,
 }
 
 impl Qwen35MtpHeadKvCache {
@@ -853,13 +865,96 @@ impl Qwen35MtpHeadKvCache {
                 max_seq,
             )?,
         };
+        let slide_buf = match inner.k_gpu.first() {
+            Some(t) => Some(gpu.alloc_tensor(&t.shape, t.dtype)?),
+            None => None,
+        };
         Ok(Self {
             inner,
             max_seq,
             n_head_kv: config.n_head_kv,
             head_dim: config.head_dim,
             kv_mode,
+            head_shift: 0,
+            slide_buf,
+            paged_only: false,
         })
+    }
+
+    /// P1b plane-only cache: keep the logical `max_seq` (so global-position
+    /// checks stay meaningful) but allocate a single 128-token placeholder.
+    /// Live K/V lives in [`crate::kvmem_ctl::LegacyHeadPlane`]; every forward
+    /// must carry a `HeadPagedKv` and the contiguous path is never written.
+    pub fn new_paged_only(
+        gpu: &mut Gpu,
+        config: &Qwen35MtpHeadConfig,
+        kv_mode: MtpKvMode,
+    ) -> HipResult<Self> {
+        let physical = config.max_seq.min(128).max(1);
+        let mut cache = Self::new_with_kv_mode_bounded(gpu, config, kv_mode, physical)?;
+        cache.max_seq = config.max_seq;
+        cache.paged_only = true;
+        Ok(cache)
+    }
+
+    #[inline]
+    pub fn paged_only(&self) -> bool {
+        self.paged_only
+    }
+
+    /// P1b: slide the bounded contiguous window left when the block-quantized
+    /// `shift` advances (whole `KV_BLOCK_TOKENS` at a time). Copies the live
+    /// K/V bytes down by `delta` rows so compact row `r` always means global
+    /// `shift + r`; rows before the new shift are dropped. No-op for the
+    /// full-resident cache (`shift == 0` for its whole life).
+    pub fn slide_to_shift(&mut self, gpu: &mut Gpu, shift: usize) -> HipResult<()> {
+        if self.paged_only {
+            self.head_shift = shift;
+            return Ok(());
+        }
+        if shift <= self.head_shift {
+            return Ok(());
+        }
+        let delta = shift - self.head_shift;
+        self.head_shift = shift;
+        eprintln!("[kvmem-head] slide shift={shift} delta={delta}");
+        for buf in self.inner.k_gpu.iter().chain(self.inner.v_gpu.iter()) {
+            let size = buf.buf.size();
+            let row = if size >= self.max_seq {
+                size / self.max_seq
+            } else {
+                0
+            };
+            let drop = delta.saturating_mul(row);
+            if row == 0 || drop >= size {
+                continue;
+            }
+            let scratch = self
+                .slide_buf
+                .as_ref()
+                .filter(|scratch| scratch.buf.size() >= size)
+                .ok_or_else(|| {
+                    hip_bridge::HipError::new(
+                        1,
+                        &format!("mtp head slide: no {size}-byte scratch buffer"),
+                    )
+                })?;
+            let bytes = size - drop;
+            // Two-hop, non-overlapping D2D. Ordered on the active stream so a
+            // captured graph replays it; the host never sees the bytes.
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip
+                    .memcpy_dtod_async_at(&scratch.buf, 0, &buf.buf, drop, bytes, stream)?;
+                gpu.hip
+                    .memcpy_dtod_async_at(&buf.buf, 0, &scratch.buf, 0, bytes, stream)?;
+            } else {
+                gpu.hip
+                    .memcpy_dtod_at(&scratch.buf, 0, &buf.buf, drop, bytes)?;
+                gpu.hip
+                    .memcpy_dtod_at(&buf.buf, 0, &scratch.buf, 0, bytes)?;
+            }
+        }
+        Ok(())
     }
 
     /// Reset positions to all-zeros. Q8 K/V slots are 34 B per 32-element
@@ -870,6 +965,10 @@ impl Qwen35MtpHeadKvCache {
     /// bytes across the full K/V buffers. Setting the flag to `0` preserves
     /// the original host-zero allocation and H2D-copy path.
     pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        self.head_shift = 0;
+        if self.paged_only {
+            return Ok(());
+        }
         if mtp_fill_fast_enabled() {
             gpu.bind_thread()?;
             for layer in 0..self.inner.k_gpu.len() {
@@ -910,6 +1009,9 @@ impl Qwen35MtpHeadKvCache {
         // leaks the k_gpu/v_gpu buffers. Free them explicitly. (The old
         // "they free on Drop" comment was false; see mtp_spec/mtp_compose
         // which already bypass this wrapper for the same reason.)
+        if let Some(slide) = self.slide_buf {
+            let _ = gpu.free_tensor(slide);
+        }
         let _ = self.inner.free_gpu(gpu);
     }
 }
@@ -2675,15 +2777,23 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
     // cache. Under the bounded paged pool `pos` is the global frontier hint and
     // may exceed the pool capacity — the COMPACT write position (`paged.positions`)
     // is the real bound, validated by the head staging geometry, so skip this assert.
-    if paged.is_none() && pos >= kv.max_seq {
-        return Err(HipError::new(
-            0,
-            &format!(
-                "mtp_head_forward_block_only_with_pos_buf: pos={pos} >= kv.max_seq={} \
-                 (bounded head KV requires a paged Layerwise source)",
-                kv.max_seq
-            ),
-        ));
+    if paged.is_none() {
+        if kv.paged_only {
+            return Err(HipError::new(
+                0,
+                "paged-only head cache requires a HeadPagedKv target",
+            ));
+        }
+        if pos >= kv.max_seq {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "mtp_head_forward_block_only_with_pos_buf: pos={pos} >= kv.max_seq={} \
+                     (bounded head KV requires a paged Layerwise source)",
+                    kv.max_seq
+                ),
+            ));
+        }
     }
 
     // ── 1. Token embedding (table lookup OR caller-supplied override) ────
@@ -3551,6 +3661,11 @@ pub fn mtp_head_forward_block_batched(
     // while K/V land at `positions`. `0` ⇒ compact == global (full-resident /
     // Legacy): byte-identical to the pre-E single-coordinate path.
     rope_shift: i32,
+    // P1b: optional bounded Legacy head arena. When set (kv_only Q8 fill) the
+    // same K/V rows are also written at the arena's compact coordinates, so
+    // the next draft reads them in place instead of re-copying the append
+    // pages from the archive.
+    paged: Option<&HeadPagedKv<'_>>,
 ) -> HipResult<()> {
     // qt53 has only the serial decode route: typed refusal before ANY launch
     // (attention included), never the generic batched-MoE panic below.
@@ -3576,6 +3691,21 @@ pub fn mtp_head_forward_block_batched(
         prev_hiddens_stacked.numel(),
         n * dim
     );
+    if paged.is_some() {
+        assert!(
+            kv_only,
+            "paged head KV writes require the kv_only fill path"
+        );
+        if kv.kv_mode != MtpKvMode::Q8 {
+            return Err(HipError::new(0, "paged head KV writes require Q8 head KV"));
+        }
+    }
+    if kv.paged_only && paged.is_none() {
+        return Err(HipError::new(
+            0,
+            "paged-only head cache requires a HeadPagedKv target",
+        ));
+    }
     for &p in positions {
         assert!(
             (p as usize) < kv.max_seq,
@@ -3854,22 +3984,51 @@ pub fn mtp_head_forward_block_batched(
     // (single-token softmax = 1). We still write K/V to make the KV cache
     // available for future cycles that wire historical reads.
     //
-    gpu.kv_cache_write_q8_0_batched(
-        &kv.inner.k_gpu[0],
-        &k_view,
-        &scratch.positions,
-        cfg.n_head_kv,
-        cfg.head_dim,
-        n,
-    )?;
-    gpu.kv_cache_write_q8_0_batched(
-        &kv.inner.v_gpu[0],
-        &v_view,
-        &scratch.positions,
-        cfg.n_head_kv,
-        cfg.head_dim,
-        n,
-    )?;
+    if !kv.paged_only {
+        gpu.kv_cache_write_q8_0_batched(
+            &kv.inner.k_gpu[0],
+            &k_view,
+            &scratch.positions,
+            cfg.n_head_kv,
+            cfg.head_dim,
+            n,
+        )?;
+        gpu.kv_cache_write_q8_0_batched(
+            &kv.inner.v_gpu[0],
+            &v_view,
+            &scratch.positions,
+            cfg.n_head_kv,
+            cfg.head_dim,
+            n,
+        )?;
+    }
+    // P1b: mirror the same rows into the bounded Legacy arena at its compact
+    // coordinates. With a paged-only cache this is the ONLY K/V write; with a
+    // contiguous cache it makes the next draft's restore a no-copy fast path.
+    if let Some(paged) = paged {
+        gpu.kv_cache_write_q8_0_batched_slots(
+            paged.k_view,
+            &k_view,
+            paged.positions,
+            cfg.n_head_kv,
+            cfg.head_dim,
+            n,
+            Some(paged.descs),
+            Some(paged.row_slot),
+            false,
+        )?;
+        gpu.kv_cache_write_q8_0_batched_slots(
+            paged.v_view,
+            &v_view,
+            paged.positions,
+            cfg.n_head_kv,
+            cfg.head_dim,
+            n,
+            Some(paged.descs),
+            Some(paged.row_slot),
+            true,
+        )?;
+    }
     if kv_only {
         return Ok(());
     }

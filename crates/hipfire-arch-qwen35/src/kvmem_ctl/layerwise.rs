@@ -279,6 +279,19 @@ impl KvMemCtl {
         self.head_plane
     }
 
+    /// P1b: Legacy + native MTP pages its live head KV through the composite
+    /// aux plane. Only the bounded cache / archive / carrier paths read this;
+    /// Layerwise-only live maps keep `head_plane_enabled`.
+    pub fn head_live_enabled(&self) -> bool {
+        self.head_live
+    }
+
+    /// Either head plane owns a bounded aux record, so the composite record,
+    /// write-through, bounded capacity and prefill shift apply.
+    pub fn head_composite_enabled(&self) -> bool {
+        self.head_plane || self.head_live
+    }
+
     /// P4.1③ H5: the resolved head-history policy (FirstLayer auto-default under
     /// Layerwise+MTP; UpstreamGlobal opt-in). The orchestration branches the head
     /// aux binding on this at the prefill-seed and the decode/verify carrier
@@ -322,8 +335,10 @@ impl KvMemCtl {
     /// admission ceiling here (unlike the trunk pressure owners); the map starts
     /// empty and the first FirstLayer binding (G5) populates it.
     pub fn ensure_head_plane(&mut self, slot: usize) -> Result<(), String> {
-        if !self.head_plane {
-            return Err("kvmem: head plane requires layerwise recall and native MTP".to_string());
+        if !self.head_composite_enabled() {
+            return Err(
+                "kvmem: head plane requires layerwise recall or Legacy live MTP".to_string(),
+            );
         }
         let st = self
             .slots
@@ -436,9 +451,9 @@ impl KvMemCtl {
         k_rows: &[u8],
         v_rows: &[u8],
     ) -> Result<(), String> {
-        if !self.head_plane {
+        if !self.head_composite_enabled() {
             return Err(
-                "kvmem head write-through: head plane inactive (requires Layerwise + MTP)"
+                "kvmem head write-through: head plane inactive (requires Layerwise or Legacy live MTP)"
                     .to_string(),
             );
         }
@@ -487,9 +502,9 @@ impl KvMemCtl {
         n_rows: usize,
         src_pos0: usize,
     ) -> Result<(), String> {
-        if !self.head_plane {
+        if !self.head_composite_enabled() {
             return Err(
-                "kvmem head write-through: head plane inactive (requires Layerwise + MTP)"
+                "kvmem head write-through: head plane inactive (requires Layerwise or Legacy live MTP)"
                     .to_string(),
             );
         }
@@ -522,6 +537,105 @@ impl KvMemCtl {
         self.seal_head_plane(slot, pos0, n_rows, &k_rows, &v_rows)
     }
 
+    /// P1b plane-only flush: gather accepted rows from the paged Legacy arena
+    /// instead of a contiguous head cache, then seal them into the composite
+    /// aux plane. `pos0` is the global first position of the span.
+    pub fn head_write_through_archive_paged(
+        &mut self,
+        gpu: &Gpu,
+        plane: &super::LegacyHeadPlane,
+        slot: usize,
+        pos0: usize,
+        n_rows: usize,
+    ) -> Result<(), String> {
+        if !self.head_composite_enabled() {
+            return Err(
+                "kvmem head write-through: head plane inactive (requires Layerwise or Legacy live MTP)"
+                    .to_string(),
+            );
+        }
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let (krow, vrow) = self.head_row_bytes();
+        if n_rows * krow > self.wt_k.len() || n_rows * vrow > self.wt_v.len() {
+            return Err(format!(
+                "kvmem head write-through: feed of {n_rows} rows exceeds the staging \
+                 capacity ({} K / {} V bytes)",
+                self.wt_k.len(),
+                self.wt_v.len()
+            ));
+        }
+        let mut k_rows = vec![0u8; n_rows * krow];
+        let mut v_rows = vec![0u8; n_rows * vrow];
+        plane.gather_rows(gpu, self, pos0, n_rows, &mut k_rows, &mut v_rows)?;
+        self.seal_head_plane(slot, pos0, n_rows, &k_rows, &v_rows)
+    }
+
+    /// P1b: direct-copy one Legacy head aux page into caller-owned packed rows.
+    /// Unlike the Layerwise restore (which goes through the payload layout and
+    /// host records), the Legacy composite record is already the exact packed
+    /// byte image, so the carrier can `copy_k_gpu`/`copy_v_gpu` straight into
+    /// the head arena stripe. `rows <= KV_BLOCK_TOKENS`.
+    pub fn copy_legacy_head_page(
+        &self,
+        slot: usize,
+        page: u32,
+        rows: u32,
+        k_rows: &mut [u8],
+        v_rows: &mut [u8],
+    ) -> Result<(), String> {
+        if !self.head_live {
+            return Err("kvmem Legacy head copy: live head paging is off".to_string());
+        }
+        let st = self
+            .slots
+            .get(slot)
+            .ok_or_else(|| format!("kvmem Legacy head copy: slot {slot} out of range"))?;
+        let krow = self.k_page_bytes / KV_BLOCK_TOKENS;
+        let vrow = self.v_page_bytes / KV_BLOCK_TOKENS;
+        if k_rows.len() < rows as usize * krow || v_rows.len() < rows as usize * vrow {
+            return Err(format!(
+                "kvmem Legacy head copy: buffers {}x{} / {}x{} too small for {rows} rows",
+                k_rows.len(),
+                krow,
+                v_rows.len(),
+                vrow
+            ));
+        }
+        if !st.raw.copy_k_gpu(
+            page,
+            self.aux_ordinal,
+            &mut k_rows[..rows as usize * krow],
+            rows,
+        ) {
+            return Err(format!(
+                "kvmem Legacy head copy: K page {page} aux {} unavailable",
+                self.aux_ordinal
+            ));
+        }
+        if !st.raw.copy_v_gpu(
+            page,
+            self.aux_ordinal,
+            &mut v_rows[..rows as usize * vrow],
+            rows,
+        ) {
+            return Err(format!(
+                "kvmem Legacy head copy: V page {page} aux {} unavailable",
+                self.aux_ordinal
+            ));
+        }
+        Ok(())
+    }
+
+    /// P1b: the packed per-row byte strides of the head aux plane.
+    pub fn head_row_bytes(&self) -> (usize, usize) {
+        (
+            self.k_page_bytes / KV_BLOCK_TOKENS,
+            self.v_page_bytes / KV_BLOCK_TOKENS,
+        )
+    }
+
     /// P4.1② G3c: the MTP head's BOUNDED token capacity (design §A.8 Q1, the
     /// hipfire analog of ninfer `layerwise_mtp_auxiliary_capacity`): the trunk
     /// layerwise working-set window (`window_tokens`) PLUS ONE native draft-scratch
@@ -531,9 +645,10 @@ impl KvMemCtl {
     /// Fail-closed off the Layerwise+MTP path and on a non-page-aligned / zero
     /// window (the ① [`mtp_auxiliary_capacity`] guard), keeping Legacy byte-neutral.
     pub fn head_pool_capacity(&self, window_tokens: usize) -> Result<usize, String> {
-        if !self.head_plane {
+        if !self.head_composite_enabled() {
             return Err(
-                "kvmem head pool: head plane inactive (requires Layerwise + MTP)".to_string(),
+                "kvmem head pool: head plane inactive (requires Layerwise or Legacy live MTP)"
+                    .to_string(),
             );
         }
         mtp_auxiliary_capacity(window_tokens, KV_BLOCK_TOKENS)
@@ -548,10 +663,19 @@ impl KvMemCtl {
     /// non-page-aligned / zero window fails closed to `None` rather than bounding
     /// to a bad geometry.
     pub fn head_bounded_capacity(&self) -> Option<usize> {
-        if !self.head_plane {
+        if !self.head_composite_enabled() {
             return None;
         }
         let window = self.budget_blocks().checked_mul(KV_BLOCK_TOKENS)?;
+        if self.head_live {
+            // P1b: the contiguous cache is only the staging source for the
+            // archive, not a second working set. Every HEAD_LIVE write also
+            // lands in the paged arena, and `head_prefill_shift` is computed
+            // from the span end, so compact rows never exceed the window plus
+            // one native block. Bound it exactly like the Layerwise head pool
+            // instead of keeping a second window of slack.
+            return self.head_pool_capacity(window).ok();
+        }
         self.head_pool_capacity(window).ok()
     }
 
@@ -564,11 +688,23 @@ impl KvMemCtl {
     /// per-chunk archive staging under Layerwise (the G4 carrier is the attention
     /// source), so each chunk re-stages independently — no slide.
     pub fn head_prefill_shift(&self, frontier: usize) -> usize {
-        if !self.head_plane {
+        if !self.head_composite_enabled() {
             return 0;
         }
         let window = self.budget_blocks().saturating_mul(KV_BLOCK_TOKENS);
-        frontier.saturating_sub(window)
+        let removed = frontier.saturating_sub(window);
+        if self.head_live {
+            // A contiguous Legacy cache can only slide in whole blocks (its
+            // rows are addressable by `global - shift`); Layerwise's paged aux
+            // arena tiles rows and keeps the exact shift. Round the shift UP to
+            // the next block: a floor would leave up to one block of the trunk
+            // window above `window`, consuming the cache's draft-scratch block
+            // and leaving no room for the next draft row (compact end could
+            // reach `window + KV_BLOCK_TOKENS - 1`).
+            removed.div_ceil(KV_BLOCK_TOKENS) * KV_BLOCK_TOKENS
+        } else {
+            removed
+        }
     }
 
     /// P4.1② G3c: build the MTP head's bounded composite-slot pool geometry (①
@@ -581,9 +717,10 @@ impl KvMemCtl {
     /// replacing the historical full-resident head `KvCache`. Fail-closed off the
     /// Layerwise+MTP path; Legacy / AR-only allocate nothing (byte-neutral).
     pub fn head_pool(&self, window_tokens: usize) -> Result<LayerwisePagePool, String> {
-        if !self.head_plane {
+        if !self.head_composite_enabled() {
             return Err(
-                "kvmem head pool: head plane inactive (requires Layerwise + MTP)".to_string(),
+                "kvmem head pool: head plane inactive (requires Layerwise or Legacy live MTP)"
+                    .to_string(),
             );
         }
         mtp_head_pool(
@@ -812,9 +949,10 @@ impl KvMemCtl {
     /// head map, or on a map that does not reconstruct `end` — Legacy / AR-only
     /// never publish a head append (byte-neutral).
     pub fn accept_head_append(&mut self, slot: usize, begin: u64, end: u64) -> Result<(), String> {
-        if !self.head_plane {
+        if !self.head_composite_enabled() {
             return Err(
-                "kvmem head append: head plane inactive (requires Layerwise + MTP)".to_string(),
+                "kvmem head append: head plane inactive (requires Layerwise or Legacy live MTP)"
+                    .to_string(),
             );
         }
         let head = self

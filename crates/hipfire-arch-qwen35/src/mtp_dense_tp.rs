@@ -588,6 +588,8 @@ pub fn spec_step_mtp_dense_tp(
             max_n,
             /* skip_proposal_graph */ true,
             None,
+            None,
+            0,
         )
         .map_err(|e| format!("dense TP MTP draft: {e}"))?
     };
@@ -784,6 +786,7 @@ pub fn prefill_trunk_and_mtp_cache_dense_tp(
                         Some(rot),
                         true,
                         /* rope_shift */ 0,
+                        None,
                     )
                     .map_err(|e| format!("dense TP MTP batched head fill: {e}"))?;
                 }

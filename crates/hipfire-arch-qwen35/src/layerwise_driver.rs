@@ -609,6 +609,40 @@ impl LayerwiseDescStaging {
         Ok(())
     }
 
+    /// Upload explicit compact positions for `layer` (at most `width`).
+    /// [`Self::update_layer`] derives the usual `seq_len - width + i` span; a
+    /// paged window that writes an arbitrary accepted span (frontier fill)
+    /// needs its own compact coordinates instead.
+    pub fn upload_positions(
+        &self,
+        gpu: &mut Gpu,
+        layer: usize,
+        positions: &[i32],
+    ) -> Result<(), String> {
+        let buf = self.positions.get(layer).ok_or_else(|| {
+            format!(
+                "layerwise desc staging: positions layer {layer} >= n_layers {}",
+                self.n_layers
+            )
+        })?;
+        if positions.len() > self.width {
+            return Err(format!(
+                "layerwise desc staging: {} positions > width {}",
+                positions.len(),
+                self.width
+            ));
+        }
+        if positions.is_empty() {
+            return Ok(());
+        }
+        gpu.hip
+            .memcpy_htod(&buf.buf, unsafe {
+                std::slice::from_raw_parts(positions.as_ptr() as *const u8, positions.len() * 4)
+            })
+            .map_err(|e| format!("layerwise desc staging: positions H2D layer {layer}: {e:?}"))?;
+        Ok(())
+    }
+
     /// Layer `layer`'s descriptor tensor (one [`KvSlotDesc`], stable address).
     pub fn descs(&self, layer: usize) -> Result<&GpuTensor, String> {
         self.descs.get(layer).ok_or_else(|| {

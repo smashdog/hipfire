@@ -58,6 +58,14 @@ pub(crate) struct KvMemOptions {
     pub(crate) content_groups: Option<usize>,
     pub(crate) content_cache_dir: Option<String>,
     pub(crate) content_cache_bytes: Option<u64>,
+    /// `HIPFIRE_KVMEM_DN_IDLE`: demote an idle session's DeltaNet state to a
+    /// host image and restore it on the next continuation. Default off.
+    pub(crate) dn_idle: Option<bool>,
+    /// `HIPFIRE_KVMEM_DN_RING_DIR`: mirror page-aligned DN checkpoints here so
+    /// they survive a process restart. Defaults to `<cache dir>/dn-ring`.
+    pub(crate) dn_ring_dir: Option<String>,
+    /// `HIPFIRE_KVMEM_DN_DISK_MIB`: disk mirror cap; `0` disables persistence.
+    pub(crate) dn_disk_mib: Option<u64>,
     pub(crate) spill_dir: Option<String>,
     pub(crate) spill_bytes: Option<u64>,
     pub(crate) layerwise_activation_ram_mib: Option<String>,
@@ -111,6 +119,9 @@ impl Default for KvMemOptions {
             content_groups: None,
             content_cache_dir: None,
             content_cache_bytes: None,
+            dn_idle: None,
+            dn_ring_dir: None,
+            dn_disk_mib: None,
             spill_dir: None,
             spill_bytes: None,
             layerwise_activation_ram_mib: None,
@@ -206,6 +217,9 @@ where
         content_groups: get("HIPFIRE_KVMEM_CONTENT_GROUPS").and_then(|v| v.parse().ok()),
         content_cache_dir: get("HIPFIRE_KVMEM_CACHE_DIR"),
         content_cache_bytes: get("HIPFIRE_KVMEM_CACHE_BYTES").and_then(|v| v.parse().ok()),
+        dn_idle: get("HIPFIRE_KVMEM_DN_IDLE").map(|v| enabled(Some(&v))),
+        dn_ring_dir: get("HIPFIRE_KVMEM_DN_RING_DIR"),
+        dn_disk_mib: get("HIPFIRE_KVMEM_DN_DISK_MIB").and_then(|v| v.parse().ok()),
         spill_dir: get("HIPFIRE_KVMEM_SPILL_DIR"),
         spill_bytes: get("HIPFIRE_KVMEM_SPILL_BYTES").and_then(|v| v.parse().ok()),
         layerwise_activation_ram_mib: get("HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_RAM_MIB"),
@@ -249,6 +263,9 @@ mod tests {
             ("HIPFIRE_KVMEM_TRACE", "on"),
             ("HIPFIRE_KVMEM_VERIFY", "1"),
             ("HIPFIRE_KVMEM_BATCH_XFER", "off"),
+            ("HIPFIRE_KVMEM_DN_IDLE", "on"),
+            ("HIPFIRE_KVMEM_DN_RING_DIR", "/tmp/dn-ring"),
+            ("HIPFIRE_KVMEM_DN_DISK_MIB", "256"),
         ])
         .expect("snapshot");
         assert_eq!(options.strategy, RecallStrategy::Layerwise);
@@ -259,6 +276,9 @@ mod tests {
         assert!(options.diagnostics.verify);
         assert!(!options.diagnostics.trace_keep);
         assert!(!options.batch_xfer);
+        assert_eq!(options.dn_idle, Some(true));
+        assert_eq!(options.dn_ring_dir.as_deref(), Some("/tmp/dn-ring"));
+        assert_eq!(options.dn_disk_mib, Some(256));
     }
 
     #[test]

@@ -255,6 +255,36 @@ pub struct KvMemStats {
     pub enabled: bool,
     /// Layerwise recall strategy active (per-layer selection) vs Legacy.
     pub layerwise: bool,
+    /// P0 ownership contract: which caches this run actually manages. Trunk
+    /// attention KV is always managed when `enabled`; the remaining flags are
+    /// mode- and feature-dependent and are the authoritative answer to
+    /// "what did KVMem take over?" (they are not inferred from bytes).
+    pub trunk_managed: bool,
+    pub mtp_head_managed: bool,
+    /// P1: the MTP head KV is captured in KVMem history images. Layerwise
+    /// additionally pages it live on the aux plane (`mtp_head_managed`);
+    /// Legacy keeps the live cache private but parks/restores its full image.
+    pub mtp_head_history_managed: bool,
+    pub dn_state_managed: bool,
+    pub dflash_managed: bool,
+    /// Live per-slot DeltaNet recurrent-state bytes and resident slots. These
+    /// are engine-owned today (reported for the ownership ledger, not paged).
+    pub dn_state_bytes: u64,
+    pub dn_state_slots: u32,
+    /// Page-aligned recurrent checkpoints currently in the engine pool.
+    pub dn_checkpoints: u32,
+    pub dn_checkpoint_bytes: u64,
+    /// S0 state-image ledger: retained DN/DFlash/MTP images, their charged
+    /// host bytes, and cumulative lifecycle transitions. All zero until the
+    /// state store starts retaining images.
+    pub state_images: u32,
+    pub state_host_bytes: u64,
+    pub state_demotions: u64,
+    pub state_promotions: u64,
+    pub state_restores: u64,
+    /// Media (vision) pages are pinned as indivisible prefix groups. Legacy
+    /// gained this in P4; Layerwise has always pinned them.
+    pub media_pins: bool,
     /// Host KV storage charged bytes (live + sealed payload + metadata).
     pub host_charged_bytes: u64,
     /// Host KV storage spilled to the disk tier.
@@ -294,6 +324,10 @@ pub struct KvMemStats {
     pub draft_images: u64,
     pub draft_image_hits: u64,
     pub draft_image_misses: u64,
+    /// P3: on-disk `<pack>.draft` images and their bytes (charged to the
+    /// content cache cap alongside packs and DN sidecars).
+    pub draft_sidecars: u64,
+    pub draft_sidecar_bytes: u64,
     /// 期3 G3: distinct content groups retained in the prefix directory.
     pub content_groups: u64,
     /// Entries retired by the group-aware publication plan.

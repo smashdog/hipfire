@@ -2553,6 +2553,22 @@ impl Gpu {
         self.hip.stream_end_capture(stream)
     }
 
+    /// Abort an in-flight stream capture, preserving the original forward error
+    /// instead of letting `hipStreamEndCapture` mask it with error 901.
+    pub fn abort_stream_capture(&mut self) {
+        let stream = self
+            .active_stream
+            .as_ref()
+            .map(|stream| unsafe { stream.alias() });
+        if let Some(stream) = stream {
+            self.graphs
+                .abort_graph_capture(&self.hip, self.device_id, &stream);
+        } else {
+            self.graphs.capture_mode = false;
+            self.graphs.capture_blobs.clear();
+        }
+    }
+
     /// Launch a previously instantiated graph on this `Gpu`'s stream.
     pub fn launch_graph(&mut self, exec: &hip_bridge::GraphExec) -> HipResult<()> {
         self.bind_thread()?;

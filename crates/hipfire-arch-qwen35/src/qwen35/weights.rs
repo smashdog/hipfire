@@ -3715,6 +3715,31 @@ impl DeltaNetState {
         Self::new_batched_with_quant(gpu, config, quant, 1)
     }
 
+    /// A parked-slot placeholder with no device allocations.
+    ///
+    /// The slot keeps its `quant` so the state store can reallocate the same
+    /// representation on promotion without consulting the model again. An
+    /// empty state is never a valid forward operand: the serve forward entry
+    /// rejects active slots in this state, and `free_gpu` on it is a no-op.
+    pub fn empty(quant: StateQuant) -> Self {
+        Self {
+            s_matrices: Vec::new(),
+            s_scales: Vec::new(),
+            conv_states: Vec::new(),
+            s_ef_residual: Vec::new(),
+            quant,
+        }
+    }
+
+    /// True when this is the parked placeholder from [`Self::empty`].
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.s_matrices.is_empty()
+            && self.s_scales.is_empty()
+            && self.conv_states.is_empty()
+            && self.s_ef_residual.is_empty()
+    }
+
     /// Allocate lane-major recurrent state for independent-sequence decode.
     ///
     /// The ordinary state has an implicit batch of one.  This variant keeps

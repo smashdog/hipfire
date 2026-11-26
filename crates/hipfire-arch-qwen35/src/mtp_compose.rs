@@ -1031,6 +1031,7 @@ pub fn spec_step_dflash_mtp_tree(
         Some(&state.gemm_rotate_scratch),
         false,
         /* rope_shift */ 0,
+        None,
     )?;
 
     // ── 3. Batched MTP lm_head + top-K extraction ─────────────────────────

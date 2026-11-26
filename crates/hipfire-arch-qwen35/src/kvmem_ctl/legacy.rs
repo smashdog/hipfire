@@ -72,6 +72,7 @@ impl KvMemCtl {
         &self,
         source: &LegacyStoreSnapshot,
         query: &crate::legacy_query::LegacyQuery,
+        media_pages: &[u32],
     ) -> Result<(Vec<u32>, Vec<f64>), String> {
         let config = self
             .legacy
@@ -168,7 +169,7 @@ impl KvMemCtl {
             KV_BLOCK_TOKENS as u32,
             self.kv_cfg.sink_blocks,
             self.kv_cfg.recent_blocks,
-            &[],
+            media_pages,
         )
         .map_err(|e| format!("kvmem Query mandatory: {e}"))?;
         if required.len() > self.budget_blocks {
@@ -249,6 +250,7 @@ impl KvMemCtl {
         incoming_rows: &[usize],
         decoding: &[bool],
         replaying: &[bool],
+        media_pages: &[Vec<u32>],
         k_arenas: &[GpuTensor],
         v_arenas: &[GpuTensor],
     ) -> Result<(), String> {
@@ -304,9 +306,22 @@ impl KvMemCtl {
                 KV_BLOCK_TOKENS as u32,
                 self.kv_cfg.sink_blocks,
                 self.kv_cfg.recent_blocks,
-                &[],
+                media_pages.get(slot).map(Vec::as_slice).unwrap_or(&[]),
             )
             .map_err(|e| format!("kvmem pressure mandatory: {e}"))?;
+            // Media spans are indivisible prefix groups: every page a live
+            // image touches must remain resident across pressure, exactly as
+            // the Layerwise decoder pins them. A pin that is already spilled
+            // cannot be recovered by the resident-only Legacy pressure pass,
+            // so refuse instead of silently dropping image KV.
+            for &pin in media_pages.get(slot).map(Vec::as_slice).unwrap_or(&[]) {
+                if (pin as usize) < frontier.div_ceil(KV_BLOCK_TOKENS) && !candidates.contains(&pin)
+                {
+                    return Err(format!(
+                        "kvmem: Legacy media pin page {pin} is not resident"
+                    ));
+                }
+            }
             // Hipfire has no accepted attention-mass producer on this Legacy
             // route. The core's empty-feedback frame has zero mass and uses
             // its own deterministic recency tie-break; never recycle Query
@@ -342,6 +357,13 @@ impl KvMemCtl {
                     "kvmem: protected Legacy working set leaves insufficient append reserve".into(),
                 );
             }
+            if let Some(pins) = media_pages.get(slot) {
+                if let Some((pin, _)) = spill.iter().find(|(lp, _)| pins.contains(&(*lp as u32))) {
+                    return Err(format!(
+                        "kvmem: Legacy pressure selected media pin page {pin} for spill"
+                    ));
+                }
+            }
             let mut elapsed = std::time::Duration::ZERO;
             let mut ignored_count = 0;
             self.flush_spill_batch(
@@ -358,9 +380,11 @@ impl KvMemCtl {
             self.spill_pages_total += spill.len() as u64;
             let bytes = spill.len() * self.n_fa_layers * (self.k_page_bytes + self.v_page_bytes);
             eprintln!(
-                "[kvmem-legacy] {} slot={slot} frontier={frontier} incoming={incoming} resident_before={} kept={} window_pages={window_pages} spill_pages={} spill_bytes={bytes} restore_bytes=0",
+                "[kvmem-legacy] {} slot={slot} frontier={frontier} incoming={incoming} resident_before={} kept={} window_pages={window_pages} media_pins={} spill_pages={} spill_bytes={bytes} restore_bytes=0",
                 if decoding.get(slot).copied().unwrap_or(false) { "DecodePressure" } else { "Pressure" },
-                candidates.len(), keep.len(), spill.len(),
+                candidates.len(), keep.len(),
+                media_pages.get(slot).map(Vec::len).unwrap_or(0),
+                spill.len(),
             );
         }
         Ok(())
@@ -419,7 +443,7 @@ impl KvMemCtl {
                 )?;
                 resident_pages.push(lp as u32);
             } else {
-                for layer in 0..self.n_fa_layers {
+                for layer in 0..self.n_record_layers {
                     if !st.raw.has_k_gpu(lp as u32, layer as u32, rows as u32)
                         || !st.raw.has_v_gpu(lp as u32, layer as u32, rows as u32)
                     {
@@ -445,7 +469,7 @@ impl KvMemCtl {
         let sealed = raw
             .capture_snapshot(blocks as u32, None)
             .map_err(|e| format!("kvmem snapshot manifest: {e}"))?;
-        if !sealed.ready() || !sealed.covers_packed(blocks as u32, self.n_fa_layers as u32) {
+        if !sealed.ready() || !sealed.covers_packed(blocks as u32, self.n_record_layers as u32) {
             return Err("kvmem: Legacy snapshot is not a complete all-layer image".into());
         }
         let retrieval = st
@@ -502,7 +526,7 @@ impl KvMemCtl {
         if !source.sealed.ready()
             || !source
                 .sealed
-                .covers_packed(blocks as u32, self.n_fa_layers as u32)
+                .covers_packed(blocks as u32, self.n_record_layers as u32)
         {
             return Err("kvmem: Legacy restore source is incomplete".into());
         }
