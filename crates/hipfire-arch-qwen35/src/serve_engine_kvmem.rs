@@ -3305,7 +3305,7 @@ pub(super) fn kvmem_feed_step(
                             let paged_only = state.mtp_kv.paged_only();
                             if paged_only {
                                 if rig.model.legacy_head_planes[s].is_none() {
-                                    let window = ctl.budget_blocks().saturating_add(2);
+                                    let window = ctl.budget_blocks();
                                     let kv_mode = ctl.kv_mode();
                                     let window_pages = u32::try_from(window).map_err(|_| {
                                         format!("kvmem AR head plane window {window} overflow")

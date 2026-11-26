@@ -566,12 +566,11 @@ impl ModelRig {
             if self.kvmem.as_ref().is_some_and(|c| c.head_live_enabled()) {
                 let (kv_mode, window_pages) = {
                     let ctl = self.kvmem.as_ref().unwrap();
-                    // P1b: one trunk window plus the sink and one spare page.
-                    // A 1024-row prefill chunk spans at most eight pages, so
-                    // the chunk's start page stays retained while `stage_rows`
-                    // remaps the window to the chunk end; the spare page
-                    // absorbs a draft/verify span that crosses the front.
-                    let window = ctl.budget_blocks().saturating_add(2);
+                    // P1b: pass only the retained trunk window. The plane itself
+                    // adds the sink and draft spare page. A 1024-row prefill
+                    // chunk spans at most eight pages, so its start page stays
+                    // retained while `stage_rows` remaps to the chunk end.
+                    let window = ctl.budget_blocks();
                     (
                         ctl.kv_mode(),
                         u32::try_from(window)
@@ -908,10 +907,9 @@ impl ModelRig {
             if self.kvmem.as_ref().is_some_and(|c| c.head_live_enabled()) {
                 let (kv_mode, window_pages) = {
                     let ctl = self.kvmem.as_ref().unwrap();
-                    // One trunk window plus the sink and one spare page; see
-                    // the prefill plane above. The spare absorbs a verify span
-                    // crossing the window front.
-                    let window = ctl.budget_blocks().saturating_add(2);
+                    // The plane adds the sink and draft spare to this retained
+                    // trunk window; see the prefill plane above.
+                    let window = ctl.budget_blocks();
                     (
                         ctl.kv_mode(),
                         u32::try_from(window)

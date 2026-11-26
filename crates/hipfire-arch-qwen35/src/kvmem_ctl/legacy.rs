@@ -42,7 +42,7 @@ impl KvMemCtl {
                     .ok_or_else(|| "kvmem: reversed frontend Query range".to_string())
             })
             .transpose()?;
-        let query = crate::legacy_query::LegacyQuery::new(
+        let query = crate::legacy_query::LegacyQuery::new_with_score_layers(
             source,
             frontier as usize,
             prompt_end,
@@ -50,6 +50,7 @@ impl KvMemCtl {
             config.query_replay_max_tokens,
             KV_BLOCK_TOKENS,
             self.n_fa_layers,
+            self.n_record_layers,
             self.q_width,
         )?;
         // A Query that would restore an empty store has no accepted history to
@@ -111,7 +112,7 @@ impl KvMemCtl {
                     blocks,
                     &sums,
                     query.query_row_counts(),
-                    self.n_fa_layers as u32,
+                    self.n_record_layers as u32,
                     self.head_dim as u32,
                     self.n_heads as u32,
                     self.n_kv_heads as u32,
@@ -128,7 +129,7 @@ impl KvMemCtl {
                 self.kv_cfg.recent_blocks,
                 query.query_rows(),
                 query.query_row_counts(),
-                self.n_fa_layers as u32,
+                self.n_record_layers as u32,
                 query.query_len() as u32,
                 self.n_heads as u32,
                 self.n_kv_heads as u32,

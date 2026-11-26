@@ -5123,6 +5123,51 @@ fn run_loop(
                     break 'serve;
                 }
             }
+            // A speculative prefill whose first target sample is a terminator
+            // otherwise completes with zero visible tokens before the drafter
+            // can run. Mask terminators only for that seed row, forcing the
+            // normal non-empty speculative path; ordinary AR sampling is
+            // unchanged.
+            for s in 0..n {
+                let guard_seed = slots[s].as_ref().is_some_and(|f| f.produced == 0)
+                    && work[s].spec.active()
+                    && !work[s].decoding
+                    && work[s].remaining_prompt.is_empty()
+                    && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0;
+                if !guard_seed {
+                    continue;
+                }
+                let row_offset = s * vocab;
+                let logits_bytes_len = vocab * std::mem::size_of::<f32>();
+                let host_slice = &mut rig.logits_host[row_offset..row_offset + vocab];
+                let host_bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        host_slice.as_mut_ptr() as *mut u8,
+                        logits_bytes_len,
+                    )
+                };
+                let gpu_row = rig.model.logits_out.sub_offset(row_offset, vocab);
+                if let Err(e) = rig.gpu.hip.memcpy_dtoh(host_bytes, &gpu_row.buf) {
+                    let reason = format!("spec seed mask D2H failed for slot {s}: {e:?}");
+                    fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                    poison = Some(reason);
+                    break 'serve;
+                }
+                for id in 0..vocab as u32 {
+                    if rig.tokenizer.is_terminator(id) {
+                        host_slice[id as usize] = f32::NEG_INFINITY;
+                    }
+                }
+                let host_bytes_back: &[u8] = unsafe {
+                    std::slice::from_raw_parts(host_slice.as_ptr() as *const u8, logits_bytes_len)
+                };
+                if let Err(e) = rig.gpu.hip.memcpy_htod(&gpu_row.buf, host_bytes_back) {
+                    let reason = format!("spec seed mask H2D failed for slot {s}: {e:?}");
+                    fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                    poison = Some(reason);
+                    break 'serve;
+                }
+            }
             // Fail any slots whose grammar constraint produced an empty allowed
             // set or unsatisfiable state. Each is a per-request rejection —
             // other active requests continue (spec §5.4/S4: "Per-request

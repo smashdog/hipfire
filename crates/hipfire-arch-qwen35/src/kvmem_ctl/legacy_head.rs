@@ -184,6 +184,37 @@ impl LegacyHeadWindow {
         self.visible_tokens().saturating_add(width)
     }
 
+    /// Descriptor extent and physical block table for one draft row. The draft
+    /// page is derived from the GLOBAL frontier, not the compact `seq_len`:
+    /// after the window slides those coordinate systems differ. At a compact
+    /// page boundary the next global page is not retained yet and must use the
+    /// arena's spare physical slot.
+    fn draft_layout(&self, row: usize) -> Result<(u32, Vec<u32>), String> {
+        let row = u32::try_from(row).map_err(|_| "legacy head plane: draft row overflow")?;
+        let seq_len = self
+            .visible_tokens()
+            .checked_add(row)
+            .and_then(|v| v.checked_add(1))
+            .ok_or("legacy head plane: draft position overflow")?;
+        let global_pos = self
+            .frontier
+            .checked_add(row)
+            .ok_or("legacy head plane: global draft position overflow")?;
+        let draft_page = global_pos / HEAD_PAGE_TOKENS;
+        let mut compact_slots = self.compact_slots();
+        if !self.contains(draft_page) {
+            compact_slots.push(self.physical_slot(draft_page));
+        }
+        let tiles = seq_len.div_ceil(HEAD_PAGE_TOKENS) as usize;
+        if tiles > compact_slots.len() {
+            return Err(format!(
+                "legacy head plane: draft seq_len {seq_len} needs {tiles} tiles > {} mapped pages",
+                compact_slots.len()
+            ));
+        }
+        Ok((seq_len, compact_slots))
+    }
+
     /// Whether the retained window contains `page`.
     pub fn contains(&self, page: u32) -> bool {
         page == self.sink_page() || self.pages.iter().any(|&p| p == page)
@@ -551,25 +582,16 @@ impl LegacyHeadPlane {
     /// return the kernel-facing view. `row` is the 0-based draft row within the
     /// chain; the global RoPE position is written separately by the caller.
     pub fn stage_row(&mut self, gpu: &mut Gpu, row: usize) -> Result<HeadPagedKv<'_>, String> {
-        let seq_len = self
-            .visible
-            .checked_add(row as u32)
-            .and_then(|v| v.checked_add(1))
-            .ok_or("legacy head plane: draft position overflow")?;
-        let mut compact_slots = self.compact_phys_slots();
-        // A draft span may start a page the accepted frontier has not reached
-        // yet. The spare physical slot holds exactly that page; appending it
-        // makes the block table cover the whole draft span without evicting a
-        // retained page.
-        let draft_page = (seq_len - 1) / HEAD_PAGE_TOKENS;
-        if !self.window.contains(draft_page) {
-            let phys = self.window.physical_slot(draft_page);
-            let slot = self
-                .slots
-                .get(phys as usize)
-                .ok_or_else(|| format!("legacy head plane: spare slot {phys} missing"))?;
-            compact_slots.push(slot.phys);
-        }
+        let (seq_len, compact_slots) = self.window.draft_layout(row)?;
+        let compact_slots = compact_slots
+            .into_iter()
+            .map(|phys| {
+                self.slots
+                    .get(phys as usize)
+                    .map(|slot| slot.phys)
+                    .ok_or_else(|| format!("legacy head plane: draft slot {phys} missing"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         self.staging
             .update_layer(gpu, 0, &compact_slots, None, None, seq_len as i32)
             .map_err(|e| format!("legacy head plane stage row {row}: {e}"))?;
@@ -745,6 +767,32 @@ mod tests {
         slots.dedup();
         assert_eq!(slots.len(), after.len());
         assert_eq!(w.capacity_tokens(), (4 + 2) * HEAD_PAGE_TOKENS);
+    }
+
+    #[test]
+    fn draft_boundary_uses_the_next_global_page_spare() {
+        let mut w = LegacyHeadWindow::new(32).unwrap();
+        w.set_frontier(36 * HEAD_PAGE_TOKENS);
+        assert_eq!(w.visible_tokens(), 33 * HEAD_PAGE_TOKENS);
+        // The compact coordinate still names retained page 33, but the next
+        // global draft row belongs to page 36 and needs the spare slot.
+        assert!(w.contains(33));
+        assert!(!w.contains(36));
+        let (seq_len, slots) = w.draft_layout(0).unwrap();
+        assert_eq!(seq_len, 33 * HEAD_PAGE_TOKENS + 1);
+        assert_eq!(slots.len(), 34);
+        assert_eq!(seq_len.div_ceil(HEAD_PAGE_TOKENS) as usize, slots.len());
+        assert_eq!(*slots.last().unwrap(), w.physical_slot(36));
+        let mut unique = slots;
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 34);
+
+        // Accepting that row slides the frame and maps the same global page at
+        // the new compact write position.
+        w.advance(1);
+        assert!(w.contains(36));
+        assert_eq!(w.compact_index(36), Some(w.visible_tokens() - 1));
     }
 
     #[test]

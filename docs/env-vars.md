@@ -1105,11 +1105,13 @@ KVMem keeps a small per-slot paged KV pool and spills the rest to a host store; 
 | `HIPFIRE_KVMEM_SELECT_INTERVAL` | `4` (clamp 1..256) | Blocks written between selection rounds. |
 | `HIPFIRE_KVMEM_GPU_HIGH_WATERMARK` / `HIPFIRE_KVMEM_GPU_LOW_WATERMARK` | unset (single threshold) | Residency hysteresis band as fractions of the budget; setting either enables it. |
 | `HIPFIRE_KVMEM_QUERY_SPAN` | `1` (1..512) | Retrieval query rows scored by page-softmax over a per-slot host Q ring; `1` is the single tapped row (byte-identical). |
+| `HIPFIRE_KVMEM_SCORE_AGG` | `max` (`mean` / `max`) | Legacy Query aggregation across recorded layers. Max preserves layer-concentrated retrieval evidence; Layerwise retains its native Mean aggregation. |
 | `HIPFIRE_KVMEM_SELECT_METHOD` | `retrieval` | `retrieval` or `recency`; `h2o` is rejected until the attention-heat tap ships. |
 | `HIPFIRE_KVMEM_LRFU` / `_LRFU_LAMBDA` / `_LRFU_TOP` | `0` / `0.5` / `0.9` | Decaying heavy-hitter history replaces the raw retrieval score (requires `retrieval`). |
 | `HIPFIRE_KVMEM_BATCH_XFER` | `1` | Batched pinned-slab spill/restore; `0` is the per-page blocking path (byte-identical). |
 | `HIPFIRE_KVMEM_GQA_DECODE` | `1` | Native q8 GQA decode kernel; `0` is the generic route. |
 | `HIPFIRE_KVMEM_HEAD_LIVE` | `0` (off) | Legacy MTP head: page the live head KV through the composite aux plane (128-token placeholder, no contiguous window). Requires `--spec mtp`; Layerwise already pages the head. |
+| `HIPFIRE_KVMEM_COLD_RETRY` | `1` (on) | KVMem only: retry once with a genuinely cold prefill when a partly cached prompt emits zero tokens and immediate EOS. Never applies to vision, schema, or tool-result turns. |
 | `HIPFIRE_KVMEM_HOST_BYTES` | 16 GiB | Host KV storage account (RAM tier). |
 | `HIPFIRE_KVMEM_SPILL_DIR` / `HIPFIRE_KVMEM_SPILL_BYTES` | unset (RAM only) / 64 GiB | Disk spill tier directory and capacity (tiered storage instead of RAM-only). |
 | `HIPFIRE_KVMEM_RECALL_STRATEGY` | `legacy` | `legacy` (global page policy, default) or `layerwise` (per-layer selection with import/checkpoint semantics; fail-closed rejects the global policy knobs). |
@@ -2282,6 +2284,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_KVMEM_GPU_LOW_WATERMARK` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |
 | `HIPFIRE_KVMEM_GQA_DECODE` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 | `HIPFIRE_KVMEM_HEAD_LIVE` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs | developer |
+| `HIPFIRE_KVMEM_COLD_RETRY` | crates/hipfire-daemon/src/slots.rs | developer |
 | `HIPFIRE_KVMEM_HOST_BYTES` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-config/src/kvmem.rs | developer |
 | `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_DISK_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |
 | `HIPFIRE_KVMEM_LAYERWISE_ACTIVATION_METADATA_MIB` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |
@@ -2297,6 +2300,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_KVMEM_PREFIX_PIN` | crates/hipfire-arch-qwen35/src/serve_engine_kvmem.rs, crates/hipfire-arch-qwen35/src/kvmem_prefix.rs | developer |
 | `HIPFIRE_KVMEM_PREFIX_PIN_BYTES` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 | `HIPFIRE_KVMEM_QUERY_SPAN` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-config/src/kvmem.rs | developer |
+| `HIPFIRE_KVMEM_SCORE_AGG` | crates/hipfire-config/src/kvmem.rs, crates/hipfire-arch-qwen35/src/kvmem_ctl/legacy.rs | developer |
 | `HIPFIRE_KVMEM_RECALL_STRATEGY` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-config/src/kvmem.rs | developer |
 | `HIPFIRE_KVMEM_RECENT_BLOCKS` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs, crates/hipfire-arch-qwen35/src/layerwise_driver.rs | developer |
 | `HIPFIRE_KVMEM_SELECT_INTERVAL` | crates/hipfire-arch-qwen35/src/kvmem_ctl/options.rs | developer |

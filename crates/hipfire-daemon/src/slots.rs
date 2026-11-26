@@ -2377,7 +2377,9 @@ impl SlotBackend {
                 if let Some(sess) = accepted_session.take() {
                     self.close_session(sess);
                 }
-                accepted_ticket = None;
+                // Keep the previous ticket until the retry is Accepted. The
+                // terminal registry still owns that lane; the normal bind
+                // fallback requeues it before binding the cold retry's lane.
                 saved_stop = None;
                 gen_ids.clear();
                 gates = StreamGates::new(repeat_stop);

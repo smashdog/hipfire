@@ -36,6 +36,7 @@ pub struct LegacyQuery {
     block_tokens: u32,
     replay_limit: u32,
     n_layers: usize,
+    n_score_layers: usize,
     q_width: usize,
     query_len: usize,
     layer_stride: usize,
@@ -53,7 +54,6 @@ impl LegacyQuery {
     /// Validate the proven span rather than silently clamping a malformed
     /// frontend range. A bounded Query crossing an already accepted frontier
     /// needs a checkpoint from the past, which this transaction does not own.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         source: Option<(u64, u64)>,
         frontier: usize,
@@ -62,6 +62,34 @@ impl LegacyQuery {
         replay_limit: u32,
         block_tokens: usize,
         n_layers: usize,
+        q_width: usize,
+    ) -> Result<Option<Self>, String> {
+        Self::new_with_score_layers(
+            source,
+            frontier,
+            prompt_end,
+            query_limit,
+            replay_limit,
+            block_tokens,
+            n_layers,
+            n_layers,
+            q_width,
+        )
+    }
+
+    /// Composite KVMem records can append an MTP-head ordinal that has no Q
+    /// probe. Allocate its zeroed scoring row/count so core geometry matches,
+    /// while completeness still requires only the trunk's active layers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_score_layers(
+        source: Option<(u64, u64)>,
+        frontier: usize,
+        prompt_end: usize,
+        query_limit: u32,
+        replay_limit: u32,
+        block_tokens: usize,
+        n_layers: usize,
+        n_score_layers: usize,
         q_width: usize,
     ) -> Result<Option<Self>, String> {
         if query_limit == 0 || replay_limit == 0 {
@@ -73,6 +101,9 @@ impl LegacyQuery {
             .ok_or("legacy query: block_tokens must be a positive u32")?;
         if n_layers == 0 || q_width == 0 {
             return Err("legacy query: n_layers and q_width must be positive".into());
+        }
+        if n_score_layers < n_layers {
+            return Err("legacy query: scoring layers are smaller than active layers".into());
         }
         if frontier > prompt_end {
             return Err(format!(
@@ -120,14 +151,14 @@ impl LegacyQuery {
         let layer_stride = query_len
             .checked_mul(q_width)
             .ok_or("legacy query: Query length * q_width overflow")?;
-        let elements = n_layers
+        let elements = n_score_layers
             .checked_mul(layer_stride)
-            .ok_or("legacy query: n_layers * Query layer stride overflow")?;
+            .ok_or("legacy query: scoring layers * Query layer stride overflow")?;
         // Validate both layouts before allocating either buffer. No allocation
         // depends on C, pre-Query history length, or the configured Q maximum
         // when the actual user Query is shorter.
         check_layout::<f32>(elements, "Query rows")?;
-        check_layout::<u32>(n_layers, "Query row counts")?;
+        check_layout::<u32>(n_score_layers, "Query row counts")?;
         Ok(Some(Self {
             query,
             restore_begin,
@@ -137,11 +168,12 @@ impl LegacyQuery {
             block_tokens,
             replay_limit,
             n_layers,
+            n_score_layers,
             q_width,
             query_len,
             layer_stride,
             rows: zeroed(elements, "Query rows")?,
-            row_counts: zeroed(n_layers, "Query row counts")?,
+            row_counts: zeroed(n_score_layers, "Query row counts")?,
             probe_finished: false,
             issued_plan: None,
             bypass_reason: None,
@@ -345,7 +377,7 @@ impl LegacyQuery {
         if !self.rows_complete() {
             return Err("legacy query: cannot sum incomplete or bypassed Query rows".into());
         }
-        let mut sums: Vec<f32> = zeroed(self.n_layers * self.q_width, "Query sums")?;
+        let mut sums: Vec<f32> = zeroed(self.n_score_layers * self.q_width, "Query sums")?;
         for (layer, values) in self.rows.chunks_exact(self.layer_stride).enumerate() {
             let sum = &mut sums[layer * self.q_width..(layer + 1) * self.q_width];
             for row in values.chunks_exact(self.q_width) {
@@ -430,9 +462,8 @@ impl LegacyQuery {
     }
 
     fn rows_complete(&self) -> bool {
-        self.row_counts.len() == self.n_layers
-            && self
-                .row_counts
+        self.row_counts.len() == self.n_score_layers
+            && self.row_counts[..self.n_layers]
                 .iter()
                 .all(|&n| n as usize == self.query_len)
     }
@@ -503,6 +534,23 @@ mod tests {
         query.record_layer_rows(1, 10, &[2.0; 10]).unwrap();
         assert!(query.probe_complete(20));
         query
+    }
+
+    #[test]
+    fn composite_score_layer_is_zero_padded_without_blocking_probe() {
+        let mut query =
+            LegacyQuery::new_with_score_layers(Some((10, 5)), 0, 20, 512, 2048, 8, 2, 3, 2)
+                .unwrap()
+                .unwrap();
+        query.checkpoint_captured().unwrap();
+        query.record_layer_rows(0, 10, &[1.0; 10]).unwrap();
+        query.record_layer_rows(1, 10, &[2.0; 10]).unwrap();
+        assert!(query.probe_complete(20));
+        assert_eq!(query.query_row_counts(), &[5, 5, 0]);
+        assert_eq!(query.query_rows().len(), 3 * 5 * 2);
+        let sums = query.query_sums().unwrap();
+        assert_eq!(sums.len(), 3 * 2);
+        assert_eq!(&sums[4..], &[0.0, 0.0]);
     }
 
     #[test]

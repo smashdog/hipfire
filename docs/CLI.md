@@ -347,7 +347,7 @@ JSON report without loading a model or touching a GPU.
 | `--kvmem-block-tokens <128>` | only 128 | Fixed native block size. |
 | `--kvmem-recall-strategy <legacy>` | only `legacy` | Formal Legacy policy. The existing Layerwise env-only route remains separate. |
 | `--kvmem-query-scorer <SCORER>` | `page-softmax` (default) / `meanq-cosine` | Query scoring function. |
-| `--kvmem-score-agg <AGG>` | `mean` / `max` | Aggregation; defaults to `mean` for page-softmax and `max` for cosine. |
+| `--kvmem-score-agg <AGG>` | `mean` / `max` | Aggregation; defaults to `max` for both query scorers so layer-concentrated retrieval evidence is preserved. |
 | `--kvmem-lrfu` / `--no-kvmem-lrfu` | boolean | Enable/disable LRFU; explicit tuning requires LRFU. |
 | `--kvmem-lrfu-lambda <FLOAT>` / `--kvmem-lrfu-top-frac <FLOAT>` | `[0,1]` / `(0,1]`; defaults 0.5 / 0.9 | LRFU decay and top-fraction. |
 | `--kvmem-graph-alpha <0>` | only 0 | Graph scoring is unsupported; zero is the effective default. |

@@ -500,7 +500,10 @@ impl RawConfig {
             }
         };
         let cosine = query_scorer == QueryScorer::MeanQCosine;
-        let agg_default = if cosine { "max" } else { "mean" };
+        // Max preserves a retrieval signal that is strong in a critical layer
+        // instead of diluting it across layers; 32k NIAH at a 4k residency
+        // budget exposed stable misses with Mean on Swift 27B.
+        let agg_default = "max";
         let agg_raw = self.value("score_agg", agg_default);
         let score_agg = match agg_raw.value.as_str() {
             "mean" => ScoreAgg::Mean,
@@ -911,10 +914,7 @@ mod tests {
         .is_err());
         for scorer in ["meanq-cosine", "page-softmax"] {
             let defaults = resolve(&[("--kvmem", "1"), ("--kvmem-query-scorer", scorer)]).unwrap();
-            assert_eq!(
-                defaults.score_agg == ScoreAgg::Max,
-                scorer == "meanq-cosine"
-            );
+            assert_eq!(defaults.score_agg, ScoreAgg::Max);
             assert_eq!(defaults.lrfu, scorer == "meanq-cosine");
             for agg in ["mean", "max"] {
                 let c = resolve(&[

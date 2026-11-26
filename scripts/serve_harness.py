@@ -1198,6 +1198,7 @@ def _startup_path_proof_failures(cfg, txt):
         loaded = (
             "DFlash draft loaded:" in txt
             or "DFlash generic speculator loaded" in txt
+            or "DFlash2 draft loaded" in txt
             # Muse Glimmer (arch 14) logs its own wording.
             or "glimmer DFlash drafter loaded:" in txt
         )
@@ -1237,7 +1238,8 @@ def _row_has_dflash_execution(row):
 # Log-side request-level DFlash route identities. Generic tau/cycle metrics are
 # intentionally excluded: both AR fallback and MTP can emit them.
 _DFLASH_EXEC_LOG_RE = re.compile(
-    r'("dflash"\s*:\s*true)|(?:^|\s)drafter=dflash(?:\s|$)',
+    r'("dflash"\s*:\s*true)|(?:^|\s)drafter=dflash(?:\s|$)'
+    r'|\[slot-trace\][^\n]*(?:spec|kind)=Dflash\b',
     re.I | re.M,
 )
 

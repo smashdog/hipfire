@@ -45,6 +45,11 @@
 //!   the production speculator's job; the AR window above is recorded as
 //!   `effective_window`).
 //!
+//! Both children force `HIPFIRE_PREFILL_BATCHED=0` and
+//! `HIPFIRE_MTP_VERIFY_DECOUPLE=0`: the AR reference is a per-token loop, so
+//! matching that route isolates sampler/penalty behavior from gfx1100's
+//! numerically different batched-prefill route.
+//!
 //! Each arm runs in its OWN FRESH PROCESS (the parent test re-executes this
 //! test binary on the ignored internal test `sampled_mtp_penalty_arm`), so two
 //! 35B sessions never share a process (allocator residue). The parent sets
@@ -1239,6 +1244,12 @@ fn spawn_arm(cfg: &Config, dir: &Path, arm: &str) -> ArmOutput {
 /// Writes `config.json`, runs both arms in fresh processes, and validates the
 /// arms are comparable.
 fn run_oracle(test: &str, mut cfg: Config) -> (PathBuf, Config, ArmOutput, ArmOutput) {
+    // The AR oracle is a per-token ModelSlot loop. Match that trunk route in
+    // the MTP child so this test isolates sampling/penalty semantics; gfx1100's
+    // batched-prefill numerical route is covered by the production serve matrix,
+    // not by this cross-route token-identity comparison.
+    std::env::set_var("HIPFIRE_PREFILL_BATCHED", "0");
+    std::env::set_var("HIPFIRE_MTP_VERIFY_DECOUPLE", "0");
     cfg.config_hash = config_hash(&cfg);
     let dir = new_run_dir(test, &cfg.config_hash);
     cfg.out_dir = dir.display().to_string();

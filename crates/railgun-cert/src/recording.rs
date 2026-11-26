@@ -2163,6 +2163,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "hipfire-arch-qwen35/src/kvmem_ctl/transfer.rs",
+        function: "archive_legacy_pages_to_host",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/kvmem_ctl/transfer.rs",
         function: "flush_spill_batch",
         occurrences: 1,
         decisions: &["graph-capture-lifecycle"],
@@ -3066,6 +3072,12 @@ pub const SITES: &[Site] = &[
         function: "a8_prefill_active",
         occurrences: 2,
         decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "abort_stream_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
     },
     Site {
         file: "rdna-compute/src/dispatch.rs",
