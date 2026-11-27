@@ -51,8 +51,8 @@ use std::{
 
 mod bench_concurrency;
 mod bench_power;
-mod capabilities;
 mod calibrate;
+mod capabilities;
 mod config_tuning;
 mod config_view;
 #[cfg(target_os = "linux")]

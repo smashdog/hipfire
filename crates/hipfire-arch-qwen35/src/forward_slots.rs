@@ -5829,7 +5829,10 @@ pub fn forward_batch_slots_opts(
         // NInfer no-refresh: the existing full-resident native maps remain the
         // attention domain; no scorer, restore, tape or layer-table work.
         false
-    } else if let Some(lq) = layerwise.as_deref_mut().and_then(|carrier| carrier.query_mut()) {
+    } else if let Some(lq) = layerwise
+        .as_deref_mut()
+        .and_then(|carrier| carrier.query_mut())
+    {
         // P4.1② G1: two admissible Layerwise shapes, both single-slot q8 paged.
         // (a) AR single-row decode (D4b-3): n == 1, unspec, the paged GQA decode
         // tile engaged. G7 Stage D admits the uniform past-prompt M-RoPE form

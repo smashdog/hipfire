@@ -6,7 +6,7 @@
 //! report what hipfire would do with it. Read-only: no GPU, daemon, model load,
 //! or tensor payload read.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::io::Read;
 use std::path::PathBuf;
@@ -53,7 +53,7 @@ pub(crate) fn inspect_command(args: InspectArgs) -> Result<()> {
 pub(crate) fn inspect_json(path: &std::path::Path) -> Result<serde_json::Value> {
     use hipfire_runtime::loader_api::ModelSource;
     use hipfire_runtime::model_source::ModelSource as SourceTrait;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     let path_text = path.to_string_lossy();
     let source = ModelSource::from_path(&path_text)
