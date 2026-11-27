@@ -2248,6 +2248,11 @@ pub(super) fn layerwise_forward(
                                 .map(|_| false),
                             None => Ok(false),
                         };
+                        // Capture the packed composite-arena feed row before
+                        // freeing the carrier; the scheduler seals it after the
+                        // single AR row is accepted.
+                        let feed_res = carrier.capture_feed_rows(&rig.gpu, begin as usize, 1);
+                        let feed_err = feed_res.as_ref().err().cloned();
                         // Release the carrier exactly once (its GPU
                         // buffers have no Drop). `free` consumes it,
                         // ending its borrow of `kvmem`/`lw_policy` before
@@ -2284,7 +2289,7 @@ pub(super) fn layerwise_forward(
                                 k.restore_layerwise_output_pressure(slot, p);
                             }
                         }
-                        if let Some(e) = accept_res.err().or_else(|| free_res.err()) {
+                        if let Some(e) = accept_res.err().or_else(|| free_res.err()).or(feed_err) {
                             rig.model.kvmem = kvmem;
                             return Err(e);
                         }
@@ -2307,6 +2312,9 @@ pub(super) fn layerwise_forward(
                             k.set_layerwise_keep_set(slot, new_keep);
                             if let Some(s) = aux_sel {
                                 k.set_aux_selection(slot, s);
+                            }
+                            if let Ok(Some(feed)) = feed_res {
+                                k.set_layerwise_pending_feed(slot, feed);
                             }
                         }
                         rig.model.kvmem = kvmem;
@@ -2523,6 +2531,9 @@ pub(super) fn layerwise_forward(
                             // so the publish runs in `mtp_verify_accept_step`
                             // (after `feed_rows`), outside this scoped take.
                             let snap_res = carrier.extract_output_acceptance(request, begin);
+                            let feed_res =
+                                carrier.capture_feed_rows(&rig.gpu, begin as usize, width as usize);
+                            let feed_err = feed_res.as_ref().err().cloned();
                             let free_res = carrier.free(&mut rig.gpu);
                             // G5: FirstLayer head aux binding (pure-host, after the
                             // carrier borrow ends). `head_plane` ⇒ Layerwise + MTP ⇒
@@ -2555,7 +2566,7 @@ pub(super) fn layerwise_forward(
                                     k.restore_layerwise_output_pressure(slot, p);
                                 }
                             }
-                            if let Some(e) = free_res.err() {
+                            if let Some(e) = free_res.err().or(feed_err) {
                                 rig.model.kvmem = kvmem;
                                 return Err(e);
                             }
@@ -2588,6 +2599,9 @@ pub(super) fn layerwise_forward(
                                 }
                                 if let Some(s) = aux_sel {
                                     k.set_aux_selection(slot, s);
+                                }
+                                if let Ok(Some(feed)) = feed_res {
+                                    k.set_layerwise_pending_feed(slot, feed);
                                 }
                             }
                             rig.model.kvmem = kvmem;

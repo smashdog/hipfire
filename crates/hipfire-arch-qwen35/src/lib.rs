@@ -185,6 +185,11 @@ pub mod legacy_query;
 pub(crate) type LayerwiseFwd<'a, 'b> = Option<&'a mut layerwise_driver::LayerwiseQuery<'b>>;
 #[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
 pub(crate) type LayerwiseFwd<'a, 'b> = Option<&'a mut core::marker::PhantomData<&'b ()>>;
+#[cfg(all(feature = "deltanet", feature = "kvmem"))]
+pub(crate) type LayerwiseCarrierFwd<'a, 'b> =
+    Option<&'a mut layerwise_driver::LayerwiseCarrier<'b>>;
+#[cfg(not(all(feature = "deltanet", feature = "kvmem")))]
+pub(crate) type LayerwiseCarrierFwd<'a, 'b> = LayerwiseFwd<'a, 'b>;
 #[cfg(feature = "deltanet")]
 pub(crate) mod layer_driver;
 #[cfg(feature = "deltanet")]

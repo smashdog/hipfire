@@ -4949,7 +4949,7 @@ pub fn forward_batch_slots_graphed_opts(
     verify_rows: usize,
     lm_head_skip: &[bool],
     mut spec_capture: Option<&mut SpecVerifyCapture>,
-    mut layerwise: crate::LayerwiseFwd<'_, '_>,
+    mut layerwise: crate::LayerwiseCarrierFwd<'_, '_>,
 ) -> HipResult<()> {
     let pure_decode = !batch.is_empty() && batch.m_per_slot.iter().all(|&m| m == 1);
     // An MTP verify step is graphable when every slot's row count is a decode
@@ -5426,7 +5426,7 @@ pub fn forward_batch_slots_opts(
     opts: SlotStepOpts,
     lm_head_skip: &[bool],
     mut spec_capture: Option<&mut SpecVerifyCapture>,
-    mut layerwise: crate::LayerwiseFwd<'_, '_>,
+    mut layerwise: crate::LayerwiseCarrierFwd<'_, '_>,
 ) -> HipResult<()> {
     if batch.is_empty() {
         return Ok(());
@@ -5822,7 +5822,14 @@ pub fn forward_batch_slots_opts(
     // below (an early `return` here would skip them, as the legacy reference
     // path also falls through).
     #[cfg(all(feature = "deltanet", feature = "kvmem"))]
-    let layerwise_handled = if let Some(lq) = layerwise.as_deref_mut() {
+    let layerwise_handled = if layerwise
+        .as_deref()
+        .is_some_and(|carrier| !carrier.is_query())
+    {
+        // NInfer no-refresh: the existing full-resident native maps remain the
+        // attention domain; no scorer, restore, tape or layer-table work.
+        false
+    } else if let Some(lq) = layerwise.as_deref_mut().and_then(|carrier| carrier.query_mut()) {
         // P4.1② G1: two admissible Layerwise shapes, both single-slot q8 paged.
         // (a) AR single-row decode (D4b-3): n == 1, unspec, the paged GQA decode
         // tile engaged. G7 Stage D admits the uniform past-prompt M-RoPE form

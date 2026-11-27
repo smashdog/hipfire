@@ -441,6 +441,7 @@ impl KvMemCtl {
                 last_freeze_id: None,
                 lw_import_blocks: Cell::new(None),
                 lw_pending_output: None,
+                lw_pending_feed: None,
                 lw_head: None,
                 lw_aux_selection: None,
             });

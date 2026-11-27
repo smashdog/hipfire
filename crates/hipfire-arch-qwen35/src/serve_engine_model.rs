@@ -35,7 +35,7 @@ impl ModelRig {
         lm_head_skip: &[bool],
         any_verify: bool,
         any_dflash_rows: bool,
-        layerwise: crate::LayerwiseFwd<'_, '_>,
+        layerwise: crate::LayerwiseCarrierFwd<'_, '_>,
     ) -> rdna_compute::HipResult<()> {
         let mut capture = (any_verify || any_dflash_rows).then(|| {
             let tape = self

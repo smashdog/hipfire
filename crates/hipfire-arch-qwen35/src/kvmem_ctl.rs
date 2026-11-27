@@ -818,6 +818,16 @@ pub struct KvMemGeometry {
     pub mtp_head: bool,
 }
 
+/// Packed Q8 feed rows captured from the Layerwise composite arena before the
+/// per-step carrier is freed. The scheduler consumes only the committed prefix
+/// after sampling, so rejected draft rows never enter the host archive.
+pub(crate) struct LayerwiseFeedRows {
+    pub pos0: u32,
+    pub rows: u32,
+    pub k: Vec<u8>,
+    pub v: Vec<u8>,
+}
+
 struct SlotState {
     raw: RawStore,
     kv: KvStore,
@@ -925,6 +935,10 @@ struct SlotState {
     /// snapshot is owned, so it survives the scoped controller take that the
     /// carrier's `&KvMemCtl` borrow requires.
     lw_pending_output: Option<OutputAcceptanceSnapshot>,
+    /// Packed composite-arena feed rows captured before the Layerwise carrier is
+    /// freed. `feed_rows` takes this after sampling and seals only the committed
+    /// prefix; prefill has no carrier and keeps the direct arena gather path.
+    lw_pending_feed: Option<LayerwiseFeedRows>,
     /// P4.1② G3: the MTP head's independent aux-plane resident map (design §A.8).
     /// Constructed lazily on the first admitted Layerwise MTP verify
     /// ([`KvMemCtl::ensure_head_plane`]); `None` under Legacy / AR-only (never

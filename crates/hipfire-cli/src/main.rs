@@ -51,6 +51,7 @@ use std::{
 
 mod bench_concurrency;
 mod bench_power;
+mod capabilities;
 mod calibrate;
 mod config_tuning;
 mod config_view;
@@ -90,6 +91,9 @@ const BUILD_TARGET: &str = env!("HIPFIRE_BUILD_TARGET");
     long_about = "Native Rust control plane for hipfire. Configuration, registry, model lifecycle, serving, chat, and diagnostics are implemented without a JavaScript runtime."
 )]
 pub(crate) struct Cli {
+    /// Print the read-only KVMem launch capability contract as JSON.
+    #[arg(long)]
+    kvmem_capabilities: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -1259,6 +1263,10 @@ fn run() -> Result<()> {
         .collect();
     validate_kvmem_storage_args(&arguments)?;
     let cli = Cli::parse_from(arguments);
+    if cli.kvmem_capabilities {
+        println!("{}", serde_json::to_string_pretty(&capabilities::report())?);
+        return Ok(());
+    }
     // Must precede Paths::discover, registry/model lookup, restart/stop, detach
     // and every daemon/GPU side effect. Only global config files are read.
     if let Some(Commands::Serve(args) | Commands::Restart(args)) = &cli.command {

@@ -63,6 +63,24 @@ pub fn layerwise_floor_tokens(sink_blocks: usize, recent_blocks: usize) -> u64 {
     (sink_blocks + recent_blocks).max(1) as u64 * LAYERWISE_BLOCK_TOKENS as u64
 }
 
+/// NInfer's below-budget no-refresh gate (`query_refresh_required` is
+/// `history >= selection_budget`). A partial tail remains on the no-refresh
+/// path until the next sealed-page boundary; force-query, media and an existing
+/// compressed keep-set always retain the full Layerwise transaction.
+pub(crate) fn layerwise_no_refresh_admitted(
+    fed: u64,
+    budget_blocks: usize,
+    force_query: bool,
+    has_media: bool,
+    has_prior_selection: bool,
+) -> bool {
+    budget_blocks > 0
+        && !force_query
+        && !has_media
+        && !has_prior_selection
+        && fed / (LAYERWISE_BLOCK_TOKENS as u64) < budget_blocks as u64
+}
+
 /// Map a core `NativeQueryScalar` ordinal (`native_layer_query.hpp`) to the
 /// launcher's `PageQueryScalar`. The ordinals are identical (F32=0, F16=1,
 /// BF16=2); an unknown ordinal fails closed rather than guessing a width.
@@ -792,6 +810,102 @@ pub struct LayerwiseQuery<'a> {
     /// pressure history that later enables Pressure refinement (otherwise the path
     /// deadlocks in Query forever). `None` for the certified ② fixtures.
     pub mass: Option<MassCapture>,
+}
+
+/// One Layerwise step. `NoRefresh` is the NInfer-equivalent below-budget path:
+/// it keeps the request on the existing full-resident native maps and performs
+/// no source freeze, current-Q scoring, projection tape, canonical stripe
+/// restore, composite-arena allocation or per-layer table upload. The archive
+/// write-through and accepted-token lifecycle remain owned by the Layerwise
+/// controller. `Query` is the existing full per-layer transaction.
+pub enum LayerwiseCarrier<'a> {
+    Query(LayerwiseQuery<'a>),
+    NoRefresh,
+}
+
+impl<'a> LayerwiseCarrier<'a> {
+    pub fn is_query(&self) -> bool {
+        matches!(self, Self::Query(_))
+    }
+
+    pub fn query(&self) -> Option<&LayerwiseQuery<'a>> {
+        match self {
+            Self::Query(query) => Some(query),
+            Self::NoRefresh => None,
+        }
+    }
+
+    pub fn query_mut(&mut self) -> Option<&mut LayerwiseQuery<'a>> {
+        match self {
+            Self::Query(query) => Some(query),
+            Self::NoRefresh => None,
+        }
+    }
+
+    pub fn is_pressure(&self) -> bool {
+        self.query().is_some_and(LayerwiseQuery::is_pressure)
+    }
+
+    pub fn activation(&self) -> Option<&LayerwiseActivation> {
+        self.query().and_then(LayerwiseQuery::activation)
+    }
+
+    pub fn activation_mut(&mut self) -> Option<&mut LayerwiseActivation> {
+        self.query_mut().and_then(LayerwiseQuery::activation_mut)
+    }
+
+    pub fn restored_keep_set(&self) -> Result<Vec<Vec<u64>>, String> {
+        match self {
+            Self::Query(query) => query.restored_keep_set(),
+            Self::NoRefresh => Ok(Vec::new()),
+        }
+    }
+
+    pub fn accept_output_pressure(
+        &mut self,
+        pressure: &mut OutputPressure,
+        request: u64,
+        begin: u64,
+        accepted: u32,
+    ) -> Result<u64, String> {
+        match self {
+            Self::Query(query) => query.accept_output_pressure(pressure, request, begin, accepted),
+            Self::NoRefresh => Ok(0),
+        }
+    }
+
+    pub fn extract_output_acceptance(
+        &self,
+        request: u64,
+        begin: u64,
+    ) -> Result<Option<OutputAcceptanceSnapshot>, String> {
+        match self {
+            Self::Query(query) => query.extract_output_acceptance(request, begin),
+            Self::NoRefresh => Ok(None),
+        }
+    }
+
+    pub fn capture_feed_rows(
+        &self,
+        gpu: &Gpu,
+        pos0: usize,
+        rows: usize,
+    ) -> Result<Option<crate::kvmem_ctl::LayerwiseFeedRows>, String> {
+        match self {
+            Self::Query(query) => query.capture_feed_rows(gpu, pos0, rows).map(Some),
+            // No-refresh attended the legacy arenas. The normal accepted-row
+            // feed reads those same arenas after sampling; no composite pending
+            // image exists and none may be fabricated.
+            Self::NoRefresh => Ok(None),
+        }
+    }
+
+    pub fn free(self, gpu: &mut Gpu) -> Result<(), String> {
+        match self {
+            Self::Query(query) => query.free(gpu),
+            Self::NoRefresh => Ok(()),
+        }
+    }
 }
 
 /// One ordinal's restored compact page geometry for the pressure mass packet
@@ -1615,6 +1729,116 @@ impl<'a> LayerwiseQuery<'a> {
             seq_len,
         )?;
         Ok(extent)
+    }
+
+    /// Capture the freshly written evaluation rows from the composite suffix
+    /// stripe before the carrier is freed. The host archive later consumes only
+    /// the scheduler-confirmed prefix, so rejected MTP draft rows are dropped.
+    pub fn capture_feed_rows(
+        &self,
+        gpu: &Gpu,
+        pos0: usize,
+        rows: usize,
+    ) -> Result<crate::kvmem_ctl::LayerwiseFeedRows, String> {
+        if rows == 0 || rows != self.staging.width() {
+            return Err(format!(
+                "layerwise feed capture: rows {rows} != staging width {}",
+                self.staging.width()
+            ));
+        }
+        let suffix = self
+            .suffix_slot
+            .ok_or_else(|| "layerwise feed capture: no suffix page mapped".to_string())?;
+        let bt = self.driver.block_tokens() as usize;
+        if bt == 0 || self.partial_tokens as usize + rows > bt * 2 {
+            return Err("layerwise feed capture: evaluation span exceeds suffix pages".to_string());
+        }
+        let layout = self.driver.arena().layout();
+        let k_plane = layout.k_plane_bytes();
+        let v_plane = layout.v_plane_bytes();
+        if k_plane % bt != 0 || v_plane % bt != 0 {
+            return Err(
+                "layerwise feed capture: packed row geometry is not page-aligned".to_string(),
+            );
+        }
+        let krow = k_plane / bt;
+        let vrow = v_plane / bt;
+        let n_layers = self.driver.fa_layers().len();
+        let k_bytes = n_layers * rows * krow;
+        let v_bytes = n_layers * rows * vrow;
+        let mut k_rows = vec![0u8; k_bytes];
+        let mut v_rows = vec![0u8; v_bytes];
+        let stream = gpu.steady_copy_stream();
+        let arena = self.driver.arena().arena();
+        let result = (|| -> Result<(), String> {
+            for ordinal in 0..n_layers {
+                for row in 0..rows {
+                    let compact = self.partial_tokens as usize + row;
+                    let (source_slot, intra) = if compact < bt {
+                        (suffix, compact)
+                    } else {
+                        (
+                            self.suffix_slot_overflow.ok_or_else(|| {
+                                "layerwise feed capture: suffix overflow page is not mapped"
+                                    .to_string()
+                            })?,
+                            compact - bt,
+                        )
+                    };
+                    let src_k = layout
+                        .layer_k_offset(source_slot as usize, ordinal)
+                        .map_err(|e| format!("layerwise feed capture: K offset {ordinal}: {e}"))?
+                        + intra * krow;
+                    let src_v = layout
+                        .layer_v_offset(source_slot as usize, ordinal)
+                        .map_err(|e| format!("layerwise feed capture: V offset {ordinal}: {e}"))?
+                        + intra * vrow;
+                    let dst_k = (ordinal * rows + row) * krow;
+                    let dst_v = (ordinal * rows + row) * vrow;
+                    gpu.hip
+                        .memcpy_dtoh_async_at(
+                            &mut k_rows[dst_k..dst_k + krow],
+                            &arena.buf,
+                            src_k,
+                            stream,
+                        )
+                        .map_err(|e| {
+                            format!("layerwise feed capture: K D2H {ordinal}/{row}: {e:?}")
+                        })?;
+                    gpu.hip
+                        .memcpy_dtoh_async_at(
+                            &mut v_rows[dst_v..dst_v + vrow],
+                            &arena.buf,
+                            src_v,
+                            stream,
+                        )
+                        .map_err(|e| {
+                            format!("layerwise feed capture: V D2H {ordinal}/{row}: {e:?}")
+                        })?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = match stream {
+                Some(stream) => gpu.hip.stream_synchronize(stream),
+                None => gpu.hip.stream_synchronize_default(),
+            };
+            return Err(error);
+        }
+        match stream {
+            Some(stream) => gpu.hip.stream_synchronize(stream),
+            None => gpu.hip.stream_synchronize_default(),
+        }
+        .map_err(|e| format!("layerwise feed capture: sync: {e:?}"))?;
+        let pos0 = u32::try_from(pos0)
+            .map_err(|_| "layerwise feed capture: position exceeds u32".to_string())?;
+        Ok(crate::kvmem_ctl::LayerwiseFeedRows {
+            pos0,
+            rows: rows as u32,
+            k: k_rows,
+            v: v_rows,
+        })
     }
 
     /// Report ordinal `ordinal`'s attended evaluation span to the state machine
@@ -2467,7 +2691,7 @@ pub fn engine_carrier_rows<'a>(
     // (byte-neutral). The caller already filtered them to sealed pages and
     // verified they fit the resident budget.
     media_pages: &[u32],
-) -> Result<Option<LayerwiseQuery<'a>>, String> {
+) -> Result<Option<LayerwiseCarrier<'a>>, String> {
     if !ctl.strategy().is_layerwise() || width == 0 {
         return Ok(None);
     }
@@ -2483,6 +2707,21 @@ pub fn engine_carrier_rows<'a>(
     // selection budget cannot admit them yet; the step stays Legacy.
     if (fed as u64) < layerwise_floor_tokens(ctl.sink_blocks(), ctl.recent_blocks()) {
         return Ok(None);
+    }
+    let (keys, _slot_policy) = stores;
+    let fa_layers: Vec<u32> = (0..n_fa_layers as u32).collect();
+    let has_prior_selection = ctl
+        .layerwise_keep_set(slot)
+        .map(|sets| sets.iter().any(|ids| !ids.is_empty()))
+        .unwrap_or(false);
+    if layerwise_no_refresh_admitted(
+        fed as u64,
+        ctl.budget_blocks(),
+        force_query,
+        !media_pages.is_empty(),
+        has_prior_selection,
+    ) {
+        return Ok(Some(LayerwiseCarrier::NoRefresh));
     }
     let (keys, _slot_policy) = stores;
     let fa_layers: Vec<u32> = (0..n_fa_layers as u32).collect();
@@ -2695,7 +2934,7 @@ pub fn engine_carrier_rows<'a>(
             return Err(e);
         }
     }
-    Ok(Some(carrier))
+    Ok(Some(LayerwiseCarrier::Query(carrier)))
 }
 
 /// P4.1② G4 (f2): the head-only restore carrier for the MTP draft phase under
@@ -4500,6 +4739,61 @@ mod tests {
         assert!((128u64) < floor);
         assert!((255u64) < floor);
         assert!((256u64) >= floor);
+    }
+
+    #[test]
+    fn layerwise_no_refresh_gate_matches_ninfer_budget_cadence() {
+        let budget = 187usize;
+        let block = 128u64;
+        assert!(layerwise_no_refresh_admitted(
+            0, budget, false, false, false
+        ));
+        assert!(layerwise_no_refresh_admitted(
+            (budget as u64 - 1) * block + 127,
+            budget,
+            false,
+            false,
+            false
+        ));
+        assert!(!layerwise_no_refresh_admitted(
+            budget as u64 * block,
+            budget,
+            false,
+            false,
+            false
+        ));
+        assert!(!layerwise_no_refresh_admitted(
+            budget as u64 * block + 1,
+            budget,
+            false,
+            false,
+            false
+        ));
+        assert!(!layerwise_no_refresh_admitted(
+            128, budget, true, false, false
+        ));
+        assert!(!layerwise_no_refresh_admitted(
+            128, budget, false, true, false
+        ));
+        assert!(!layerwise_no_refresh_admitted(
+            128, budget, false, false, true
+        ));
+    }
+
+    #[test]
+    fn no_refresh_carrier_owns_no_query_or_feedback_work() {
+        let carrier = LayerwiseCarrier::NoRefresh;
+        assert!(!carrier.is_query());
+        assert!(!carrier.is_pressure());
+        assert!(carrier.activation().is_none());
+        assert!(carrier
+            .restored_keep_set()
+            .expect("empty keep-set")
+            .is_empty());
+        assert!(carrier
+            .extract_output_acceptance(1, 0)
+            .expect("no output snapshot")
+            .is_none());
     }
 
     /// Q8-ish geometry: 2 KV heads × head_dim 64 → kw = 128; 4 query heads →
@@ -10043,6 +10337,9 @@ mod tests {
         )
         .expect("engine_carrier_rows")
         .expect("admitted carrier");
+        let LayerwiseCarrier::Query(mut carrier) = carrier else {
+            panic!("width-4 verify fixture requires a full Query carrier");
+        };
         assert_eq!(
             carrier.staging.width(),
             width as usize,

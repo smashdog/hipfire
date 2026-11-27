@@ -271,6 +271,21 @@ impl KvMemCtl {
             .and_then(|st| st.lw_pending_output.take())
     }
 
+    /// Store packed feed rows captured from the Layerwise composite arena before
+    /// the carrier is freed. The scheduler seals only the committed prefix.
+    pub fn set_layerwise_pending_feed(&mut self, slot: usize, feed: LayerwiseFeedRows) {
+        if let Some(st) = self.slots.get_mut(slot) {
+            st.lw_pending_feed = Some(feed);
+        }
+    }
+
+    /// Take the pending composite-arena feed rows for `slot`, if any.
+    pub fn take_layerwise_pending_feed(&mut self, slot: usize) -> Option<LayerwiseFeedRows> {
+        self.slots
+            .get_mut(slot)
+            .and_then(|st| st.lw_pending_feed.take())
+    }
+
     /// P4.1② G3: whether the composite head aux plane is active (Layerwise AND
     /// native MTP). The orchestration gates every head-plane path on this; under
     /// Legacy / AR-only it is false and the head keeps the historical
@@ -1062,7 +1077,12 @@ impl KvMemCtl {
         // drop-evict + COW restore (D4). Legacy skips this entirely — the arena
         // params are unused on the default path, keeping it byte-neutral.
         if self.strategy.is_layerwise() {
-            self.write_through_archive(gpu, pool, k_arenas, v_arenas, slot, pos0, n_rows)?;
+            let pending_feed = st.lw_pending_feed.take();
+            if let Some(feed) = pending_feed {
+                self.write_through_archive_rows(slot, pos0, n_rows, &feed)?;
+            } else {
+                self.write_through_archive(gpu, pool, k_arenas, v_arenas, slot, pos0, n_rows)?;
+            }
         }
         if trace {
             eprintln!(
@@ -1078,6 +1098,63 @@ impl KvMemCtl {
                 t_read.as_secs_f64() * 1e3,
                 t_write.as_secs_f64() * 1e3,
             );
+        }
+        Ok(())
+    }
+
+    /// Seal a committed prefix of feed rows captured from the Layerwise
+    /// composite arena. The carrier is already freed when this runs, so the
+    /// packed Q8 payload must be supplied by the scoped forward orchestration.
+    pub(super) fn write_through_archive_rows(
+        &mut self,
+        slot: usize,
+        pos0: usize,
+        n_rows: usize,
+        feed: &LayerwiseFeedRows,
+    ) -> Result<(), String> {
+        if slot >= self.slots.len() {
+            return Err(format!("kvmem write-through: slot {slot} out of range"));
+        }
+        if feed.pos0 != pos0 as u32 || n_rows > feed.rows as usize {
+            return Err(format!(
+                "kvmem write-through: captured rows {}..{} do not cover committed {}..{}",
+                feed.pos0,
+                feed.pos0 + feed.rows,
+                pos0,
+                pos0 + n_rows
+            ));
+        }
+        let krow = self.k_page_bytes / KV_BLOCK_TOKENS;
+        let vrow = self.v_page_bytes / KV_BLOCK_TOKENS;
+        let captured = feed.rows as usize;
+        if feed.k.len() != self.n_fa_layers * captured * krow
+            || feed.v.len() != self.n_fa_layers * captured * vrow
+        {
+            return Err("kvmem write-through: captured K/V buffer geometry mismatch".to_string());
+        }
+        let committed_k = n_rows * krow;
+        let committed_v = n_rows * vrow;
+        for il in 0..self.n_fa_layers {
+            let k0 = il * captured * krow;
+            let v0 = il * captured * vrow;
+            self.slots[slot]
+                .raw
+                .write_layer_k_gpu(
+                    pos0 as u32,
+                    n_rows as u32,
+                    il as u32,
+                    &feed.k[k0..k0 + committed_k],
+                )
+                .map_err(|e| format!("kvmem write-through K seal (layer {il}): {e}"))?;
+            self.slots[slot]
+                .raw
+                .write_layer_v_gpu(
+                    pos0 as u32,
+                    n_rows as u32,
+                    il as u32,
+                    &feed.v[v0..v0 + committed_v],
+                )
+                .map_err(|e| format!("kvmem write-through V seal (layer {il}): {e}"))?;
         }
         Ok(())
     }

@@ -121,6 +121,7 @@ impl KvMemCtl {
             last_freeze_id: None,
             lw_import_blocks: Cell::new(None),
             lw_pending_output: None,
+            lw_pending_feed: None,
             // P4.1② G3: a fresh session drops the head resident map and its
             // per-Query binding, mirroring the trunk pressure owners. The next
             // admitted MTP verify lazily reconstructs the map under the bumped
@@ -246,6 +247,8 @@ impl KvMemCtl {
             .ok_or_else(|| format!("kvmem: begin_request slot {slot} out of range"))?;
         st.turn_start = st.fed;
         st.first_decode_done = false;
+        // A cancelled verify may leave captured rows that were never committed.
+        st.lw_pending_feed = None;
         // A new turn's question must not inherit the previous turn's Q span.
         st.q_ring_len = 0;
         st.q_ring_cursor = 0;
